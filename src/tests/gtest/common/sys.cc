@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2001-2017 Mellanox Technologies, Ltd. All rights reserved.
+ * Copyright (c) 2001-2018 Mellanox Technologies, Ltd. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -33,6 +33,8 @@
 #include "common/def.h"
 #include "common/log.h"
 #include "sys.h"
+
+#include <dirent.h>
 
 
 void sys_hexdump(const char *tag, void *ptr, int buflen)
@@ -186,4 +188,47 @@ int sys_gateway(struct sockaddr_in *addr)
     pclose(file);
 
     return (gateway ? 0 : -1);
+}
+
+pid_t sys_procpid(const char* name)
+{
+    DIR* dir;
+    struct dirent* ent;
+    char buf[512];
+    long  pid;
+    char pname[100] = {0};
+    char state;
+    FILE *fp=NULL;
+
+    if (!(dir = opendir("/proc"))) {
+        perror("can't open /proc");
+        return -1;
+    }
+
+    while((ent = readdir(dir)) != NULL) {
+        long lpid = atol(ent->d_name);
+        if(lpid < 0) {
+            continue;
+        }
+        snprintf(buf, sizeof(buf), "/proc/%ld/stat", lpid);
+        fp = fopen(buf, "r");
+
+        if (fp) {
+            if ( (fscanf(fp, "%ld (%[^)]) %c", &pid, pname, &state)) != 3 ){
+                printf("fscanf failed \n");
+                fclose(fp);
+                closedir(dir);
+                return -1;
+            }
+            if (!strcmp(pname, name)) {
+                fclose(fp);
+                closedir(dir);
+                return (pid_t)lpid;
+            }
+            fclose(fp);
+        }
+    }
+
+    closedir(dir);
+    return -1;
 }

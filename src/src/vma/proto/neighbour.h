@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2001-2017 Mellanox Technologies, Ltd. All rights reserved.
+ * Copyright (c) 2001-2018 Mellanox Technologies, Ltd. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -325,6 +325,8 @@ protected:
 
 	bool 			priv_get_neigh_state(int & state);
 	bool 			priv_get_neigh_l2(address_t & l2_addr);
+	bool 			priv_is_reachable(int state) { return state & (NUD_REACHABLE | NUD_PERMANENT); }
+	bool 			priv_is_failed(int state) { return state & (NUD_FAILED | NUD_INCOMPLETE); }
 
 	void			event_handler(event_t event, void* p_event_info = NULL);
 	void			priv_event_handler_no_locks(event_t event, void* p_event_info = NULL);
@@ -357,9 +359,9 @@ private:
 	resource_allocation_key	*m_res_key;
 	event_t 		rdma_event_mapping(struct rdma_cm_event* p_event);
 	void 			empty_unsent_queue();
-	bool 			post_send_packet(uint8_t protocol, iovec * iov, header *h);
-	bool			post_send_udp(iovec * iov, header *h);
-	bool			post_send_tcp(iovec * iov, header *h);
+	bool 			post_send_packet(neigh_send_data *n_send_data);
+	bool			post_send_udp(neigh_send_data *n_send_data);
+	bool			post_send_tcp(neigh_send_data *n_send_data);
 };
 
 class neigh_ib : public neigh_entry, public event_handler_ibverbs

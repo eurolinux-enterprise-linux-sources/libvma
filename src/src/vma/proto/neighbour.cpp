@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2001-2017 Mellanox Technologies, Ltd. All rights reserved.
+ * Copyright (c) 2001-2018 Mellanox Technologies, Ltd. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -282,13 +282,7 @@ int neigh_entry::send(neigh_send_info &s_info)
 	neigh_logdbg("");
 	auto_unlocker lock(m_lock);
 	//Need to copy send info
-	neigh_send_data * ns_data = new neigh_send_data(&s_info);
-	BULLSEYE_EXCLUDE_BLOCK_START
-	if(ns_data == NULL) {
-		neigh_logerr("Send() failed, failed to allocate ns_info");
-		return 0;
-	}
-	BULLSEYE_EXCLUDE_BLOCK_END
+	neigh_send_data *ns_data = new neigh_send_data(&s_info);
 
 	m_unsent_queue.push_back(ns_data);
 	int ret = ns_data->m_iov.iov_len;
@@ -306,8 +300,8 @@ void neigh_entry::empty_unsent_queue()
 	while (!m_unsent_queue.empty())
 	{
 		neigh_send_data * n_send_data = m_unsent_queue.front();
-		if(prepare_to_send_packet(n_send_data->m_header)) {
-			if(post_send_packet(n_send_data->m_protocol, &n_send_data->m_iov, n_send_data->m_header)) {
+		if (prepare_to_send_packet(n_send_data->m_header)) {
+			if (post_send_packet(n_send_data)) {
 				neigh_logdbg("sent one packet");
 			}
 			else {
@@ -346,7 +340,7 @@ void neigh_entry::handle_timer_expired(void* ctx)
 		return;
 	}
 
-	if(state != NUD_FAILED) {
+	if(!priv_is_failed(state)) {
 		//We want to verify that L2 address wasn't changed
 		unsigned char tmp[IPOIB_HW_ADDR_LEN];
 		address_t l2_addr = (address_t)tmp;
@@ -358,13 +352,13 @@ void neigh_entry::handle_timer_expired(void* ctx)
 		}
 	}
 
-	if (state != NUD_REACHABLE) {
-		neigh_logdbg("State is different from NUD_REACHABLE and L2 address wasn't changed. Sending ARP");
+	if (!priv_is_reachable(state)) {
+		neigh_logdbg("State (%d) is not reachable and L2 address wasn't changed. Sending ARP", state);
 		send_arp();
 		m_timer_handle = priv_register_timer_event(m_n_sysvar_neigh_wait_till_send_arp_msec, this, ONE_SHOT_TIMER, NULL);
 	}
 	else {
-		neigh_logdbg("State is NUD_REACHABLE and L2 address wasn't changed. Stop sending ARP");
+		neigh_logdbg("State is reachable (%s %d) and L2 address wasn't changed. Stop sending ARP", (state == NUD_REACHABLE) ? "NUD_REACHABLE" : "NUD_PERMANENT", state);
 	}
 }
 
@@ -372,23 +366,24 @@ void neigh_entry::send_arp()
 {
 	// In case we already sent the quota number of unicast ARPs, start sending broadcast ARPs
 	// or we want to send broadcast ARP for the first time
-	bool is_broadcast = (m_arp_counter >= m_n_sysvar_neigh_uc_arp_quata) || m_is_first_send_arp;
+	// or m_val is not valid
+	bool is_broadcast = (m_arp_counter >= m_n_sysvar_neigh_uc_arp_quata) || m_is_first_send_arp || !m_val;
 	if (post_send_arp(is_broadcast)) {
 		m_is_first_send_arp = false;
 		m_arp_counter++;
 	}
 }
 
-bool neigh_entry::post_send_packet(uint8_t protocol, iovec * iov, header * h)
+bool neigh_entry::post_send_packet(neigh_send_data *p_n_send_data)
 {
-	neigh_logdbg("ENTER post_send_packet protocol = %d", protocol);
-	m_id = generate_ring_user_id(h);
-	switch(protocol)
+	neigh_logdbg("ENTER post_send_packet protocol = %d", p_n_send_data->m_protocol);
+	m_id = generate_ring_user_id(p_n_send_data->m_header);
+	switch(p_n_send_data->m_protocol)
 	{
 		case  IPPROTO_UDP:
-			return (post_send_udp(iov, h));
+			return (post_send_udp(p_n_send_data));
 		case  IPPROTO_TCP:
-			return(post_send_tcp(iov, h));
+			return (post_send_tcp(p_n_send_data));
 		default:
 			neigh_logdbg("Unsupported protocol");
 			return false;
@@ -396,22 +391,21 @@ bool neigh_entry::post_send_packet(uint8_t protocol, iovec * iov, header * h)
 	}
 }
 
-bool neigh_entry::post_send_udp(iovec * iov, header *h)
+bool neigh_entry::post_send_udp(neigh_send_data *n_send_data)
 {
 	// Find number of ip fragments (-> packets, buffers, buffer descs...)
 	neigh_logdbg("ENTER post_send_udp");
 	int n_num_frags = 1;
 	bool b_need_sw_csum = false;
-#ifdef VMA_NO_HW_CSUM
+#ifdef DEFINED_SW_CSUM
 	b_need_sw_csum = true;
 #endif
 	mem_buf_desc_t* p_mem_buf_desc, *tmp = NULL;
 	tx_packet_template_t *p_pkt;
-	size_t sz_data_payload = iov->iov_len;
-	iphdr* p_hdr = &h->m_header.hdr.m_ip_hdr;
+	size_t sz_data_payload = n_send_data->m_iov.iov_len;
+	header *h = n_send_data->m_header;
 
-	int mtu = m_p_ring->get_mtu(route_rule_table_key(p_hdr->daddr, p_hdr->saddr, 0));
-	size_t max_ip_payload_size = ((mtu - sizeof(struct iphdr)) & ~0x7);
+	size_t max_ip_payload_size = ((n_send_data->m_mtu - sizeof(struct iphdr)) & ~0x7);
 
 	if (sz_data_payload > 65536) {
 		neigh_logdbg("sz_data_payload=%d exceeds max of 64KB", sz_data_payload);
@@ -478,7 +472,7 @@ bool neigh_entry::post_send_udp(iovec * iov, header *h)
 		uint8_t* p_payload = p_mem_buf_desc->p_buffer + h->m_transport_header_tx_offset + hdr_len;
 
 		// Copy user data to our tx buffers
-		int ret = memcpy_fromiovec(p_payload, iov, 1, sz_user_data_offset, sz_user_data_to_copy);
+		int ret = memcpy_fromiovec(p_payload, &n_send_data->m_iov, 1, sz_user_data_offset, sz_user_data_to_copy);
 		BULLSEYE_EXCLUDE_BLOCK_START
 		if (ret != (int)sz_user_data_to_copy) {
 			neigh_logerr("memcpy_fromiovec error (sz_user_data_to_copy=%d, ret=%d)", sz_user_data_to_copy, ret);
@@ -489,17 +483,17 @@ bool neigh_entry::post_send_udp(iovec * iov, header *h)
 		BULLSEYE_EXCLUDE_BLOCK_END
 
 		wqe_send_handler wqe_sh;
-		vma_wr_tx_packet_attr attr = (vma_wr_tx_packet_attr)0;
+		vma_wr_tx_packet_attr attr = (vma_wr_tx_packet_attr)(VMA_TX_PACKET_L3_CSUM);
 		if (b_need_sw_csum) {
-			neigh_logdbg("ip fragmentation detected, using SW checksum calculation");
-			p_pkt->hdr.m_ip_hdr.check = 0; // use 0 at csum calculation time
-			p_pkt->hdr.m_ip_hdr.check = compute_ip_checksum((unsigned short*)&p_pkt->hdr.m_ip_hdr, p_pkt->hdr.m_ip_hdr.ihl * 2);
+			attr = (vma_wr_tx_packet_attr)(attr|VMA_TX_SW_CSUM);
 			wqe_sh.disable_hw_csum(m_send_wqe);
 		} else {
 			neigh_logdbg("using HW checksum calculation");
 			wqe_sh.enable_hw_csum(m_send_wqe);
-			attr = (vma_wr_tx_packet_attr)(VMA_TX_PACKET_L3_CSUM|VMA_TX_PACKET_L4_CSUM);
 		}
+
+		p_mem_buf_desc->tx.p_ip_h = &p_pkt->hdr.m_ip_hdr;
+		p_mem_buf_desc->tx.p_udp_h = &p_pkt->hdr.m_udp_hdr;
 
 		m_sge.addr = (uintptr_t)(p_mem_buf_desc->p_buffer + (uint8_t)h->m_transport_header_tx_offset);
 		m_sge.length = sz_user_data_to_copy + hdr_len;
@@ -529,11 +523,12 @@ bool neigh_entry::post_send_udp(iovec * iov, header *h)
 }
 
 
-bool neigh_entry::post_send_tcp(iovec *iov, header *h)
+bool neigh_entry::post_send_tcp(neigh_send_data *p_data)
 {
 	tx_packet_template_t* p_pkt;
 	mem_buf_desc_t *p_mem_buf_desc;
 	size_t total_packet_len = 0;
+	header *h = p_data->m_header;
 
 	wqe_send_handler wqe_sh;
 	wqe_sh.enable_hw_csum(m_send_wqe);
@@ -552,15 +547,16 @@ bool neigh_entry::post_send_tcp(iovec *iov, header *h)
 	p_mem_buf_desc->p_next_desc = NULL;
 
 	//copy L4 neigh buffer to tx buffer
-	memcpy((void*)(p_mem_buf_desc->p_buffer +h->m_aligned_l2_l3_len), iov->iov_base, iov->iov_len);
+	memcpy((void*)(p_mem_buf_desc->p_buffer + h->m_aligned_l2_l3_len),
+			p_data->m_iov.iov_base, p_data->m_iov.iov_len);
 
 	p_pkt = (tx_packet_template_t*)(p_mem_buf_desc->p_buffer);
-	total_packet_len = iov->iov_len + h->m_total_hdr_len;
+	total_packet_len = p_data->m_iov.iov_len + h->m_total_hdr_len;
 	h->copy_l2_ip_hdr(p_pkt);
 	// We've copied to aligned address, and now we must update p_pkt to point to real
 	// L2 header
 
-	p_pkt->hdr.m_ip_hdr.tot_len = (htons)(iov->iov_len + h->m_ip_header_len);
+	p_pkt->hdr.m_ip_hdr.tot_len = (htons)(p_data->m_iov.iov_len + h->m_ip_header_len);
 
 	// The header is aligned for fast copy but we need to maintain this diff in order to get the real header pointer easily
 	size_t hdr_alignment_diff = h->m_aligned_l2_l3_len - h->m_total_hdr_len;
@@ -577,17 +573,10 @@ bool neigh_entry::post_send_tcp(iovec *iov, header *h)
 	}
 
 	m_send_wqe.wr_id = (uintptr_t)p_mem_buf_desc;
-	vma_wr_tx_packet_attr attr = (vma_wr_tx_packet_attr)0;
-#ifdef VMA_NO_HW_CSUM
-		p_pkt->hdr.m_ip_hdr.check = 0; // use 0 at csum calculation time
-		p_pkt->hdr.m_ip_hdr.check = compute_ip_checksum((unsigned short*)&p_pkt->hdr.m_ip_hdr, p_pkt->hdr.m_ip_hdr.ihl * 2);
-		struct tcphdr* p_tcphdr = (struct tcphdr*)(((uint8_t*)(&(p_pkt->hdr.m_ip_hdr))+sizeof(p_pkt->hdr.m_ip_hdr)));
-		p_tcphdr->check = 0;
-		p_tcphdr->check = compute_tcp_checksum(&p_pkt->hdr.m_ip_hdr, (const uint16_t *)p_tcphdr);
-		neigh_logdbg("using SW checksum calculation: p_pkt->hdr.m_ip_hdr.check=%d, p_tcphdr->check=%d", (int)p_tcphdr->check, (int)p_pkt->hdr.m_ip_hdr.check);
-#else
-	attr = (vma_wr_tx_packet_attr)(VMA_TX_PACKET_L3_CSUM|VMA_TX_PACKET_L4_CSUM);
-#endif
+	vma_wr_tx_packet_attr attr = (vma_wr_tx_packet_attr)(VMA_TX_PACKET_L3_CSUM|VMA_TX_PACKET_L4_CSUM);
+	p_mem_buf_desc->tx.p_ip_h = &p_pkt->hdr.m_ip_hdr;
+	p_mem_buf_desc->tx.p_tcp_h = (struct tcphdr*)(((uint8_t*)(&(p_pkt->hdr.m_ip_hdr))+sizeof(p_pkt->hdr.m_ip_hdr)));
+
 	m_p_ring->send_ring_buffer(m_id, &m_send_wqe, attr);
 #ifndef __COVERITY__
 	struct tcphdr* p_tcp_h = (struct tcphdr*)(((uint8_t*)(&(p_pkt->hdr.m_ip_hdr))+sizeof(p_pkt->hdr.m_ip_hdr)));
@@ -683,10 +672,37 @@ void neigh_entry::handle_neigh_event(neigh_nl_event* nl_ev)
 	int neigh_state = nl_info->state;
 	switch (neigh_state)
 	{
-	case NUD_FAILED:
-		neigh_logdbg("state = FAILED");
-		event_handler(EV_ERROR);
+
+	case NUD_REACHABLE:
+	case NUD_PERMANENT:
+	{
+		BULLSEYE_EXCLUDE_BLOCK_START
+		if(m_state_machine == NULL) {
+			neigh_logerr("m_state_machine: not a valid case");
+			break;
+		}
+		BULLSEYE_EXCLUDE_BLOCK_END
+
+		neigh_logdbg("state = '%s' (%d) L2 address = %s", nl_info->get_state2str().c_str(), neigh_state, nl_info->lladdr_str.c_str());
+		priv_handle_neigh_reachable_event();
+		/* In case we got REACHABLE event need to do the following
+		 * Check that neigh has L2 address
+		 * if not send event to neigh
+		 * else need to check that the new l2 address is equal to the old one
+		 * if not equal this is a remote bonding event - issue an EV_ERROR
+		 */
+		auto_unlocker lock(m_lock);
+		// This if and priv_handle_neigh_ha_event should be done under lock
+		if (m_state_machine->get_curr_state() != ST_READY) {
+			// This is new entry
+			event_handler(EV_ARP_RESOLVED);
+			break;
+		}
+
+		// Check if neigh L2 address changed (HA event) and restart the state machine
+		priv_handle_neigh_is_l2_changed(nl_info->lladdr);
 		break;
+	}
 
 	case NUD_STALE:
 	{
@@ -716,33 +732,17 @@ void neigh_entry::handle_neigh_event(neigh_nl_event* nl_ev)
 		}
 		break;
 	}
-	case NUD_REACHABLE:
+
+	case NUD_INCOMPLETE:
 	{
-		BULLSEYE_EXCLUDE_BLOCK_START
-		if(m_state_machine == NULL) {
-			neigh_logerr("m_state_machine: not a valid case");
-			break;
-		}
-		BULLSEYE_EXCLUDE_BLOCK_END
+		neigh_logdbg("state = INCOMPLETE");
+		break;
+	}
 
-		neigh_logdbg("state = '%s' (%d) L2 address = %s", nl_info->get_state2str().c_str(), neigh_state, nl_info->lladdr_str.c_str());
-		priv_handle_neigh_reachable_event();
-		/* In case we got REACHABLE event need to do the following
-		 * Check that neigh has L2 address
-		 * if not send event to neigh
-		 * else need to check that the new l2 address is equal to the old one
-		 * if not equal this is a remote bonding event - issue an EV_ERROR
-		 */
-		auto_unlocker lock(m_lock);
-		// This if and priv_handle_neigh_ha_event should be done under lock
-		if (m_state_machine->get_curr_state() != ST_READY) {
-			// This is new entry
-			event_handler(EV_ARP_RESOLVED);
-			break;
-		}
-
-		// Check if neigh L2 address changed (HA event) and restart the state machine
-		priv_handle_neigh_is_l2_changed(nl_info->lladdr);
+	case NUD_FAILED:
+	{
+		neigh_logdbg("state = FAILED");
+		event_handler(EV_ERROR);
 		break;
 	}
 
@@ -997,6 +997,10 @@ int neigh_entry::priv_enter_init()
 //Private enter function for INIT_RESOLUTION state
 int neigh_entry::priv_enter_init_resolution()
 {
+	if (NULL == g_p_neigh_table_mgr->m_neigh_cma_event_channel) {
+		return 0;
+	}
+
 	// 1. Delete old cma_id
 	priv_destroy_cma_id();
 
@@ -1040,7 +1044,7 @@ int neigh_entry::priv_enter_addr_resolved()
 
 	int state;
 
-	if (!priv_get_neigh_state(state) || state != NUD_REACHABLE) {
+	if (!priv_get_neigh_state(state) || !priv_is_reachable(state)) {
 		neigh_logdbg("got addr_resolved but state=%d", state);
 		send_arp();
 		m_timer_handle = priv_register_timer_event(m_n_sysvar_neigh_wait_till_send_arp_msec, this, ONE_SHOT_TIMER, NULL);
@@ -1065,6 +1069,7 @@ void neigh_entry::priv_enter_not_active()
 
 	priv_destroy_cma_id();
 	priv_unregister_timer();
+	m_is_first_send_arp = true; // force send boardcast next cycle
 	m_arp_counter = 0;
 
 	// Flush unsent_queue in case that neigh entry is in error state
@@ -1099,6 +1104,7 @@ void neigh_entry::priv_enter_error()
 
 	priv_destroy_cma_id();
 	priv_unregister_timer();
+	m_is_first_send_arp = true; // force send boardcast next cycle
 	m_arp_counter = 0;
 
 	if (m_val) {
@@ -1142,7 +1148,7 @@ int neigh_entry::priv_enter_ready()
 	// This is the case when VMA was started with neigh in STALE state and
 	// rdma_adress_resolve() in this case will not initiate ARP
 	if (m_type == UC && ! m_is_loopback) {
-		if (priv_get_neigh_state(state) && (state != NUD_REACHABLE)) {
+		if (priv_get_neigh_state(state) && !priv_is_reachable(state)) {
 			send_arp();
 			m_timer_handle = priv_register_timer_event(m_n_sysvar_neigh_wait_till_send_arp_msec, this, ONE_SHOT_TIMER, NULL);
 		}
@@ -1183,7 +1189,7 @@ bool neigh_entry::priv_get_neigh_l2(address_t & l2_addr)
 
 	if (inet_ntop(AF_INET, &(m_dst_addr.sin_addr), str_addr, sizeof(str_addr)) &&
 			g_p_netlink_handler->get_neigh(str_addr, m_p_dev->get_if_idx(), &info)){
-		if (info.state != NUD_FAILED) {
+		if (!priv_is_failed(info.state)) {
 			memcpy(l2_addr, info.lladdr, info.lladdr_len);
 			return true;
 		}
@@ -1349,7 +1355,7 @@ int neigh_eth::priv_enter_init()
 {
 	int state;
 
-	if (priv_get_neigh_state(state) && (state != NUD_FAILED)) {
+	if (priv_get_neigh_state(state) && !priv_is_failed(state)) {
 		event_handler(EV_ARP_RESOLVED);
 		return 0;
 	}
@@ -1363,7 +1369,7 @@ int neigh_eth::priv_enter_init_resolution()
 
 	if (!(neigh_entry::priv_enter_init_resolution())) {
 		// query netlink - if this entry already exist and REACHABLE we can use it
-		if (priv_get_neigh_state(state) && (state != NUD_FAILED)) {
+		if (priv_get_neigh_state(state) && !priv_is_failed(state)) {
 				event_handler(EV_ARP_RESOLVED);
 		}
 		return 0;
@@ -1794,6 +1800,11 @@ int neigh_ib::priv_enter_arp_resolved()
 {
 	neigh_logfunc("");
 
+	if (m_cma_id->verbs == NULL) {
+		neigh_logdbg("m_cma_id->verbs is NULL");
+		return -1;
+	}
+
 	if (find_pd())
 		return -1;
 
@@ -1998,12 +2009,7 @@ int neigh_ib::find_pd()
 {
 	neigh_logdbg("");
 
-	if (m_cma_id->verbs == NULL) {
-		neigh_logdbg("m_cma_id->verbs is NULL");
-		return -1;
-	}
-	ib_ctx_handler* ib_ctx_h = g_p_ib_ctx_handler_collection->get_ib_ctx(
-			m_cma_id->verbs);
+	ib_ctx_handler* ib_ctx_h = g_p_ib_ctx_handler_collection->get_ib_ctx(m_p_dev->get_ifname_link());
 
 	if (ib_ctx_h) {
 		m_pd = ib_ctx_h->get_ibv_pd();
@@ -2091,6 +2097,11 @@ void neigh_ib_broadcast::build_mc_neigh_val()
 		return;
 	}
 
+	if (m_cma_id->verbs == NULL) {
+		neigh_logdbg("m_cma_id->verbs is NULL");
+		return;
+	}
+
 	m_val->m_l2_address = new IPoIB_addr(((m_p_dev->get_br_address())->get_address()));
 	if (m_val->m_l2_address == NULL) {
 		neigh_logerr("Failed allocating m_val->m_l2_address");
@@ -2108,7 +2119,8 @@ void neigh_ib_broadcast::build_mc_neigh_val()
 	((neigh_ib_val *) m_val)->m_ah_attr.is_global	  =	0x1;
 
 	if(find_pd()) {
-			neigh_logerr("Failed find_pd()");
+		neigh_logerr("Failed find_pd()");
+		return;
 	}
 
 	/*neigh_logerr("m_pd = %p,  flow_label = %#x, sgid_index=%#x, hop_limit=%#x, traffic_class=%#x",

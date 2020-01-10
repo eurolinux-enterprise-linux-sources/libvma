@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2001-2017 Mellanox Technologies, Ltd. All rights reserved.
+ * Copyright (c) 2001-2018 Mellanox Technologies, Ltd. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -44,7 +44,7 @@
 #include "util/valgrind.h"
 #include "vma/event/event_handler_manager.h"
 
-#define MODULE_NAME             "ib_ctx_handler"
+#define MODULE_NAME             "ibch"
 
 #define ibch_logpanic           __log_panic
 #define ibch_logerr             __log_err
@@ -55,128 +55,194 @@
 #define ibch_logfuncall         __log_info_funcall
 
 
-ib_ctx_handler::ib_ctx_handler(struct ibv_context* ctx, ts_conversion_mode_t ctx_time_converter_mode) :
+ib_ctx_handler::ib_ctx_handler(struct ib_ctx_handler_desc *desc) :
 	m_flow_tag_enabled(false)
 	, m_on_device_memory(0)
 	, m_removed(false)
-	, m_conf_attr_rx_num_wre(0)
-	, m_conf_attr_tx_num_to_signal(0)
-	, m_conf_attr_tx_max_inline(0)
-	, m_conf_attr_tx_num_wre(0)
+	, m_lock_umr("spin_lock_umr")
+	, m_umr_cq(NULL)
+	, m_umr_qp(NULL)
 	, m_p_ctx_time_converter(NULL)
 {
-	memset(&m_ibv_port_attr, 0, sizeof(m_ibv_port_attr));
-	m_p_ibv_context = ctx;
-	VALGRIND_MAKE_MEM_DEFINED(m_p_ibv_context, sizeof(ibv_context));
-	m_p_ibv_device = ctx->device;
+	if (NULL == desc) {
+		ibch_logpanic("Invalid ib_ctx_handler");
+	}
 
-	BULLSEYE_EXCLUDE_BLOCK_START
+	m_p_ibv_device = desc->device;
+
 	if (m_p_ibv_device == NULL) {
-		ibch_logpanic("ibv_device is NULL! (ibv context %p)", m_p_ibv_context);
+		ibch_logpanic("m_p_ibv_device is invalid");
 	}
 
-#ifdef DEFINED_IBV_EXP_CQ_TIMESTAMP
-	if (ctx_time_converter_mode != TS_CONVERSION_MODE_DISABLE) {
-		struct ibv_exp_device_attr device_attr;
-		memset(&device_attr, 0, sizeof(device_attr));
-		device_attr.comp_mask = IBV_EXP_DEVICE_ATTR_WITH_HCA_CORE_CLOCK;
-		if (!ibv_exp_query_device(m_p_ibv_context ,&device_attr)) {
-			if (ctx_time_converter_mode == TS_CONVERSION_MODE_PTP) {
-#ifdef DEFINED_IBV_EXP_VALUES_CLOCK_INFO
-				struct ibv_exp_values ibv_exp_values_tmp;
-				memset(&ibv_exp_values_tmp, 0, sizeof(ibv_exp_values_tmp));
-				int ret = ibv_exp_query_values(m_p_ibv_context, IBV_EXP_VALUES_CLOCK_INFO, &ibv_exp_values_tmp);
-				if (!ret) {
-					m_p_ctx_time_converter = new time_converter_ptp(ctx);
-				} else { // revert to mode TS_CONVERSION_MODE_SYNC
-					m_p_ctx_time_converter = new time_converter_ib_ctx(ctx, TS_CONVERSION_MODE_SYNC, device_attr.hca_core_clock);
-					ibch_logwarn("ibv_exp_query_values failure for clock_info, reverting to mode TS_CONVERSION_MODE_SYNC (ibv context %p) (return value=%d)",
-								m_p_ibv_context, ret);
-				}
-#else
-				m_p_ctx_time_converter = new time_converter_ib_ctx(ctx, TS_CONVERSION_MODE_SYNC, device_attr.hca_core_clock);
-				ibch_logwarn("PTP is not supported by the underlying Infiniband verbs. IBV_EXP_VALUES_CLOCK_INFO not defined. reverting to mode TS_CONVERSION_MODE_SYNC");
-#endif // DEFINED_IBV_EXP_VALUES_CLOCK_INFO
-			} else {
-				m_p_ctx_time_converter = new time_converter_ib_ctx(ctx, ctx_time_converter_mode, device_attr.hca_core_clock);
-			}
-		} else {
-			m_p_ctx_time_converter = new time_converter_ib_ctx(ctx, TS_CONVERSION_MODE_DISABLE, 0);
-			ibch_logwarn("device does not support hca_core_clock operations, reverting to mode TS_CONVERSION_MODE_DISABLE (ibv context %p) (hca_core_clock=%llu)",
-											m_p_ibv_context, device_attr.hca_core_clock);
-		}
-	} else {
-		m_p_ctx_time_converter = new time_converter_ib_ctx(ctx, TS_CONVERSION_MODE_DISABLE, 0);
-	}
-#else
-	m_p_ctx_time_converter = new time_converter_ib_ctx(ctx, TS_CONVERSION_MODE_DISABLE, 0);
-	if (ctx_time_converter_mode != TS_CONVERSION_MODE_DISABLE) {
-		ibch_logwarn("time converter mode not applicable (configuration value=%d). set to TS_CONVERSION_MODE_DISABLE.",
-				ctx_time_converter_mode);
-	}
-#endif // DEFINED_IBV_EXP_CQ_TIMESTAMP
-
-	if (!m_p_ctx_time_converter) {
-		ibch_logerr("Failed to allocate memory for time converter object");
-		return;
+	m_p_ibv_context = ibv_open_device(m_p_ibv_device);
+	if (m_p_ibv_context == NULL) {
+		ibch_logpanic("m_p_ibv_context is invalid");
 	}
 
 	// Create pd for this device
 	m_p_ibv_pd = ibv_alloc_pd(m_p_ibv_context);
 	if (m_p_ibv_pd == NULL) {
-		ibch_logpanic("ibv device %p pd allocation failure (ibv context %p) (errno=%d %m)", 
+		ibch_logpanic("ibv device %p pd allocation failure (ibv context %p) (errno=%d %m)",
 			    m_p_ibv_device, m_p_ibv_context, errno);
 	}
-
-	memset(&m_ibv_device_attr, 0, sizeof(m_ibv_device_attr));
-	vma_ibv_device_attr_comp_mask(m_ibv_device_attr);
-	IF_VERBS_FAILURE(vma_ibv_query_device(m_p_ibv_context, &m_ibv_device_attr)) {
-		ibch_logerr("ibv_query_device failed on ibv device %p (ibv context %p) (errno=%d %m)", 
+	VALGRIND_MAKE_MEM_DEFINED(m_p_ibv_pd, sizeof(struct ibv_pd));
+	m_p_ibv_device_attr = new vma_ibv_device_attr();
+	if (m_p_ibv_device_attr == NULL) {
+		ibch_logpanic("ibv device %p attr allocation failure (ibv context %p) (errno=%d %m)",
+			    m_p_ibv_device, m_p_ibv_context, errno);
+	}
+	vma_ibv_device_attr_comp_mask(m_p_ibv_device_attr);
+	IF_VERBS_FAILURE(vma_ibv_query_device(m_p_ibv_context, m_p_ibv_device_attr)) {
+		ibch_logerr("ibv_query_device failed on ibv device %p (ibv context %p) (errno=%d %m)",
 			  m_p_ibv_device, m_p_ibv_context, errno);
-		return;
+		goto err;
 	} ENDIF_VERBS_FAILURE;
-	BULLSEYE_EXCLUDE_BLOCK_END
 
-	// Query device for on device memory capabilities
-	update_on_device_memory_size();
+#ifdef DEFINED_IBV_EXP_CQ_TIMESTAMP
+	switch (desc->ctx_time_converter_mode) {
+	case TS_CONVERSION_MODE_DISABLE:
+		m_p_ctx_time_converter = new time_converter_ib_ctx(m_p_ibv_context, TS_CONVERSION_MODE_DISABLE, 0);
+	break;
+	case TS_CONVERSION_MODE_PTP: {
+# ifdef DEFINED_IBV_EXP_VALUES_CLOCK_INFO
+		struct ibv_exp_values ibv_exp_values_tmp;
+		memset(&ibv_exp_values_tmp, 0, sizeof(ibv_exp_values_tmp));
+		int ret = ibv_exp_query_values(m_p_ibv_context,
+					       IBV_EXP_VALUES_CLOCK_INFO,
+					       &ibv_exp_values_tmp);
+		if (!ret) {
+			m_p_ctx_time_converter = new time_converter_ptp(m_p_ibv_context);
+		} else { // revert to mode TS_CONVERSION_MODE_SYNC
+			m_p_ctx_time_converter = new time_converter_ib_ctx(m_p_ibv_context,
+							TS_CONVERSION_MODE_SYNC,
+							m_p_ibv_device_attr->hca_core_clock);
+			ibch_logwarn("ibv_exp_query_values failure for clock_info, "
+					"reverting to mode TS_CONVERSION_MODE_SYNC "
+					"(ibv context %p) (return value=%d)",
+					m_p_ibv_context, ret);
+		}
+# else
+		m_p_ctx_time_converter = new time_converter_ib_ctx(m_p_ibv_context,
+				TS_CONVERSION_MODE_SYNC,
+				m_p_ibv_device_attr->hca_core_clock);
+		ibch_logwarn("PTP is not supported by the underlying Infiniband "
+				"verbs. IBV_EXP_VALUES_CLOCK_INFO not defined. "
+				"reverting to mode TS_CONVERSION_MODE_SYNC");
+# endif // DEFINED_IBV_EXP_VALUES_CLOCK_INFO
+	}
+	break;
+	default:
+		m_p_ctx_time_converter = new time_converter_ib_ctx(m_p_ibv_context,
+				desc->ctx_time_converter_mode,
+				m_p_ibv_device_attr->hca_core_clock);
+		break;
+	}
+#else
+	m_p_ctx_time_converter = new time_converter_ib_ctx(m_p_ibv_context, TS_CONVERSION_MODE_DISABLE, 0);
+	if (desc->ctx_time_converter_mode != TS_CONVERSION_MODE_DISABLE) {
+		ibch_logwarn("time converter mode not applicable (configuration "
+				"value=%d). set to TS_CONVERSION_MODE_DISABLE.",
+				desc->ctx_time_converter_mode);
+	}
+#endif // DEFINED_IBV_EXP_CQ_TIMESTAMP
+	// update device memory capabilities
+	m_on_device_memory = vma_ibv_dm_size(m_p_ibv_device_attr);
 
-	ibch_logdbg("ibv device '%s' [%p] has %d port%s. Vendor Part Id: %d, FW Ver: %s, max_qp_wr=%d",
-			m_p_ibv_device->name, m_p_ibv_device, m_ibv_device_attr.phys_port_cnt, ((m_ibv_device_attr.phys_port_cnt>1)?"s":""),
-			m_ibv_device_attr.vendor_part_id, m_ibv_device_attr.fw_ver, m_ibv_device_attr.max_qp_wr);
+	g_p_event_handler_manager->register_ibverbs_event(m_p_ibv_context->async_fd,
+						this, m_p_ibv_context, 0);
 
-	set_dev_configuration();
+	return;
 
-	g_p_event_handler_manager->register_ibverbs_event(m_p_ibv_context->async_fd, this, m_p_ibv_context, 0);
+err:
+	if (m_p_ibv_device_attr) {
+		delete m_p_ibv_device_attr;
+	}
+
+	if (m_p_ibv_pd) {
+		ibv_dealloc_pd(m_p_ibv_pd);
+	}
+
+	if (m_p_ibv_context) {
+		ibv_close_device(m_p_ibv_context);
+	}
 }
 
-ib_ctx_handler::~ib_ctx_handler() {
+ib_ctx_handler::~ib_ctx_handler()
+{
 	g_p_event_handler_manager->unregister_ibverbs_event(m_p_ibv_context->async_fd, this);
+
 	// must delete ib_ctx_handler only after freeing all resources that
 	// are still associated with the PD m_p_ibv_pd
 	BULLSEYE_EXCLUDE_BLOCK_START
-	if (ibv_dealloc_pd(m_p_ibv_pd))
-		ibch_logdbg("pd deallocation failure (errno=%d %m)", errno);
+
+	mr_map_lkey_t::iterator iter;
+	while ((iter = m_mr_map_lkey.begin()) != m_mr_map_lkey.end()) {
+		mem_dereg(iter->first);
+	}
+	if (m_umr_qp) {
+		IF_VERBS_FAILURE_EX(ibv_destroy_qp(m_umr_qp), EIO) {
+			ibch_logdbg("destroy qp failed (errno=%d %m)", errno);
+		} ENDIF_VERBS_FAILURE;
+		m_umr_qp = NULL;
+	}
+	if (m_umr_cq) {
+		IF_VERBS_FAILURE_EX(ibv_destroy_cq(m_umr_cq), EIO) {
+			ibch_logdbg("destroy cq failed (errno=%d %m)", errno);
+		} ENDIF_VERBS_FAILURE;
+		m_umr_cq = NULL;
+	}
+	if (m_p_ibv_pd) {
+		IF_VERBS_FAILURE_EX(ibv_dealloc_pd(m_p_ibv_pd), EIO) {
+			ibch_logdbg("pd deallocation failure (errno=%d %m)", errno);
+		} ENDIF_VERBS_FAILURE;
+		VALGRIND_MAKE_MEM_UNDEFINED(m_p_ibv_pd, sizeof(struct ibv_pd));
+		m_p_ibv_pd = NULL;
+	}
+
 	delete m_p_ctx_time_converter;
+	delete m_p_ibv_device_attr;
+
+	ibv_close_device(m_p_ibv_context);
+	m_p_ibv_context = NULL;
+
 	BULLSEYE_EXCLUDE_BLOCK_END
 }
 
-void ib_ctx_handler::update_on_device_memory_size()
+void ib_ctx_handler::set_str()
 {
-#if defined(HAVE_IBV_DM)
-	struct ibv_exp_device_attr attr;
-	memset(&attr, 0, sizeof(attr));
+	char str_x[255] = {0};
 
-	attr.comp_mask = IBV_EXP_DEVICE_ATTR_MAX_DM_SIZE;
-	if (ibv_exp_query_device(m_p_ibv_context, &attr)) {
-		ibch_logerr("Couldn't query device for its features");
-		return;
-	}
+	m_str[0] = '\0';
 
-	m_on_device_memory = attr.max_dm_size;
+	str_x[0] = '\0';
+	sprintf(str_x, " %s:", get_ibname());
+	strcat(m_str, str_x);
 
-#endif
+	str_x[0] = '\0';
+	sprintf(str_x, " port(s): %d", m_p_ibv_device_attr->phys_port_cnt);
+	strcat(m_str, str_x);
 
-	ibch_logdbg("ibv device '%s' [%p] supports %zu bytes of on device memory", m_p_ibv_device->name, m_p_ibv_device, m_on_device_memory);
+	str_x[0] = '\0';
+	sprintf(str_x, " vendor: %d", m_p_ibv_device_attr->vendor_part_id);
+	strcat(m_str, str_x);
+
+	str_x[0] = '\0';
+	sprintf(str_x, " fw: %s", m_p_ibv_device_attr->fw_ver);
+	strcat(m_str, str_x);
+
+	str_x[0] = '\0';
+	sprintf(str_x, " max_qp_wr: %d", m_p_ibv_device_attr->max_qp_wr);
+	strcat(m_str, str_x);
+
+	str_x[0] = '\0';
+	sprintf(str_x, " on_device_memory: %zu", m_on_device_memory);
+	strcat(m_str, str_x);
+}
+
+void ib_ctx_handler::print_val()
+{
+	set_str();
+	ibch_logdbg("%s", m_str);
 }
 
 ts_conversion_mode_t ib_ctx_handler::get_ctx_time_converter_status()
@@ -184,10 +250,11 @@ ts_conversion_mode_t ib_ctx_handler::get_ctx_time_converter_status()
 	return m_p_ctx_time_converter->get_converter_status();
 }
 
-ibv_mr* ib_ctx_handler::mem_reg(void *addr, size_t length, uint64_t access)
+uint32_t ib_ctx_handler::mem_reg(void *addr, size_t length, uint64_t access)
 {
-	// Register the memory block with the HCA on this ibv_device
-	ibch_logfunc("(dev=%p) addr=%p, length=%d, m_p_ibv_pd=%p on dev=%p", m_p_ibv_device, addr, length, m_p_ibv_pd, m_p_ibv_pd->context->device);
+	struct ibv_mr *mr = NULL;
+	uint32_t lkey = (uint32_t)(-1);
+
 #ifdef DEFINED_IBV_EXP_ACCESS_ALLOCATE_MR
 	struct ibv_exp_reg_mr_in in;
 	memset(&in, 0 ,sizeof(in));
@@ -195,24 +262,49 @@ ibv_mr* ib_ctx_handler::mem_reg(void *addr, size_t length, uint64_t access)
 	in.addr = addr;
 	in.length = length;
 	in.pd = m_p_ibv_pd;
-	ibv_mr *mr = ibv_exp_reg_mr(&in);
+	mr = ibv_exp_reg_mr(&in);
 #else
-	ibv_mr *mr = ibv_reg_mr(m_p_ibv_pd, addr, length, access);
+	mr = ibv_reg_mr(m_p_ibv_pd, addr, length, access);
 #endif
 	VALGRIND_MAKE_MEM_DEFINED(mr, sizeof(ibv_mr));
-	return mr;
+	if (NULL == mr) {
+		ibch_logerr("failed registering a memory region "
+				"(errno=%d %m)", errno);
+	} else {
+		m_mr_map_lkey[mr->lkey] = mr;
+		lkey = mr->lkey;
+
+		ibch_logdbg("dev:%s (%p) addr=%p length=%d pd=%p",
+				get_ibname(), m_p_ibv_device, addr, length, m_p_ibv_pd);
+	}
+
+	return lkey;
 }
 
-void ib_ctx_handler::mem_dereg(ibv_mr *mr)
+void ib_ctx_handler::mem_dereg(uint32_t lkey)
 {
-	if (is_removed()) {
-		return;
+	mr_map_lkey_t::iterator iter = m_mr_map_lkey.find(lkey);
+	if (iter != m_mr_map_lkey.end()) {
+		struct ibv_mr* mr = iter->second;
+		ibch_logdbg("dev:%s (%p) addr=%p length=%d pd=%p",
+				get_ibname(), m_p_ibv_device, mr->addr, mr->length, m_p_ibv_pd);
+		IF_VERBS_FAILURE_EX(ibv_dereg_mr(mr), EIO) {
+			ibch_logdbg("failed de-registering a memory region "
+					"(errno=%d %m)", errno);
+		} ENDIF_VERBS_FAILURE;
+		VALGRIND_MAKE_MEM_UNDEFINED(mr, sizeof(ibv_mr));
+		m_mr_map_lkey.erase(iter);
 	}
-	IF_VERBS_FAILURE(ibv_dereg_mr(mr)) {
-		ibch_logerr("failed de-registering a memory region "
-				"(errno=%d %m)", errno);
-	} ENDIF_VERBS_FAILURE;
-	VALGRIND_MAKE_MEM_UNDEFINED(mr, sizeof(ibv_mr));
+}
+
+struct ibv_mr* ib_ctx_handler::get_mem_reg(uint32_t lkey)
+{
+	mr_map_lkey_t::iterator iter = m_mr_map_lkey.find(lkey);
+	if (iter != m_mr_map_lkey.end()) {
+		return iter->second;
+	}
+
+	return NULL;
 }
 
 void ib_ctx_handler::set_flow_tag_capability(bool flow_tag_capability)
@@ -220,48 +312,16 @@ void ib_ctx_handler::set_flow_tag_capability(bool flow_tag_capability)
 	m_flow_tag_enabled = flow_tag_capability;
 }
 
-bool ib_ctx_handler::update_port_attr(int port_num)
+bool ib_ctx_handler::is_active(int port_num)
 {
-        IF_VERBS_FAILURE(ibv_query_port(m_p_ibv_context, port_num, &m_ibv_port_attr)) {
-                ibch_logdbg("ibv_query_port failed on ibv device %p, port %d (errno=%d)", m_p_ibv_context, port_num, errno);
-                return false;
-        } ENDIF_VERBS_FAILURE;
-        return true;
-}
+	ibv_port_attr port_attr;
 
-ibv_port_state ib_ctx_handler::get_port_state(int port_num)
-{       
-        update_port_attr(port_num);
-        return m_ibv_port_attr.state;
-}
-
-#if _BullseyeCoverage
-    #pragma BullseyeCoverage off
-#endif
-
-ibv_port_attr ib_ctx_handler::get_ibv_port_attr(int port_num)
-{
-        update_port_attr(port_num);
-        return m_ibv_port_attr;
-}
-
-#if _BullseyeCoverage
-    #pragma BullseyeCoverage on
-#endif
-
-void ib_ctx_handler::set_dev_configuration()
-{
-	ibch_logdbg("Setting configuration for the MLX card %s", m_p_ibv_device->name);
-	m_conf_attr_rx_num_wre       = safe_mce_sys().rx_num_wr;
-	m_conf_attr_tx_max_inline    = safe_mce_sys().tx_max_inline;
-	m_conf_attr_tx_num_wre       = safe_mce_sys().tx_num_wr;
-	m_conf_attr_tx_num_to_signal = safe_mce_sys().tx_num_wr_to_signal;
-
-	if (m_conf_attr_tx_num_wre < (m_conf_attr_tx_num_to_signal * 2)) {
-		m_conf_attr_tx_num_wre = m_conf_attr_tx_num_to_signal * 2;
-		ibch_loginfo("%s Setting the %s to %d according to the device specific configuration:",
-			   m_p_ibv_device->name, SYS_VAR_TX_NUM_WRE, safe_mce_sys().tx_num_wr);
-	}
+	memset(&port_attr, 0, sizeof(ibv_port_attr));
+	IF_VERBS_FAILURE(ibv_query_port(m_p_ibv_context, port_num, &port_attr)) {
+		ibch_logdbg("ibv_query_port failed on ibv device %p, port %d "
+			    "(errno=%d)", m_p_ibv_context, port_num, errno);
+	}ENDIF_VERBS_FAILURE;
+	return port_attr.state == IBV_PORT_ACTIVE;
 }
 
 void ib_ctx_handler::handle_event_ibverbs_cb(void *ev_data, void *ctx)
@@ -269,15 +329,173 @@ void ib_ctx_handler::handle_event_ibverbs_cb(void *ev_data, void *ctx)
  	NOT_IN_USE(ctx);
 
 	struct ibv_async_event *ibv_event = (struct ibv_async_event*)ev_data;
-	ibch_logdbg("received ibv_event '%s' (%d)", priv_ibv_event_desc_str(ibv_event->event_type), ibv_event->event_type);
+	ibch_logdbg("received ibv_event '%s' (%d)",
+		    priv_ibv_event_desc_str(ibv_event->event_type),
+		    ibv_event->event_type);
 		
 	if (ibv_event->event_type == IBV_EVENT_DEVICE_FATAL) {
-		handle_event_DEVICE_FATAL();
+		handle_event_device_fatal();
 	}
 }
 
-void ib_ctx_handler::handle_event_DEVICE_FATAL()
+void ib_ctx_handler::handle_event_device_fatal()
 {
 	m_removed = true;
-	g_p_event_handler_manager->unregister_ibverbs_event(m_p_ibv_context->async_fd, this);
+}
+
+bool ib_ctx_handler::post_umr_wr(struct ibv_exp_send_wr &wr)
+{
+#ifdef HAVE_MP_RQ
+	auto_unlocker lock(m_lock_umr);
+	ibv_exp_send_wr *bad_wr = NULL;
+	ibv_exp_wc wc;
+
+	if (!m_umr_qp && !create_umr_qp()) {
+		ibch_logwarn("failed creating umr_qp");
+		return false;
+	}
+	int res = ibv_exp_post_send(m_umr_qp, &wr, &bad_wr);
+
+	if (res) {
+		if (bad_wr) {
+			ibch_logdbg("bad_wr info: wr_id=%#x, send_flags=%#x, "
+				    "addr=%#x, length=%d, lkey=%#x",
+				    bad_wr->wr_id,
+				    bad_wr->exp_send_flags,
+				    bad_wr->sg_list[0].addr,
+				    bad_wr->sg_list[0].length,
+				    bad_wr->sg_list[0].lkey);
+		}
+		return false;
+	}
+	int ret;
+	do {
+		ret = ibv_exp_poll_cq(m_umr_cq, 1, &wc, sizeof(wc));
+		if (ret < 0) {
+			ibch_logdbg("poll CQ failed after %d errno:%d\n", ret, errno);
+			return false;
+		}
+	} while (!ret);
+
+	if (wc.status != IBV_WC_SUCCESS) {
+		ibch_logdbg("post_umr_wr comp status %d\n", wc.status);
+		return false;
+	}
+	return true;
+#else
+	NOT_IN_USE(wr);
+	return false;
+#endif
+}
+
+bool ib_ctx_handler::create_umr_qp()
+{
+#ifdef HAVE_MP_RQ
+	ibch_logdbg("");
+	int ret = 0;
+	uint8_t *gid_raw;
+	const int port_num = 1;
+	//create TX_QP & CQ for UMR
+	vma_ibv_cq_init_attr cq_attr;
+	memset(&cq_attr, 0, sizeof(cq_attr));
+
+	m_umr_cq = vma_ibv_create_cq(m_p_ibv_context, 16, NULL, NULL, 0, &cq_attr);
+	if (m_umr_cq == NULL) {
+		ibch_logdbg("failed creating UMR CQ (errno=%d %m)", errno);
+		return false;
+	}
+	// Create QP
+	vma_ibv_qp_init_attr qp_init_attr;
+	memset(&qp_init_attr, 0, sizeof(qp_init_attr));
+
+	qp_init_attr.qp_type = IBV_QPT_RC;
+	qp_init_attr.recv_cq = m_umr_cq;
+	qp_init_attr.send_cq = m_umr_cq;
+	qp_init_attr.cap.max_send_wr = 16;
+	qp_init_attr.cap.max_recv_wr = 16;
+	qp_init_attr.cap.max_send_sge = 1;
+	qp_init_attr.cap.max_recv_sge = 1;
+	vma_ibv_qp_init_attr_comp_mask(m_p_ibv_pd, qp_init_attr);
+	qp_init_attr.comp_mask |= IBV_EXP_QP_INIT_ATTR_CREATE_FLAGS |
+				  IBV_EXP_QP_INIT_ATTR_MAX_INL_KLMS;
+	qp_init_attr.exp_create_flags |= IBV_EXP_QP_CREATE_UMR;
+	// max UMR needed is 4, in STRIP with HEADER mode. net, hdr, payload, padding
+	qp_init_attr.max_inl_send_klms = 4;
+	m_umr_qp = vma_ibv_create_qp(m_p_ibv_pd, &qp_init_attr);
+
+	BULLSEYE_EXCLUDE_BLOCK_START
+	if (!m_umr_qp) {
+		ibch_logdbg("vma_ibv_create_qp failed (errno=%d %m)", errno);
+		goto err_destroy_cq;
+	}
+	BULLSEYE_EXCLUDE_BLOCK_END
+	// Modify QP to INIT state
+	struct ibv_qp_attr qp_attr;
+	memset(&qp_attr, 0, sizeof(qp_attr));
+	qp_attr.qp_state = IBV_QPS_INIT;
+	qp_attr.port_num = port_num;
+	ret = ibv_modify_qp(m_umr_qp, &qp_attr,
+			IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS);
+	if (ret) {
+		ibch_logdbg("Failed to modify UMR QP to INIT: (errno=%d %m)", errno);
+		goto err_destroy_qp;
+	}
+	// Modify to RTR
+	qp_attr.qp_state = IBV_QPS_RTR;
+	qp_attr.dest_qp_num = m_umr_qp->qp_num;
+	memset(&qp_attr.ah_attr, 0, sizeof(qp_attr.ah_attr));
+	qp_attr.ah_attr.port_num = port_num;
+	qp_attr.ah_attr.is_global = 1;
+	if (ibv_query_gid(m_p_ibv_context, port_num,
+			  0, &qp_attr.ah_attr.grh.dgid)) {
+		ibch_logdbg("Failed getting port gid: (errno=%d %m)", errno);
+		goto err_destroy_qp;
+	}
+	gid_raw = qp_attr.ah_attr.grh.dgid.raw;
+	if ((*(uint64_t *)gid_raw == 0) && (*(uint64_t *)(gid_raw + 8) == 0)) {
+		ibch_logdbg("Port gid is zero: (errno=%d %m)", errno);
+		goto err_destroy_qp;
+	}
+	qp_attr.path_mtu = IBV_MTU_512;
+	qp_attr.min_rnr_timer = 7;
+	qp_attr.max_dest_rd_atomic = 1;
+	ret = ibv_modify_qp(m_umr_qp, &qp_attr,
+			IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU | IBV_QP_DEST_QPN |
+			IBV_QP_RQ_PSN | IBV_QP_MAX_DEST_RD_ATOMIC | IBV_QP_MIN_RNR_TIMER);
+	if (ret) {
+		ibch_logdbg("Failed to modify UMR QP to RTR:(errno=%d %m)", errno);
+		goto err_destroy_qp;
+	}
+
+	/* Modify to RTS */
+	qp_attr.qp_state = IBV_QPS_RTS;
+	qp_attr.sq_psn = 0;
+	qp_attr.timeout = 7;
+	qp_attr.rnr_retry = 7;
+	qp_attr.retry_cnt = 7;
+	qp_attr.max_rd_atomic = 1;
+	ret = ibv_modify_qp(m_umr_qp, &qp_attr,
+			IBV_QP_STATE | IBV_QP_TIMEOUT | IBV_QP_RETRY_CNT |
+			IBV_QP_RETRY_CNT | IBV_QP_RNR_RETRY | IBV_QP_SQ_PSN |
+			IBV_QP_MAX_QP_RD_ATOMIC);
+	if (ret) {
+		ibch_logdbg("Failed to modify UMR QP to RTS:(errno=%d %m)", errno);
+		goto err_destroy_qp;
+	}
+
+	return true;
+err_destroy_qp:
+	IF_VERBS_FAILURE(ibv_destroy_qp(m_umr_qp)) {
+		ibch_logdbg("destroy qp failed (errno=%d %m)", errno);
+	} ENDIF_VERBS_FAILURE;
+	m_umr_qp = NULL;
+err_destroy_cq:
+	IF_VERBS_FAILURE(ibv_destroy_cq(m_umr_cq)) {
+		ibch_logdbg("destroy cq failed (errno=%d %m)", errno);
+	} ENDIF_VERBS_FAILURE;
+	m_umr_cq = NULL;
+	return false;
+#else
+	return false;
+#endif
 }

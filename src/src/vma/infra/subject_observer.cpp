@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2001-2017 Mellanox Technologies, Ltd. All rights reserved.
+ * Copyright (c) 2001-2018 Mellanox Technologies, Ltd. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -52,11 +52,11 @@ bool subject::register_observer(IN const observer* const new_observer)
 	}
 
 	auto_unlocker lock(m_lock);
-	if (m_observers.count((observer * const)new_observer) > 0) {
+	if (m_observers.count((observer *)new_observer) > 0) {
 //		sub_obs_logdbg("[%s] Observer is already registered (%p)", to_str(), new_observer);
 		return false;
 	}
-	m_observers.insert((observer * const)new_observer);
+	m_observers.insert((observer *)new_observer);
 //	sub_obs_logdbg("[%s] Successfully registered new_observer %s", to_str(), new_observer->to_str());
 	return true;
 }
@@ -69,7 +69,7 @@ bool subject::unregister_observer(IN const observer * const old_observer)
 	}
 
 	auto_unlocker lock(m_lock);
-	m_observers.erase((observer * const)old_observer);
+	m_observers.erase((observer *)old_observer);
 //	sub_obs_logdbg("[%s] Successfully unregistered old_observer %s",to_str(), old_observer->to_str());
 	return true;
 }

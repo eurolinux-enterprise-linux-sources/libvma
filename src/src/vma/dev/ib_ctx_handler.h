@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2001-2017 Mellanox Technologies, Ltd. All rights reserved.
+ * Copyright (c) 2001-2018 Mellanox Technologies, Ltd. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -35,65 +35,72 @@
 #define IB_CTX_HANDLER_H
 
 #include <infiniband/verbs.h>
+#include <tr1/unordered_map>
+
 #include "vma/event/event_handler_ibverbs.h"
 #include "vma/dev/time_converter.h"
+#include "utils/lock_wrapper.h"
+
+typedef std::tr1::unordered_map<uint32_t, struct ibv_mr*> mr_map_lkey_t;
 
 // client to event manager 'command' invoker (??)
 //
 class ib_ctx_handler : public event_handler_ibverbs
 {
 public:
-	ib_ctx_handler(struct ibv_context* ctx, ts_conversion_mode_t ctx_time_converter_mode);
+	struct ib_ctx_handler_desc {
+		struct ibv_device *device;
+		ts_conversion_mode_t ctx_time_converter_mode;
+	};
+public:
+	ib_ctx_handler(struct ib_ctx_handler_desc *desc);
 	virtual ~ib_ctx_handler();
+
 	/*
 	 * on init or constructor:
 	 *      register to event manager with m_channel and this.
 	 * */
-	//void execute(struct ibv_async_event ibv_event) { handle_ibv_event(ibv_event); }
-	void                    set_dev_configuration();
-	ibv_mr*                 mem_reg(void *addr, size_t length, uint64_t access);
-	void                    mem_dereg(ibv_mr *mr);
-	ibv_port_state          get_port_state(int port_num);
-	ibv_device*             get_ibv_device() { return m_p_ibv_device;}
-	ibv_pd*			get_ibv_pd() { return m_p_ibv_pd;}
-	struct ibv_context*     get_ibv_context() { return m_p_ibv_context;}
-	vma_ibv_device_attr&    get_ibv_device_attr() { return m_ibv_device_attr;}
-	struct ibv_port_attr    get_ibv_port_attr(int port_num);
+	ibv_pd*                 get_ibv_pd() { return m_p_ibv_pd; }
+	bool                    post_umr_wr(struct ibv_exp_send_wr &wr);
+	ibv_device*             get_ibv_device() { return m_p_ibv_device; }
+	inline char*            get_ibname() { return (m_p_ibv_device ? m_p_ibv_device->name : (char *)""); }
+	struct ibv_context*     get_ibv_context() { return m_p_ibv_context; }
+	vma_ibv_device_attr*    get_ibv_device_attr() { return m_p_ibv_device_attr; }
+	uint32_t                mem_reg(void *addr, size_t length, uint64_t access);
+	void                    mem_dereg(uint32_t lkey);
+	struct ibv_mr*          get_mem_reg(uint32_t lkey);
 	bool                    is_removed() { return m_removed;}
-	virtual void            handle_event_ibverbs_cb(void *ev_data, void *ctx);
-	void                    handle_event_DEVICE_FATAL();
 	ts_conversion_mode_t    get_ctx_time_converter_status();
 	void                    set_flow_tag_capability(bool flow_tag_capability); 
-	bool                    get_flow_tag_capability() { return m_flow_tag_enabled;} // m_flow_tag_capability
+	bool                    get_flow_tag_capability() { return m_flow_tag_enabled; } // m_flow_tag_capability
 	size_t                  get_on_device_memory_size() { return m_on_device_memory; }
+	bool                    is_active(int port_num);
+	virtual void            handle_event_ibverbs_cb(void *ev_data, void *ctx);
+
+	void set_str();
+	void print_val();
 
 	inline void convert_hw_time_to_system_time(uint64_t hwtime, struct timespec* systime)
 	{
 		m_p_ctx_time_converter->convert_hw_time_to_system_time(hwtime, systime);
 	}
-
 private:
-	struct ibv_context*     m_p_ibv_context;
-	struct ibv_port_attr    m_ibv_port_attr;
+	bool                    create_umr_qp();
+	void                    handle_event_device_fatal();
 	ibv_device*             m_p_ibv_device; // HCA handle
-	vma_ibv_device_attr     m_ibv_device_attr;
+	struct ibv_context*     m_p_ibv_context;
+	vma_ibv_device_attr*    m_p_ibv_device_attr;
 	ibv_pd*                 m_p_ibv_pd;
 	bool                    m_flow_tag_enabled;
 	size_t                  m_on_device_memory;
 	bool                    m_removed;
-
-	bool                    update_port_attr(int port_num);
-	void                    update_on_device_memory_size();
-
-	//void handle_ibv_event(struct ibv_async_event ibv_event); // will be called by the command execute
-	//
-	//conf params
-	uint32_t                m_conf_attr_rx_num_wre;
-	uint32_t                m_conf_attr_tx_num_to_signal;
-	uint32_t                m_conf_attr_tx_max_inline;
-	uint32_t                m_conf_attr_tx_num_wre;
-
+	lock_spin               m_lock_umr;
+	struct ibv_cq*          m_umr_cq;
+	struct ibv_qp*          m_umr_qp;
 	time_converter*         m_p_ctx_time_converter;
+	mr_map_lkey_t           m_mr_map_lkey;
+
+	char m_str[255];
 };
 
 #endif

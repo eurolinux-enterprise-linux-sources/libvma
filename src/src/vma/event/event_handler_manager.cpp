@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2001-2017 Mellanox Technologies, Ltd. All rights reserved.
+ * Copyright (c) 2001-2018 Mellanox Technologies, Ltd. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -400,12 +400,17 @@ void event_handler_manager::update_epfd(int fd, int operation, int events)
 {
 	epoll_event ev = {0, {0}};
 
+	if (m_epfd < 0) {
+		return;
+	}
+
 	ev.events = events;
 	ev.data.fd = fd;
 	BULLSEYE_EXCLUDE_BLOCK_START
-	if (orig_os_api.epoll_ctl(m_epfd, operation, fd, &ev) < 0) {
+	if ((orig_os_api.epoll_ctl(m_epfd, operation, fd, &ev) < 0) &&
+		(!(errno == ENOENT || errno == EBADF))) {
 		const char* operation_str[] = {"", "ADD", "DEL", "MOD"};
-		evh_logerr("epoll_ctl(%d, %s, fd=%d) failed (errno=%d %m)", 
+		evh_logerr("epoll_ctl(%d, %s, fd=%d) failed (errno=%d %m)",
 			   m_epfd, operation_str[operation], fd, errno);
 	}
 	BULLSEYE_EXCLUDE_BLOCK_END

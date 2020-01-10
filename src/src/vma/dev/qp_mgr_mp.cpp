@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2001-2017 Mellanox Technologies, Ltd. All rights reserved.
+ * Copyright (c) 2001-2018 Mellanox Technologies, Ltd. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -56,7 +56,7 @@ cq_mgr* qp_mgr_mp::init_rx_cq_mgr(struct ibv_comp_channel* p_rx_comp_event_chann
 	uint32_t cq_size = align32pow2((m_p_mp_ring->get_strides_num() *
 					m_p_mp_ring->get_wq_count()));
 	return new cq_mgr_mp(m_p_mp_ring, m_p_ib_ctx_handler, cq_size,
-			     p_rx_comp_event_channel, true);
+			     p_rx_comp_event_channel, true, m_external_mem);
 }
 
 int qp_mgr_mp::prepare_ibv_qp(vma_ibv_qp_init_attr& qp_init_attr)
@@ -70,7 +70,7 @@ int qp_mgr_mp::prepare_ibv_qp(vma_ibv_qp_init_attr& qp_init_attr)
 	enum ibv_exp_query_intf_status intf_status;
 	uint32_t lkey;
 	uint8_t *ptr;
-	uint32_t stride_size, strides_num, size;
+	uint32_t size;
 	uint8_t toeplitz_key[] = { 0x6d, 0x5a, 0x56, 0xda, 0x25, 0x5b, 0x0e, 0xc2,
 				   0x41, 0x67, 0x25, 0x3d, 0x43, 0xa3, 0x8f, 0xb0,
 				   0xd0, 0xca, 0x2b, 0xcb, 0xae, 0x7b, 0x30, 0xb4,
@@ -80,8 +80,6 @@ int qp_mgr_mp::prepare_ibv_qp(vma_ibv_qp_init_attr& qp_init_attr)
 			sizeof(toeplitz_key)/sizeof(toeplitz_key[0]);
 	// create RX resources
 	// create WQ
-	vma_ibv_device_attr& r_ibv_dev_attr =
-			m_p_ib_ctx_handler->get_ibv_device_attr();
 	struct ibv_exp_wq_init_attr wq_init_attr;
 	memset(&wq_init_attr, 0, sizeof(wq_init_attr));
 
@@ -90,7 +88,7 @@ int qp_mgr_mp::prepare_ibv_qp(vma_ibv_qp_init_attr& qp_init_attr)
 	wq_init_attr.max_recv_sge = 1;
 	wq_init_attr.pd = m_p_ib_ctx_handler->get_ibv_pd();
 	wq_init_attr.cq = m_p_cq_mgr_rx->get_ibv_cq_hndl();
-	if (r_ibv_dev_attr.wq_vlan_offloads_cap &
+	if (m_p_ib_ctx_handler->get_ibv_device_attr()->wq_vlan_offloads_cap &
 	    IBV_EXP_RECEIVE_WQ_CVLAN_STRIP) {
 		wq_init_attr.comp_mask |= IBV_EXP_CREATE_WQ_VLAN_OFFLOADS;
 		wq_init_attr.vlan_offloads |= IBV_EXP_RECEIVE_WQ_CVLAN_STRIP;
@@ -180,12 +178,10 @@ int qp_mgr_mp::prepare_ibv_qp(vma_ibv_qp_init_attr& qp_init_attr)
 	}
 	BULLSEYE_EXCLUDE_BLOCK_END
 	// initlize the sge, the same sg will be used for all operations
-	ptr = (uint8_t *)(((unsigned long)m_p_mp_ring->get_mem_block()));
-	stride_size = m_p_mp_ring->get_stride_size();
-	strides_num = m_p_mp_ring->get_strides_num();
-	size = stride_size * strides_num;
-
-	lkey = m_p_mp_ring->get_mem_lkey(m_p_ib_ctx_handler);
+	ptr = (uint8_t *)m_buff_data.addr;
+	lkey = m_buff_data.lkey;
+	size = m_buff_data.length;
+	// initlize the sge, the same sg will be used for all operations
 	for (uint32_t i = 0; i < m_n_sysvar_rx_num_wr_to_post_recv; i++) {
 		m_ibv_rx_sg_array[i].addr = (uint64_t)ptr;
 		m_ibv_rx_sg_array[i].length = size;
@@ -239,6 +235,22 @@ int qp_mgr_mp::post_recv(uint32_t sg_index, uint32_t num_of_sge)
 	}
 	return m_p_wq_family->recv_burst(m_p_wq, &m_ibv_rx_sg_array[sg_index],
 			num_of_sge);
+}
+
+bool qp_mgr_mp::fill_hw_descriptors(vma_mlx_hw_device_data &data)
+{
+	struct mlx5_rwq *mrwq = container_of(m_p_wq, struct mlx5_rwq, wq);
+
+	data.rq_data.wq_data.buf       = (uint8_t *)mrwq->buf.buf + mrwq->rq.offset;
+	data.rq_data.wq_data.dbrec     = mrwq->db;
+	data.rq_data.wq_data.wqe_cnt   = mrwq->rq.wqe_cnt;
+	data.rq_data.wq_data.stride    = (1 << mrwq->rq.wqe_shift);
+
+	qp_logdbg("QP: %d  WQ: dbrec: %p buf: %p wqe_cnt: %d stride: %d ",
+		m_qp->qp_num, data.rq_data.wq_data.dbrec,
+		data.rq_data.wq_data.buf, data.rq_data.wq_data.wqe_cnt,
+		data.rq_data.wq_data.stride);
+	return true;
 }
 
 qp_mgr_mp::~qp_mgr_mp()

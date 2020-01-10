@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2001-2017 Mellanox Technologies, Ltd. All rights reserved.
+ * Copyright (c) 2001-2018 Mellanox Technologies, Ltd. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -45,6 +45,7 @@
 #include <limits>
 #include <math.h>
 #include <linux/ip.h>  //IP  header (struct  iphdr) definition
+#include <netinet/tcp.h>
 #include <netinet/udp.h>
 
 #include "utils/bullseye.h"
@@ -155,6 +156,30 @@ int get_base_interface_name(const char *if_name, char *base_ifname, size_t sz_ba
 	snprintf(base_ifname, sz_base_ifname, "%s" ,if_name);
 	__log_dbg("no base for %s", base_ifname, if_name);
 	return 0;
+}
+
+void compute_tx_checksum(mem_buf_desc_t* p_mem_buf_desc, bool l3_csum, bool l4_csum)
+{
+	// L3
+	if (l3_csum) {
+		struct iphdr* ip_hdr = p_mem_buf_desc->tx.p_ip_h;
+		ip_hdr->check = 0; // use 0 at csum calculation time
+		ip_hdr->check = compute_ip_checksum((unsigned short *)ip_hdr, ip_hdr->ihl * 2);
+
+		// L4
+		if (l4_csum) {
+			if (ip_hdr->protocol == IPPROTO_UDP) {
+				struct udphdr* udp_hdr = p_mem_buf_desc->tx.p_udp_h;
+				udp_hdr->check = 0;
+				__log_entry_func("using SW checksum calculation: ip_hdr->check=%d, udp_hdr->check=%d", ip_hdr->check, udp_hdr->check);
+			} else if (ip_hdr->protocol == IPPROTO_TCP) {
+				struct tcphdr* tcp_hdr = p_mem_buf_desc->tx.p_tcp_h;
+				tcp_hdr->check = 0;
+				tcp_hdr->check = compute_tcp_checksum(ip_hdr, (const uint16_t *)tcp_hdr);
+				__log_entry_func("using SW checksum calculation: ip_hdr->check=%d, tcp_hdr->check=%d", ip_hdr->check, tcp_hdr->check);
+			}
+		}
+	}
 }
 
 unsigned short compute_ip_checksum(const unsigned short *buf, unsigned int nshort_words)
@@ -460,6 +485,29 @@ int get_ifinfo_from_ip(const struct sockaddr& addr, char* ifname, uint32_t& iffl
 	return -1;
 }
 
+int get_port_from_ifname(const char* ifname)
+{
+	int port_num, dev_id = -1, dev_port = -1;
+	// Depending of kernel version and OFED stack the files containing dev_id and dev_port may not exist.
+	// if file reading fails *dev_id or *dev_port may remain unmodified
+	char num_buf[24] = {0};
+	char dev_path[256] = {0};
+	snprintf(dev_path, sizeof(dev_path), VERBS_DEVICE_PORT_PARAM_FILE, ifname);
+	if (priv_safe_try_read_file(dev_path, num_buf, sizeof(num_buf)) > 0) {
+		dev_port = strtol(num_buf, NULL, 0); // base=0 means strtol() can parse hexadecimal and decimal
+		__log_dbg("dev_port file=%s dev_port str=%s dev_port val=%d", dev_path, num_buf, dev_port);
+	}
+	snprintf(dev_path, sizeof(dev_path), VERBS_DEVICE_ID_PARAM_FILE, ifname);
+	if (priv_safe_try_read_file(dev_path, num_buf, sizeof(num_buf)) > 0) {
+		dev_id = strtol(num_buf, NULL, 0); // base=0 means strtol() can parse hexadecimal and decimal
+		__log_dbg("dev_id file= %s dev_id str=%s dev_id val=%d", dev_path, num_buf, dev_id);
+	}
+
+	// take the max between dev_port and dev_id as port number
+	port_num = (dev_port > dev_id) ? dev_port : dev_id;
+	return ++port_num;
+}
+
 int get_iftype_from_ifname(const char* ifname)
 {
 	__log_func("find interface type for ifname '%s'", ifname);
@@ -724,6 +772,53 @@ bool get_bond_active_slave_name(IN const char* bond_name, OUT char* active_slave
 	char* p = strchr(active_slave_name, '\n');
 	if (p) *p = '\0'; // Remove the tailing 'new line" char
 	return true;
+}
+
+bool get_netvsc_slave(IN const char* ifname, OUT char* slave_name, OUT unsigned int &slave_flags)
+{
+	char netvsc_path[256];
+	char base_ifname[IFNAMSIZ];
+	get_base_interface_name(ifname, base_ifname, sizeof(base_ifname));
+	struct ifaddrs *ifaddr, *ifa;
+	bool ret = false;
+
+	if (getifaddrs(&ifaddr) == -1) {
+		__log_err("getifaddrs() failed (errno = %d %m)", errno);
+		return ret;
+	}
+
+	for (ifa = ifaddr; ifa != NULL; ifa = ifa->ifa_next) {
+		snprintf(netvsc_path, sizeof(netvsc_path), NETVSC_DEVICE_LOWER_FILE, base_ifname, ifa->ifa_name);
+		int fd = open(netvsc_path, O_RDONLY);
+		if (fd >= 0) {
+			close(fd);
+			memcpy(slave_name, ifa->ifa_name, IFNAMSIZ);
+			slave_flags = ifa->ifa_flags;
+			__log_dbg("Found slave_name = %s, slave_flags = %u", slave_name, slave_flags);
+			ret = true;
+			break;
+		}
+	}
+
+	freeifaddrs(ifaddr);
+
+	return ret;
+}
+
+bool check_netvsc_device_exist(const char* ifname)
+{
+	char device_path[256] = {0};
+	char base_ifname[IFNAMSIZ];
+	get_base_interface_name(ifname, base_ifname, sizeof(base_ifname));
+	sprintf(device_path, NETVSC_DEVICE_CLASS_FILE, base_ifname);
+	char sys_res[1024] = {0};
+	if (priv_read_file(device_path, sys_res, 1024, VLOG_FUNC) > 0) {
+		if (strcmp(sys_res, NETVSC_ID) == 0) {
+			return true;
+		}
+	}
+
+	return false;
 }
 
 /*

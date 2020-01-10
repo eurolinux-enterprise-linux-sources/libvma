@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2001-2017 Mellanox Technologies, Ltd. All rights reserved.
+ * Copyright (c) 2001-2018 Mellanox Technologies, Ltd. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -33,6 +33,9 @@
 #ifndef TOOLS_DAEMON_HASH_H_
 #define TOOLS_DAEMON_HASH_H_
 
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 /* The hash_t opaque data type
  */
@@ -119,5 +122,9 @@ void *hash_put(hash_t ht, hash_key_t key, void *value);
  * @return @a none
  */
 void hash_del(hash_t ht, hash_key_t key);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* TOOLS_DAEMON_HASH_H_ */

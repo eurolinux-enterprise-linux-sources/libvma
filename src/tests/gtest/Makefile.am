@@ -5,6 +5,7 @@ CXXFLAGS = $(GTEST_CXXFLAGS)
 gtest_LDADD =
 
 gtest_CPPFLAGS = \
+	-I$(top_srcdir)/ \
 	-I$(top_srcdir)/src \
 	-I$(top_srcdir)/src/vma \
 	-I$(top_srcdir)/tests/gtest
@@ -25,6 +26,7 @@ gtest_SOURCES = \
 	\
 	mix/mix_base.cc \
 	mix/sg_array.cc \
+	mix/mix_list.cc \
 	\
 	tcp/tcp_base.cc \
 	tcp/tcp_bind.cc \
@@ -41,7 +43,14 @@ gtest_SOURCES = \
 	\
 	vma/vma_base.cc \
 	vma/vma_ring.cc \
-	vma/vma_poll.cc
+	vma/vma_poll.cc \
+	\
+	vmad/vmad_base.cc \
+	vmad/vmad_bitmap.cc \
+	vmad/vmad_hash.cc \
+	vmad/vmad_init.cc \
+	vmad/vmad_state.cc \
+	vmad/vmad_flow.cc
 
 noinst_HEADERS = \
 	common/gtest.h \
@@ -62,6 +71,19 @@ noinst_HEADERS = \
 	udp/udp_base.h \
 	\
 	vma/vma_base.h
+
+
+# This workaround allows to compile files located
+# at another directory.
+# This place resolve make distcheck isue
+nodist_gtest_SOURCES = \
+	hash.c
+
+CLEANFILES = hash.c
+
+hash.c:
+	@echo "#include \"$(top_builddir)/tools/daemon/$@\"" >$@
+
 
 .PHONY: test gdb valgrind
 

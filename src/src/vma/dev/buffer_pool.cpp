@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2001-2017 Mellanox Technologies, Ltd. All rights reserved.
+ * Copyright (c) 2001-2018 Mellanox Technologies, Ltd. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -75,7 +75,7 @@ void buffer_pool::free_tx_lwip_pbuf_custom(struct pbuf *p_buff)
 	g_buffer_pool_tx->put_buffers_thread_safe((mem_buf_desc_t *)p_buff);
 }
 
-buffer_pool::buffer_pool(size_t buffer_count, size_t buf_size, ib_ctx_handler *p_ib_ctx_h, mem_buf_desc_owner *owner, pbuf_free_custom_fn custom_free_function) :
+buffer_pool::buffer_pool(size_t buffer_count, size_t buf_size, pbuf_free_custom_fn custom_free_function) :
 			m_lock_spin("buffer_pool"),
 			m_n_buffers(0),
 			m_n_buffers_created(buffer_count),
@@ -90,14 +90,13 @@ buffer_pool::buffer_pool(size_t buffer_count, size_t buf_size, ib_ctx_handler *p
 	memset(m_p_bpool_stat , 0, sizeof(*m_p_bpool_stat));
 	vma_stats_instance_create_bpool_block(m_p_bpool_stat);
 
-	size_t size;
 	if (buffer_count) {
 		sz_aligned_element = (buf_size + MCE_ALIGNMENT) & (~MCE_ALIGNMENT);
-		size = (sizeof(mem_buf_desc_t) + sz_aligned_element) * buffer_count + MCE_ALIGNMENT;
+		m_size = (sizeof(mem_buf_desc_t) + sz_aligned_element) * buffer_count + MCE_ALIGNMENT;
 	} else {
-		size = buf_size;
+		m_size = buf_size;
 	}
-	void *data_block = m_allocator.alloc_and_reg_mr(size, p_ib_ctx_h);
+	void *data_block = m_allocator.alloc_and_reg_mr(m_size, NULL);
 
 
 	if (!buffer_count) return;
@@ -108,16 +107,8 @@ buffer_pool::buffer_pool(size_t buffer_count, size_t buf_size, ib_ctx_handler *p
 
 	// Split the block to buffers
 	for (size_t i = 0; i < buffer_count; ++i) {
-
-		mem_buf_desc_t* ptr_desc_mbdt = (mem_buf_desc_t*)ptr_desc;
-		memset(ptr_desc_mbdt, 0, sizeof (*ptr_desc_mbdt));
-		mem_buf_desc_t *desc = new (ptr_desc) mem_buf_desc_t(ptr_buff, buf_size);
-		desc->p_desc_owner = owner;
-		desc->lwip_pbuf.custom_free_function = custom_free_function;
+		mem_buf_desc_t *desc = new (ptr_desc) mem_buf_desc_t(ptr_buff, buf_size, custom_free_function);
 		put_buffer_helper(desc);
-#ifdef DEFINED_VMAPOLL
-		desc->rx.vma_polled = false;
-#endif		
 
 		ptr_buff += sz_aligned_element;
 		ptr_desc += sizeof(mem_buf_desc_t);
@@ -147,46 +138,50 @@ void buffer_pool::free_bpool_resources()
 	__log_info_func("done");
 }
 
-
-mem_buf_desc_t *buffer_pool::get_buffers(size_t count, uint32_t lkey)
+void buffer_pool::register_memory()
 {
-	mem_buf_desc_t *next, *head;
+	m_allocator.register_memory(m_size, NULL, VMA_IBV_ACCESS_LOCAL_WRITE);
+}
+
+void buffer_pool::print_val_tbl()
+{
+	__log_info_dbg("pool 0x%X size: %ld buffers: %lu", this, m_size, m_n_buffers);
+}
+
+bool buffer_pool::get_buffers_thread_safe(descq_t &pDeque, mem_buf_desc_owner* desc_owner, size_t count, uint32_t lkey)
+{
+	auto_unlocker lock(m_lock_spin);
+
+	mem_buf_desc_t *head;
 
 	__log_info_funcall("requested %lu, present %lu, created %lu", count, m_n_buffers, m_n_buffers_created);
 
 	if (unlikely(m_n_buffers < count)) {
-		static vlog_levels_t log_severity = VLOG_DEBUG; // DEBUG severity will be used only once - at the 1st time
-
-		VLOG_PRINTF_INFO(log_severity, "ERROR! not enough buffers in the pool (requested: %lu, have: %lu, created: %lu, Buffer pool type: %s)",
+		VLOG_PRINTF_INFO_ONCE_THEN_ALWAYS(VLOG_DEBUG, VLOG_FUNC, "ERROR! not enough buffers in the pool (requested: %lu, have: %lu, created: %lu, Buffer pool type: %s)",
 				count, m_n_buffers, m_n_buffers_created, m_p_bpool_stat->is_rx ? "Rx" : "Tx");
 
-		log_severity = VLOG_FUNC; // for all times but the 1st one
-
 		m_p_bpool_stat->n_buffer_pool_no_bufs++;
-
-		return NULL;
+		return false;
 	}
 
 	// pop buffers from the list
-	head = NULL;
 	m_n_buffers -= count;
 	m_p_bpool_stat->n_buffer_pool_size -= count;
-	while (count > 0) {
-		next = m_p_head->p_next_desc;
-		m_p_head->p_next_desc = head;
+	while (count-- > 0) {
+		// Remove from list
 		head = m_p_head;
-		m_p_head = next;
+		m_p_head = m_p_head->p_next_desc;
+		head->p_next_desc = NULL;
+
+		// Init
 		head->lkey = lkey;
-		--count;
+		head->p_desc_owner = desc_owner;
+
+		// Push to queue
+		pDeque.push_back(head);
 	}
 
-	return head;
-}
-
-mem_buf_desc_t *buffer_pool::get_buffers_thread_safe(size_t count, uint32_t lkey)
-{
-	auto_unlocker lock(m_lock_spin);
-	return get_buffers(count, lkey);
+	return true;
 }
 
 uint32_t buffer_pool::find_lkey_by_ib_ctx_thread_safe(ib_ctx_handler* p_ib_ctx_h)

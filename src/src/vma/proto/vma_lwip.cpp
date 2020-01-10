@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2001-2017 Mellanox Technologies, Ltd. All rights reserved.
+ * Copyright (c) 2001-2018 Mellanox Technologies, Ltd. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -116,7 +116,7 @@ vma_lwip *g_p_lwip = 0;
  * LWIP "network" driver code
  */
 
-vma_lwip::vma_lwip() : lock_spin_recursive("vma_lwip")
+vma_lwip::vma_lwip()
 {
 	m_run_timers = false;
 
@@ -154,7 +154,7 @@ vma_lwip::vma_lwip() : lock_spin_recursive("vma_lwip")
 	register_tcp_state_observer(sockinfo_tcp::tcp_state_observer);
 	register_ip_route_mtu(sockinfo_tcp::get_route_mtu);
 	register_sys_now(sys_now);
-
+	set_tmr_resolution(safe_mce_sys().tcp_timer_resolution_msec);
 	//tcp_ticks increases in the rate of tcp slow_timer
 	void *node = g_p_event_handler_manager->register_timer_event(safe_mce_sys().tcp_timer_resolution_msec * 2, this, PERIODIC_TIMER, 0);
 	if (!node) {

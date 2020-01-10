@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2001-2017 Mellanox Technologies, Ltd. All rights reserved.
+ * Copyright (c) 2001-2018 Mellanox Technologies, Ltd. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -283,6 +283,16 @@ struct mce_sys_var {
 		return the_instance;
 	}
 
+public:
+	enum hyper_t {
+		HYPER_NONE	= 0,
+		HYPER_XEN,
+		HYPER_KVM,
+		HYPER_MSHV,
+		HYPER_VMWARE
+	};
+
+public:
 	void		get_env_params();
 
 	char 		*app_name;
@@ -294,10 +304,11 @@ struct mce_sys_var {
 
 	vlog_levels_t 	log_level;
 	uint32_t	log_details;
-	char 		log_filename[FILE_NAME_MAX_SIZE];
-	char		stats_filename[FILE_NAME_MAX_SIZE];
-	char		stats_shmem_dirname[FILE_NAME_MAX_SIZE];
-	char 		conf_filename[FILE_NAME_MAX_SIZE];
+	char 		log_filename[PATH_MAX];
+	char		stats_filename[PATH_MAX];
+	char		stats_shmem_dirname[PATH_MAX];
+	char 		conf_filename[PATH_MAX];
+	char		vmad_notify_dir[PATH_MAX];
 	bool		log_colors;
 	bool 		handle_sigintr;
 	bool		handle_segfault;
@@ -330,7 +341,6 @@ struct mce_sys_var {
 	int32_t		rx_poll_num_init;
 	uint32_t 	rx_udp_poll_os_ratio;
 	ts_conversion_mode_t	hw_ts_conversion_mode;
-	bool 		rx_sw_csum;
 	uint32_t 	rx_poll_yield_loops;
 	uint32_t 	rx_ready_byte_min_limit;
 	uint32_t 	rx_prefetch_bytes;
@@ -401,10 +411,10 @@ struct mce_sys_var {
 	uint32_t	neigh_num_err_retries;
 
 	uint32_t 	vma_time_measure_num_samples;
-	char 		vma_time_measure_filename[FILENAME_MAX];
+	char 		vma_time_measure_filename[PATH_MAX];
 	sysctl_reader_t & sysctl_reader;
 	bool		rx_poll_on_tx_tcp;
-	bool		is_hypervisor;
+	hyper_t		hypervisor;
 	bool		trigger_dummy_send_getsockname;
 
 private:
@@ -414,6 +424,9 @@ private:
 	int env_to_cpuset(char *orig_start, cpu_set_t *cpu_set);
 	void read_env_variable_with_pid(char* mce_sys_name, size_t mce_sys_max_size, char* env_ptr);
 	bool check_cpuinfo_flag(const char* flag);
+	bool cpuid_hv();
+	const char* cpuid_hv_vendor();
+	void read_hv();
 
 	// prevent unautothrized creation of objects
 	mce_sys_var () : sysctl_reader(sysctl_reader_t::instance()){
@@ -432,6 +445,7 @@ extern mce_sys_var & safe_mce_sys();
 #define SYS_VAR_LOG_DETAILS				"VMA_LOG_DETAILS"
 #define SYS_VAR_LOG_FILENAME				"VMA_LOG_FILE"
 #define SYS_VAR_STATS_FILENAME				"VMA_STATS_FILE"
+#define SYS_VAR_VMAD_DIR				"VMA_VMAD_NOTIFY_DIR"
 #define SYS_VAR_STATS_SHMEM_DIRNAME			"VMA_STATS_SHMEM_DIR"
 #define SYS_VAR_CONF_FILENAME				"VMA_CONFIG_FILE"
 #define SYS_VAR_LOG_COLORS				"VMA_LOG_COLORS"
@@ -462,7 +476,6 @@ extern mce_sys_var & safe_mce_sys();
 #define SYS_VAR_RX_NUM_POLLS				"VMA_RX_POLL"
 #define SYS_VAR_RX_NUM_POLLS_INIT			"VMA_RX_POLL_INIT"
 #define SYS_VAR_RX_UDP_POLL_OS_RATIO			"VMA_RX_UDP_POLL_OS_RATIO"
-#define SYS_VAR_RX_SW_CSUM				"VMA_RX_SW_CSUM"
 #define SYS_VAR_HW_TS_CONVERSION_MODE			"VMA_HW_TS_CONVERSION"
 // The following 2 params were replaced by VMA_RX_UDP_POLL_OS_RATIO
 #define SYS_VAR_RX_POLL_OS_RATIO			"VMA_RX_POLL_OS_RATIO"
@@ -543,6 +556,7 @@ extern mce_sys_var & safe_mce_sys();
 #define MCE_DEFAULT_LOG_FILE				("")
 #define MCE_DEFAULT_CONF_FILE				("/etc/libvma.conf")
 #define MCE_DEFAULT_STATS_FILE				("")
+#define MCE_DEFAULT_VMAD_FOLDER			(VMA_AGENT_PATH)
 #define MCE_DEFAULT_STATS_SHMEM_DIR			("/tmp/")
 #define MCE_DEFAULT_LOG_DETAILS				(0)
 #define MCE_DEFAULT_LOG_COLORS				(true)
@@ -571,28 +585,27 @@ extern mce_sys_var & safe_mce_sys();
 #define MCE_DEFAULT_TX_NUM_SGE				(2)
 #define MCE_DEFAULT_RX_NUM_BUFS				(200000)
 #define MCE_DEFAULT_RX_BUFS_BATCH			(64)
-#ifdef DEFINED_VMAPOLL
+#ifdef DEFINED_SOCKETXTREME
 #define MCE_DEFAULT_RX_NUM_WRE				(1024)
 #else
 #define MCE_DEFAULT_RX_NUM_WRE				(16000)
-#endif // DEFINED_VMAPOLL
+#endif // DEFINED_SOCKETXTREME
 #define MCE_DEFAULT_RX_NUM_WRE_TO_POST_RECV		(64)
 #define MCE_DEFAULT_RX_NUM_SGE				(1)
 #define MCE_DEFAULT_RX_NUM_POLLS			(100000)
 #define MCE_DEFAULT_RX_NUM_POLLS_INIT			(0)
 #define MCE_DEFAULT_RX_UDP_POLL_OS_RATIO		(100)
 #define MCE_DEFAULT_HW_TS_CONVERSION_MODE		(TS_CONVERSION_MODE_SYNC)
-#define MCE_DEFUALT_RX_SW_CSUM				(true)
 #define MCE_DEFAULT_RX_POLL_YIELD			(0)
 #define MCE_DEFAULT_RX_BYTE_MIN_LIMIT			(65536)
 #define MCE_DEFAULT_RX_PREFETCH_BYTES			(256)
 #define MCE_DEFAULT_RX_PREFETCH_BYTES_BEFORE_POLL	(0)
 #define MCE_DEFAULT_RX_CQ_DRAIN_RATE			(MCE_RX_CQ_DRAIN_RATE_DISABLED)
-#ifdef DEFINED_VMAPOLL
+#ifdef DEFINED_SOCKETXTREME
 #define MCE_DEFAULT_GRO_STREAMS_MAX			(0)
 #else
 #define MCE_DEFAULT_GRO_STREAMS_MAX			(32)
-#endif // DEFINED_VMAPOLL
+#endif // DEFINED_SOCKETXTREME
 #define MCE_DEFAULT_TCP_3T_RULES			(false)
 #define MCE_DEFAULT_ETH_MC_L2_ONLY_RULES		(false)
 #define MCE_DEFAULT_MC_FORCE_FLOWTAG			(false)
@@ -685,7 +698,6 @@ extern mce_sys_var & safe_mce_sys();
 #define IPOIB_MODE_PARAM_FILE				"/sys/class/net/%s/mode"
 #define VERBS_DEVICE_PORT_PARAM_FILE			"/sys/class/net/%s/dev_port"
 #define VERBS_DEVICE_ID_PARAM_FILE			"/sys/class/net/%s/dev_id"
-#define VERBS_DEVICE_RESOURCE_PARAM_FILE		"/sys/class/net/%s/device/resource"
 #define BONDING_MODE_PARAM_FILE				"/sys/class/net/%s/bonding/mode"
 #define BONDING_SLAVES_PARAM_FILE			"/sys/class/net/%s/bonding/slaves"
 #define BONDING_ACTIVE_SLAVE_PARAM_FILE			"/sys/class/net/%s/bonding/active_slave"
@@ -700,6 +712,12 @@ extern mce_sys_var & safe_mce_sys();
 #define FLOW_STEERING_MGM_ENTRY_SIZE_PARAM_FILE		"/sys/module/mlx4_core/parameters/log_num_mgm_entry_size"
 #define VIRTUAL_DEVICE_FOLDER			"/sys/devices/virtual/net/%s/"
 #define BOND_DEVICE_FILE				"/proc/net/bonding/%s"
+
+
+#define NETVSC_DEVICE_CLASS_FILE		"/sys/class/net/%s/device/class_id"
+#define NETVSC_DEVICE_LOWER_FILE		"/sys/class/net/%s/lower_%s/ifindex"
+#define NETVSC_DEVICE_UPPER_FILE		"/sys/class/net/%s/upper_%s/ifindex"
+#define NETVSC_ID               		"{f8615163-df3e-46c5-913f-f2d2f965ed0e}\n"
 
 #define MAX_STATS_FD_NUM				1024
 #define MAX_WINDOW_SCALING				14

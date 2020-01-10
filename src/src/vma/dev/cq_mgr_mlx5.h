@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2001-2017 Mellanox Technologies, Ltd. All rights reserved.
+ * Copyright (c) 2001-2018 Mellanox Technologies, Ltd. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -72,6 +72,7 @@ public:
 	virtual uint32_t            clean_cq();
 	virtual int                 request_notification(uint64_t poll_sn);
 	virtual int                 wait_for_notification_and_process_element(uint64_t* p_cq_poll_sn, void* pv_fd_ready_array = NULL);
+	virtual bool                fill_cq_hw_descriptors(struct hw_cq_data &data);
 
 protected:
 	inline struct mlx5_cqe64*   check_cqe(void);

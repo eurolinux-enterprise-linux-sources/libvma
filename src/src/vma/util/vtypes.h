@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2001-2017 Mellanox Technologies, Ltd. All rights reserved.
+ * Copyright (c) 2001-2018 Mellanox Technologies, Ltd. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -179,6 +179,14 @@ static inline uint64_t ntohll(uint64_t x) { return x; }
 
 #ifndef ARPHRD_INFINIBAND
 #define ARPHRD_INFINIBAND 32		/* InfiniBand			*/
+#endif
+
+#ifndef ARPHRD_ETHER
+#define ARPHRD_ETHER 1            /* Ethernet 10Mbps                   */
+#endif
+
+#ifndef ARPHRD_LOOPBACK
+#define ARPHRD_LOOPBACK 772            /* Loopback device                   */
 #endif
 
 #ifndef ETH_P_8021Q

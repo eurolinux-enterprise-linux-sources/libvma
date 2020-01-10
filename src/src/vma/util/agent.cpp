@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2001-2017 Mellanox Technologies, Ltd. All rights reserved.
+ * Copyright (c) 2001-2018 Mellanox Technologies, Ltd. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -64,13 +64,15 @@
 	} while (0)
 
 /* Print user notification */
-#define output_warn() \
-	vlog_printf(VLOG_DEBUG, "Peer notification functionality is not active.\n"); \
-	vlog_printf(VLOG_DEBUG, "Check daemon state\n");
-
 #define output_fatal() \
-	vlog_printf(VLOG_DEBUG, "Peer notification functionality is not supported.\n"); \
-	vlog_printf(VLOG_DEBUG, "Increase output level to see a reason\n");
+	do { \
+		vlog_levels_t _level = (mce_sys_var::HYPER_MSHV == safe_mce_sys().hypervisor ?          \
+						VLOG_WARNING : VLOG_DEBUG);                                             \
+		vlog_printf(_level, "*************************************************************\n"); \
+		vlog_printf(_level, "* Can not establish connection with the daemon (vmad).      *\n"); \
+		vlog_printf(_level, "* UDP/TCP connections are likely to be limited.             *\n"); \
+		vlog_printf(_level, "*************************************************************\n"); \
+	} while (0)
 
 agent* g_p_agent = NULL;
 
@@ -89,6 +91,7 @@ agent::agent() :
 	/* Fill free queue with empty messages */
 	i = m_msg_num;
 	m_msg_num = 0;
+	const char *path = safe_mce_sys().vmad_notify_dir;
 	while (i--) {
 		/* coverity[overwrite_var] */
 		msg = (agent_msg_t *)calloc(1, sizeof(*msg));
@@ -102,14 +105,14 @@ agent::agent() :
 		m_msg_num++;
 	}
 
-	if ((mkdir(VMA_AGENT_PATH, 0777) != 0) && (errno != EEXIST)) {
+	if ((mkdir(path, 0777) != 0) && (errno != EEXIST)) {
 		rc = -errno;
-		__log_dbg("failed create folder %s (rc = %d)\n", VMA_AGENT_PATH, rc);
+		__log_dbg("failed create folder %s (rc = %d)\n", path, rc);
 		goto err;
 	}
 
 	rc = snprintf(m_sock_file, sizeof(m_sock_file) - 1,
-			"%s/%s.%d.sock", VMA_AGENT_PATH, VMA_AGENT_BASE_NAME, getpid());
+			"%s/%s.%d.sock", path, VMA_AGENT_BASE_NAME, getpid());
 	if ((rc < 0 ) || (rc == (sizeof(m_sock_file) - 1) )) {
 		rc = -ENOMEM;
 		__log_dbg("failed allocate sock file (rc = %d)\n", rc);
@@ -117,7 +120,7 @@ agent::agent() :
 	}
 
 	rc = snprintf(m_pid_file, sizeof(m_pid_file) - 1,
-			"%s/%s.%d.pid", VMA_AGENT_PATH, VMA_AGENT_BASE_NAME, getpid());
+			"%s/%s.%d.pid", path, VMA_AGENT_BASE_NAME, getpid());
 	if ((rc < 0 ) || (rc == (sizeof(m_pid_file) - 1) )) {
 		rc = -ENOMEM;
 		__log_dbg("failed allocate pid file (rc = %d)\n", rc);
@@ -147,10 +150,7 @@ agent::agent() :
 	rc = send_msg_init();
 	if (rc < 0) {
 		__log_dbg("failed establish connection with daemon (rc = %d)\n", rc);
-		output_warn();
-		if (rc != -ECONNREFUSED) {
-			goto err;
-		}
+		goto err;
 	}
 
 	/* coverity[leaked_storage] */
@@ -205,6 +205,11 @@ agent::~agent()
 	send_msg_exit();
 
 	m_state = AGENT_CLOSED;
+
+	/* This delay is needed to allow process EXIT message
+	 * before event from system file monitor is raised
+	 */
+	usleep(1000);
 
 	while (!list_empty(&m_free_queue)) {
 		msg = list_first_entry(&m_free_queue, agent_msg_t, item);
@@ -408,6 +413,56 @@ int agent::send_msg_state(uint32_t fid, uint8_t st, uint8_t type,
 		goto err;
 	}
 
+err:
+	return rc;
+}
+
+int agent::send_msg_flow(struct vma_msg_flow *data)
+{
+	int rc = 0;
+	struct vma_msg_flow answer;
+
+	if (AGENT_ACTIVE != m_state) {
+		return -ENODEV;
+	}
+
+	if (m_sock_fd < 0) {
+		return -EBADF;
+	}
+
+	/* wait answer */
+	data->hdr.status = 1;
+
+	/* send(VMA_MSG_TC) in blocking manner */
+	sys_call(rc, send, m_sock_fd, data, sizeof(*data), 0);
+	if (rc < 0) {
+		__log_dbg("Failed to send(VMA_MSG_TC) errno %d (%s)\n",
+				errno, strerror(errno));
+		rc = -errno;
+		goto err;
+	}
+
+	/* recv(VMA_MSG_TC|ACK) in blocking manner */
+	memset(&answer, 0, sizeof(answer));
+	sys_call(rc, recv, m_sock_fd, &answer.hdr, sizeof(answer.hdr), 0);
+	if (rc < (int)sizeof(answer.hdr)) {
+		__log_dbg("Failed to recv(VMA_MSG_TC) errno %d (%s)\n",
+				errno, strerror(errno));
+		rc = -ECONNREFUSED;
+		goto err;
+	}
+
+	/* reply sanity check */
+	if (!(answer.hdr.code == (data->hdr.code | VMA_MSG_ACK) &&
+			answer.hdr.ver == data->hdr.ver &&
+			answer.hdr.pid == data->hdr.pid)) {
+		__log_dbg("Protocol version mismatch: code = 0x%X ver = 0x%X pid = %d\n",
+				answer.hdr.code, answer.hdr.ver, answer.hdr.pid);
+		rc = -EPROTO;
+		goto err;
+	}
+
+	rc = answer.hdr.status;
 err:
 	return rc;
 }

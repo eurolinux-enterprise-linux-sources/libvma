@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2001-2017 Mellanox Technologies, Ltd. All rights reserved.
+ * Copyright (c) 2001-2018 Mellanox Technologies, Ltd. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -114,7 +114,8 @@ public:
 	int	getsockopt(int __level, int __optname, void *__optval, socklen_t *__optlen);
 
 	inline void set_reuseaddr(bool reuseaddr) { m_reuseaddr = reuseaddr; }
-	virtual bool addr_in_reuse(void) { return m_reuseaddr; }
+	inline void set_reuseport(bool reuseport) { m_reuseport = reuseport; }
+	virtual bool flow_in_reuse(void) { return m_reuseaddr | m_reuseport; }
 
 	/**
 	* Sampling the OS immediately by matching the rx_skip_os counter (m_rx_udp_poll_os_ratio_counter) to the limit (safe_mce_sys().rx_udp_poll_os_ratio)
@@ -161,7 +162,7 @@ public:
 	// This callback will handle ready rx packet notification from any ib_conn_mgr
 	/**
 	 *	Method sockinfo_udp::rx_process_packet run packet processor
-	 *	with inspection, in case packet is OK, completion for VMAPOLL mode
+	 *	with inspection, in case packet is OK, completion for SOCKETXTREME mode
 	 *	will be filled or in other cases packet go to ready queue.
 	 *	If packet to be discarded, packet ref. counter will not be
 	 *	incremented and method returns false.
@@ -182,7 +183,7 @@ public:
 	}
 
 	virtual bool prepare_to_close(bool process_shutdown = false);
-
+	virtual int get_socket_tx_ring_fd(struct sockaddr *to, socklen_t tolen);
 private:
 
 	struct port_socket_t {
@@ -232,6 +233,7 @@ private:
 	bool		m_b_rcvtstamp;
 	bool		m_b_rcvtstampns;
 	uint8_t		m_n_tsing_flags;
+	uint8_t		m_tos;
 
 	const uint32_t	m_n_sysvar_rx_poll_yield_loops;
 	const uint32_t	m_n_sysvar_rx_udp_poll_os_ratio;
@@ -240,6 +242,7 @@ private:
 	const uint32_t	m_n_sysvar_rx_delta_tsc_between_cq_polls;
 
 	bool		m_reuseaddr; // to track setsockopt with SO_REUSEADDR
+	bool		m_reuseport; // to track setsockopt with SO_REUSEPORT
 	bool		m_sockopt_mapped; // setsockopt IPPROTO_UDP UDP_MAP_ADD
 	bool		m_is_connected; // to inspect for in_addr.src
 	bool		m_multicast; // true when socket set MC rule
@@ -262,7 +265,6 @@ private:
 	void 		save_stats_threadid_rx(); // ThreadId will only saved if logger is at least in DEBUG(4) level
 	void 		save_stats_threadid_tx(); // ThreadId will only saved if logger is at least in DEBUG(4) level
 
-	void 		save_stats_rx_offload(int bytes);
 	void 		save_stats_tx_offload(int bytes, bool is_dummy);
 
 	int 		rx_wait_helper(int &poll_count, bool is_blocking);

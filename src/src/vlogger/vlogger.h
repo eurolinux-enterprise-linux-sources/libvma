@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2001-2017 Mellanox Technologies, Ltd. All rights reserved.
+ * Copyright (c) 2001-2018 Mellanox Technologies, Ltd. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -73,6 +73,20 @@
 		static vlog_levels_t ___log_level = log_level_once; \
 		VLOG_PRINTF_INFO(___log_level, log_fmt, ##log_args); \
 		___log_level = log_level; \
+	} while (0)
+
+#define VLOG_PRINTF_ONCE_THEN_ALWAYS(log_level_once, log_level, log_fmt,log_args...) \
+	do { \
+		static vlog_levels_t ___log_level = log_level_once; \
+		VLOG_PRINTF(___log_level, log_fmt, ##log_args); \
+		___log_level = log_level; \
+	} while (0)
+
+#define VLOG_PRINTF_ONCE_THEN_DEBUG(log_level_once, log_fmt,log_args...) \
+	do { \
+		static vlog_levels_t ___log_level = log_level_once; \
+		vlog_printf(___log_level, log_fmt, ##log_args); \
+		___log_level = VLOG_DEBUG; \
 	} while (0)
 
 #define VLOG_PRINTF_ENTRY(log_level, log_fmt, log_args...)	vlog_printf(log_level, MODULE_HDR_ENTRY "%s(" log_fmt ")\n", __FUNCTION__, ##log_args)

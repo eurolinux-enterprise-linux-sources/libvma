@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2001-2017 Mellanox Technologies, Ltd. All rights reserved.
+ * Copyright (c) 2001-2018 Mellanox Technologies, Ltd. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -63,10 +63,11 @@ const uint32_t cq_mgr_mp::UDP_OK_FLAGS = IBV_EXP_CQ_RX_IP_CSUM_OK |
 cq_mgr_mp::cq_mgr_mp(const ring_eth_cb *p_ring, ib_ctx_handler *p_ib_ctx_handler,
 		     uint32_t cq_size,
 		     struct ibv_comp_channel *p_comp_event_channel,
-		     bool is_rx):
+		     bool is_rx, bool external_mem):
 		     cq_mgr_mlx5((ring_simple*)p_ring, p_ib_ctx_handler,
 				 cq_size , p_comp_event_channel, is_rx, false),
-		     m_p_ring(p_ring)
+		     m_p_ring(p_ring),
+			 m_external_mem(external_mem)
 {
 	// must call from derive in order to call derived hooks
 	m_p_cq_stat->n_buffer_pool_len = cq_size;
@@ -92,11 +93,15 @@ void cq_mgr_mp::add_qp_rx(qp_mgr *qp)
 	}
 	set_qp_rq(qp);
 	m_qp_rec.qp = qp;
-	if (mp_qp->post_recv(0, mp_qp->get_wq_count()) != 0) {
-		cq_logdbg("qp post recv failed");
+	if (m_external_mem) {
+		cq_logdbg("this qp uses an external memory %p", qp);
 	} else {
-		cq_logdbg("Successfully post_recv qp with %d new Rx buffers",
-			  mp_qp->get_wq_count());
+		if (mp_qp->post_recv(0, mp_qp->get_wq_count()) != 0) {
+			cq_logdbg("qp post recv failed");
+		} else {
+			cq_logdbg("Successfully post_recv qp with %d new Rx buffers",
+				  mp_qp->get_wq_count());
+		}
 	}
 }
 
@@ -106,13 +111,22 @@ void cq_mgr_mp::add_qp_rx(qp_mgr *qp)
  * if a bad checksum packet or a filler bit it will return VMA_MP_RQ_BAD_PACKET
  */
 int cq_mgr_mp::poll_mp_cq(uint16_t &size, uint32_t &strides_used,
-			  uint32_t &flags, volatile struct mlx5_cqe64 *&out_cqe64)
+			  uint32_t &flags, struct mlx5_cqe64 *&out_cqe64)
 {
-	volatile struct mlx5_cqe64 *cqe= check_cqe();
+	struct mlx5_cqe64 *cqe= check_cqe();
 	if (likely(cqe)) {
 		if (unlikely(MLX5_CQE_OPCODE(cqe->op_own) != MLX5_CQE_RESP_SEND)) {
 			cq_logdbg("Warning op_own is %x", MLX5_CQE_OPCODE(cqe->op_own));
 			// optimize checks in ring by setting size non zero
+			if (MLX5_CQE_OPCODE(cqe->op_own) == MLX5_CQE_RESP_ERR) {
+				cq_logdbg("poll_length, CQE response error, "
+					 "syndrome=0x%x, vendor syndrome error=0x%x, "
+					 "HW syndrome 0x%x, HW syndrome type 0x%x\n",
+					 ((struct mlx5_err_cqe *)cqe)->syndrome,
+					 ((struct mlx5_err_cqe *)cqe)->vendor_err_synd,
+					 ((struct mlx5_err_cqe *)cqe)->hw_err_synd,
+					 ((struct mlx5_err_cqe *)cqe)->hw_synd_type);
+			}
 			size = 1;
 			m_p_cq_stat->n_rx_pkt_drop++;
 			return -1;
@@ -120,7 +134,7 @@ int cq_mgr_mp::poll_mp_cq(uint16_t &size, uint32_t &strides_used,
 		m_p_cq_stat->n_rx_pkt_drop += cqe->sop_qpn.sop;
 		out_cqe64 = cqe;
 		uint32_t stride_byte_cnt = ntohl(cqe->byte_cnt);
-		strides_used += (stride_byte_cnt & MP_RQ_NUM_STRIDES_FIELD_MASK) >>
+		strides_used = (stride_byte_cnt & MP_RQ_NUM_STRIDES_FIELD_MASK) >>
 				MP_RQ_NUM_STRIDES_FIELD_SHIFT;
 		flags = (!!(cqe->hds_ip_ext & MLX5_CQE_L4_OK) * IBV_EXP_CQ_RX_TCP_UDP_CSUM_OK) |
 			(!!(cqe->hds_ip_ext & MLX5_CQE_L3_OK) * IBV_EXP_CQ_RX_IP_CSUM_OK);
@@ -154,7 +168,7 @@ void cq_mgr_mp::update_dbell()
 
 cq_mgr_mp::~cq_mgr_mp()
 {
-	volatile struct mlx5_cqe64 *out_cqe64;
+	struct mlx5_cqe64 *out_cqe64;
 	uint16_t size;
 	uint32_t strides_used = 0, flags = 0;
 	int ret;

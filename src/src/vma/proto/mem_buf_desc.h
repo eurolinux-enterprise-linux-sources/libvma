@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2001-2017 Mellanox Technologies, Ltd. All rights reserved.
+ * Copyright (c) 2001-2018 Mellanox Technologies, Ltd. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -64,8 +64,16 @@ public:
  */
 class mem_buf_desc_t {
 public:
-	mem_buf_desc_t(uint8_t *buffer, size_t size) : p_buffer(buffer), sz_buffer(size) {
-		// coverity[uninit_member]
+	mem_buf_desc_t(uint8_t *buffer, size_t size,  pbuf_free_custom_fn custom_free_function) :
+		p_buffer(buffer), lkey(0), p_next_desc(0),
+		p_prev_desc(0), sz_buffer(size), sz_data(0),
+		p_desc_owner(0) {
+		memset(&lwip_pbuf, 0, sizeof(lwip_pbuf));
+		memset(&rx, 0, sizeof(rx));
+		memset(&tx, 0, sizeof(tx));
+		reset_ref_count();
+
+		lwip_pbuf.custom_free_function = custom_free_function;
 	}
 
 	struct pbuf_custom lwip_pbuf;	//Do not change the location of this field.
@@ -104,15 +112,15 @@ public:
 			int8_t		n_frags;	//number of fragments
 			bool 		is_vma_thr; 	// specify whether packet drained from VMA internal thread or from user app thread
 			bool		is_sw_csum_need; // specify if software checksum is need for this packet
-
-	#ifdef DEFINED_VMAPOLL
-			bool 		vma_polled;
-	#else
-			bool		pad[1];
-	#endif // DEFINED_VMAPOLL
+			bool 		socketxtreme_polled;
 		} rx;
 		struct {
 			size_t		dev_mem_length; // Total data aligned to 4 bytes.
+			struct		iphdr* 	p_ip_h;
+			union {
+				struct		udphdr* p_udp_h;
+				struct		tcphdr* p_tcp_h;
+			};
 		} tx;
 	};
 

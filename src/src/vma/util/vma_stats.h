@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2001-2017 Mellanox Technologies, Ltd. All rights reserved.
+ * Copyright (c) 2001-2018 Mellanox Technologies, Ltd. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -38,6 +38,7 @@
 #include <string.h>
 #include <bitset>
 #include <netinet/in.h>
+#include <linux/if.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <vlogger/vlogger.h>
@@ -47,7 +48,7 @@
 #define NUM_OF_SUPPORTED_BPOOLS                     2
 #define NUM_OF_SUPPORTED_EPFDS                      32
 #define SHMEM_STATS_SIZE(fds_num)                   sizeof(sh_mem_t) + (fds_num * sizeof(socket_instance_block_t))
-#define FILE_NAME_MAX_SIZE                          256
+#define FILE_NAME_MAX_SIZE                          (NAME_MAX + 1)
 #define MC_TABLE_SIZE                               1024
 #define MAP_SH_MEM(var,sh_stats)                    var = (sh_mem_t*)sh_stats
 #define STATS_PUBLISHER_TIMER_PERIOD                10 // publisher will check for stats request every 10 msec
@@ -102,6 +103,7 @@ struct user_params_t {
 	int                     cycles;
 	int                     fd_dump;
 	vlog_levels_t           fd_dump_log_level;
+	std::string             vma_stats_path;
 };
 
 extern user_params_t user_params;
@@ -224,20 +226,38 @@ typedef struct {
 	cq_stats_t  cq_stats;
 } cq_instance_block_t;
 
+typedef enum {
+	RING_SIMPLE = 0,
+	RING_TAP
+} ring_type_t;
+
 // Ring stat info
 typedef struct {
 	uint64_t    n_rx_pkt_count;
 	uint64_t    n_rx_byte_count;
-	uint64_t    n_rx_interrupt_requests;
-	uint64_t    n_rx_interrupt_received;
-	uint32_t    n_rx_cq_moderation_count;
-	uint32_t    n_rx_cq_moderation_period;
+	uint64_t    n_tx_pkt_count;
+	uint64_t    n_tx_byte_count;
 	uint64_t    n_tx_retransmits;
-	uint64_t    n_tx_dev_mem_pkt_count;
-	uint64_t    n_tx_dev_mem_byte_count;
-	uint64_t    n_tx_dev_mem_oob;
-	uint32_t    n_tx_dev_mem_allocated;
 	void*       p_ring_master;
+	ring_type_t n_type;
+	union {
+		struct {
+			uint64_t    n_rx_interrupt_requests;
+			uint64_t    n_rx_interrupt_received;
+			uint32_t    n_rx_cq_moderation_count;
+			uint32_t    n_rx_cq_moderation_period;
+			uint64_t    n_tx_dev_mem_pkt_count;
+			uint64_t    n_tx_dev_mem_byte_count;
+			uint64_t    n_tx_dev_mem_oob;
+			uint32_t    n_tx_dev_mem_allocated;
+		} simple;
+		struct {
+			char		s_tap_name[IFNAMSIZ];
+			uint32_t	n_tap_fd;
+			uint32_t	n_rx_buffers;
+			uint32_t	n_vf_plugouts;
+		} tap;
+	};
 } ring_stats_t;
 
 typedef struct {
@@ -323,7 +343,7 @@ typedef struct sh_mem_t {
 } sh_mem_t;
 
 typedef struct sh_mem_info {
-	char     filename_sh_stats[FILE_NAME_MAX_SIZE];
+	char     filename_sh_stats[PATH_MAX];
 	size_t   shmem_size;
 	int      fd_sh_stats;
 	void*    p_sh_stats;

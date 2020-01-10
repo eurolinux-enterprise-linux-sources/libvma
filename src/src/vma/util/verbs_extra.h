@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2001-2017 Mellanox Technologies, Ltd. All rights reserved.
+ * Copyright (c) 2001-2018 Mellanox Technologies, Ltd. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -64,6 +64,7 @@ inline int _errnocheck(int rc) {
     return rc;
 }
 
+#define IF_VERBS_FAILURE_EX(__func__, __err__)  { if (_errnocheck(__func__) && (errno != __err__))
 #define IF_VERBS_FAILURE(__func__)  { if (_errnocheck(__func__))
 #define ENDIF_VERBS_FAILURE			}
 
@@ -95,7 +96,7 @@ int priv_ibv_modify_qp_from_init_to_rts(struct ibv_qp *qp, uint32_t underly_qpn 
 int priv_ibv_query_qp_state(struct ibv_qp *qp);
 
 // change  ib rate limit
-int priv_ibv_modify_qp_ratelimit(struct ibv_qp *qp, uint32_t ratelimit_kbps);
+int priv_ibv_modify_qp_ratelimit(struct ibv_qp *qp, struct vma_rate_limit_t &rate_limit, uint32_t rl_changes);
 
 
 #ifndef VLAN_VID_MASK
@@ -131,7 +132,7 @@ typedef struct ibv_wc				vma_ibv_wc;
 #define VMA_IBV_WC_RECV				IBV_WC_RECV
 //csum offload
 #ifdef DEFINED_IBV_DEVICE_RAW_IP_CSUM
-#define vma_is_rx_hw_csum_supported(attr)	((attr).device_cap_flags & (IBV_DEVICE_RAW_IP_CSUM | IBV_DEVICE_UD_IP_CSUM))
+#define vma_is_rx_hw_csum_supported(attr)	((attr)->device_cap_flags & (IBV_DEVICE_RAW_IP_CSUM | IBV_DEVICE_UD_IP_CSUM))
 #define vma_wc_rx_hw_csum_ok(wc)		(vma_wc_flags(wc) & IBV_WC_IP_CSUM_OK)
 #else
 #define vma_is_rx_hw_csum_supported(attr)	0
@@ -151,7 +152,7 @@ typedef int            vma_ibv_cq_init_attr;
 #ifdef DEFINED_IBV_SEND_IP_CSUM
 	#define VMA_IBV_SEND_IP_CSUM			(IBV_SEND_IP_CSUM)
 #else
-	#define VMA_NO_HW_CSUM
+	#define DEFINED_SW_CSUM
 #endif
 #define vma_ibv_send_flags			ibv_send_flags
 #define vma_send_wr_send_flags(wr)		(wr).send_flags
@@ -187,26 +188,25 @@ typedef struct ibv_flow_spec_ipv4		vma_ibv_flow_spec_ipv4;
 typedef struct ibv_flow_spec_tcp_udp		vma_ibv_flow_spec_tcp_udp;
 #define vma_get_flow_tag			0
 typedef struct ibv_exp_flow_spec_action_tag_dummy {}	vma_ibv_flow_spec_action_tag;
-
 #else //new MLNX_OFED verbs (2.2 and newer)
 
 #define vma_ibv_create_qp(pd, attr)             ibv_exp_create_qp((pd)->context, attr)
 typedef struct ibv_exp_qp_init_attr             vma_ibv_qp_init_attr;
 #define vma_ibv_qp_init_attr_comp_mask(_pd, _attr)	\
-	{ (_attr).pd = _pd; (_attr).comp_mask = IBV_EXP_QP_INIT_ATTR_PD; }
+	{ (_attr).pd = _pd; (_attr).comp_mask |= IBV_EXP_QP_INIT_ATTR_PD; }
 //ibv_query_device
 #define vma_ibv_query_device(context, attr)	ibv_exp_query_device(context, attr)
 typedef struct ibv_exp_device_attr		vma_ibv_device_attr;
 
-#define vma_ibv_device_attr_comp_mask(attr)	{ (attr).comp_mask = IBV_EXP_DEVICE_ATTR_RESERVED - 1; }
+#define vma_ibv_device_attr_comp_mask(attr)	{ (attr)->comp_mask = IBV_EXP_DEVICE_ATTR_RESERVED - 1; }
 
 #ifdef DEFINED_IBV_EXP_DEVICE_RX_CSUM_L4_PKT
-#define vma_is_rx_hw_csum_supported(attr)	(((attr).exp_device_cap_flags & IBV_EXP_DEVICE_RX_CSUM_L3_PKT) \
-						&& ((attr).exp_device_cap_flags & IBV_EXP_DEVICE_RX_CSUM_L4_PKT))
+#define vma_is_rx_hw_csum_supported(attr)	(((attr)->exp_device_cap_flags & IBV_EXP_DEVICE_RX_CSUM_L3_PKT) \
+						&& ((attr)->exp_device_cap_flags & IBV_EXP_DEVICE_RX_CSUM_L4_PKT))
 #else
 #ifdef DEFINED_IBV_EXP_DEVICE_RX_CSUM_TCP_UDP_PKT
-#define vma_is_rx_hw_csum_supported(attr)	(((attr).exp_device_cap_flags & IBV_EXP_DEVICE_RX_CSUM_IP_PKT) \
-						&& ((attr).exp_device_cap_flags & IBV_EXP_DEVICE_RX_CSUM_TCP_UDP_PKT))
+#define vma_is_rx_hw_csum_supported(attr)	(((attr)->exp_device_cap_flags & IBV_EXP_DEVICE_RX_CSUM_IP_PKT) \
+						&& ((attr)->exp_device_cap_flags & IBV_EXP_DEVICE_RX_CSUM_TCP_UDP_PKT))
 #else
 #define vma_is_rx_hw_csum_supported(attr)	0
 #endif
@@ -261,7 +261,11 @@ typedef int            vma_ibv_cq_init_attr;
 //ibv_post_send
 #define VMA_IBV_SEND_SIGNALED			IBV_EXP_SEND_SIGNALED
 #define VMA_IBV_SEND_INLINE			IBV_EXP_SEND_INLINE
-#define VMA_IBV_SEND_IP_CSUM			(IBV_EXP_SEND_IP_CSUM)
+#ifdef DEFINED_IBV_EXP_SEND_IP_CSUM
+	#define VMA_IBV_SEND_IP_CSUM			(IBV_EXP_SEND_IP_CSUM)
+#else
+	#define DEFINED_SW_CSUM
+#endif
 #define vma_ibv_send_flags			ibv_exp_send_flags
 #define vma_send_wr_send_flags(wr)		(wr).exp_send_flags
 #define VMA_IBV_WR_SEND				IBV_EXP_WR_SEND
@@ -308,13 +312,46 @@ typedef struct ibv_exp_flow_spec_action_tag	vma_ibv_flow_spec_action_tag;
 #define vma_get_flow_tag(cqe)			0
 typedef struct ibv_exp_flow_spec_action_tag_dummy {}	vma_ibv_flow_spec_action_tag;
 #endif //DEFINED_IBV_EXP_FLOW_TAG
+#endif /* DEFINED_IBV_OLD_VERBS_MLX_OFED */
+
+#if defined(HAVE_IBV_DM)
+#define vma_ibv_dm_size(attr)			((attr)->max_dm_size)
+#else
+#define vma_ibv_dm_size(attr)			(0)
 #endif
+
+#ifdef HAVE_MP_RQ
+#define vma_is_umr_supported(attr)		((attr)->umr_caps.max_klm_list_size)
+#define vma_is_mp_rq_supported(attr)		((attr)->comp_mask & IBV_EXP_DEVICE_ATTR_MP_RQ)
+#else
+#define vma_is_umr_supported(attr)		(0)
+#define vma_is_mp_rq_supported(attr)		(0)
+#endif
+
+#ifdef DEFINED_IBV_EXP_QP_RATE_LIMIT
+#define vma_is_packet_pacing_supported(attr)	((attr)->packet_pacing_caps.qp_rate_limit_min)
+#else
+#define vma_is_packet_pacing_supported(attr)	(0)
+#endif
+
+#if defined(HAVE_IBV_EXP_GET_DEVICE_LIST)
+#define vma_ibv_get_device_list(num)		ibv_exp_get_device_list(num)
+#else
+#define vma_ibv_get_device_list(num)		ibv_get_device_list(num)
+#endif
+
+typedef enum {
+	RL_RATE = 1<<0,
+	RL_BURST_SIZE = 1<<1,
+	RL_PKT_SIZE = 1<<2,
+} vma_rl_changed;
 
 typedef enum vma_wr_tx_packet_attr {
 	VMA_TX_PACKET_BLOCK   = (1 << 0), // blocking send
 	VMA_TX_PACKET_DUMMY   = (1 << 1), // dummy send
-	VMA_TX_PACKET_L3_CSUM = (1 << 6), //MLX5_ETH_WQE_L3_CSUM offload to HW L3 (IP) header checksum
-	VMA_TX_PACKET_L4_CSUM = (1 << 7), //MLX5_ETH_WQE_L4_CSUM offload to HW L4 (TCP/UDP) header checksum
+	VMA_TX_SW_CSUM        = (1 << 5), // Force SW checksum
+	VMA_TX_PACKET_L3_CSUM = (1 << 6), // MLX5_ETH_WQE_L3_CSUM offload to HW L3 (IP) header checksum
+	VMA_TX_PACKET_L4_CSUM = (1 << 7), // MLX5_ETH_WQE_L4_CSUM offload to HW L4 (TCP/UDP) header checksum
 } vma_wr_tx_packet_attr;
 
 inline bool is_set(vma_wr_tx_packet_attr state_, vma_wr_tx_packet_attr tx_mode_)

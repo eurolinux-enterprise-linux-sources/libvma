@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2001-2017 Mellanox Technologies, Ltd. All rights reserved.
+ * Copyright (c) 2001-2018 Mellanox Technologies, Ltd. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -65,7 +65,7 @@ qp_mgr::qp_mgr(const ring_simple* p_ring, const ib_ctx_handler* p_context,
 		const uint8_t port_num, const uint32_t tx_num_wr):
 	 m_rq_wqe_counter(0)
 	,m_rq_wqe_idx_to_wrid(NULL)
-#ifdef DEFINED_VMAPOLL
+#ifdef DEFINED_SOCKETXTREME
 	,m_mlx5_hw_qp(NULL)
 #endif
 	,m_qp(NULL)
@@ -91,20 +91,20 @@ qp_mgr::qp_mgr(const ring_simple* p_ring, const ib_ctx_handler* p_context,
 	,m_p_prev_rx_desc_pushed(NULL)
 	,m_n_ip_id_base(0)
 	,m_n_ip_id_offset(0)
-	,m_ratelimit_kbps(0)
 {
 	m_ibv_rx_sg_array = new ibv_sge[m_n_sysvar_rx_num_wr_to_post_recv];
 	m_ibv_rx_wr_array = new ibv_recv_wr[m_n_sysvar_rx_num_wr_to_post_recv];
 
 	set_unsignaled_count();
+	memset(&m_rate_limit, 0, sizeof(struct vma_rate_limit_t));
 
-#ifdef DEFINED_VMAPOLL
+#ifdef DEFINED_SOCKETXTREME
 	m_rq_wqe_idx_to_wrid = (uint64_t*)mmap(NULL, m_rx_num_wr * sizeof(*m_rq_wqe_idx_to_wrid),
 		PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
 	if (m_rq_wqe_idx_to_wrid == MAP_FAILED) {
 		qp_logerr("Failed allocating m_rq_wqe_idx_to_wrid (errno=%d %m)", errno);
 	}
-#endif // DEFINED_VMAPOLL
+#endif // DEFINED_SOCKETXTREME
 	qp_logfunc("");
 }
 
@@ -122,7 +122,7 @@ qp_mgr::~qp_mgr()
 	}
 	qp_logdbg("calling ibv_destroy_qp(qp=%p)", m_qp);
 	if (m_qp) {
-		IF_VERBS_FAILURE(ibv_destroy_qp(m_qp)) {
+		IF_VERBS_FAILURE_EX(ibv_destroy_qp(m_qp), EIO) {
 			qp_logdbg("QP destroy failure (errno = %d %m)", -errno);
 		} ENDIF_VERBS_FAILURE;
 		VALGRIND_MAKE_MEM_UNDEFINED(m_qp, sizeof(ibv_qp));
@@ -141,14 +141,14 @@ qp_mgr::~qp_mgr()
 	delete[] m_ibv_rx_sg_array;
 	delete[] m_ibv_rx_wr_array;
 
-#ifdef DEFINED_VMAPOLL
+#ifdef DEFINED_SOCKETXTREME
         if (m_rq_wqe_idx_to_wrid) {
 		if (0 != munmap(m_rq_wqe_idx_to_wrid, m_rx_num_wr * sizeof(*m_rq_wqe_idx_to_wrid))) {
 			qp_logerr("Failed deallocating memory with munmap m_rq_wqe_idx_to_wrid (errno=%d %m)", errno);
 		}
 		m_rq_wqe_idx_to_wrid = NULL;
 	}
-#endif // DEFINED_VMAPOLL
+#endif // DEFINED_SOCKETXTREME
 
 	qp_logdbg("Rx buffer poll: %d free global buffers available", g_buffer_pool_rx->get_free_count());
 	qp_logdbg("delete done");
@@ -170,12 +170,12 @@ int qp_mgr::configure(struct ibv_comp_channel* p_rx_comp_event_channel)
 {
 	qp_logdbg("Creating QP of transport type '%s' on ibv device '%s' [%p] on port %d",
 			priv_vma_transport_type_str(m_p_ring->get_transport_type()),
-			m_p_ib_ctx_handler->get_ibv_device()->name, m_p_ib_ctx_handler->get_ibv_device(), m_port_num);
+			m_p_ib_ctx_handler->get_ibname(), m_p_ib_ctx_handler->get_ibv_device(), m_port_num);
 
-	vma_ibv_device_attr& r_ibv_dev_attr = m_p_ib_ctx_handler->get_ibv_device_attr();
+	vma_ibv_device_attr *r_ibv_dev_attr = m_p_ib_ctx_handler->get_ibv_device_attr();
 
 	// Check device capabilities for max QP work requests
-	m_max_qp_wr = ALIGN_WR_DOWN(r_ibv_dev_attr.max_qp_wr - 1);
+	m_max_qp_wr = ALIGN_WR_DOWN(r_ibv_dev_attr->max_qp_wr - 1);
 	if (m_rx_num_wr > m_max_qp_wr) {
 		qp_logwarn("Allocating only %d Rx QP work requests while user "
 			   "requested %s=%d for QP on <%p, %d>",
@@ -186,7 +186,7 @@ int qp_mgr::configure(struct ibv_comp_channel* p_rx_comp_event_channel)
 
 	// Check device capabilities for dummy send support
 #ifdef DEFINED_IBV_EXP_WR_NOP
-	m_hw_dummy_send_support = r_ibv_dev_attr.exp_device_cap_flags & IBV_EXP_DEVICE_NOP;
+	m_hw_dummy_send_support = r_ibv_dev_attr->exp_device_cap_flags & IBV_EXP_DEVICE_NOP;
 #endif
 	qp_logdbg("HW Dummy send support for QP = %d", m_hw_dummy_send_support);
 
@@ -216,7 +216,7 @@ int qp_mgr::configure(struct ibv_comp_channel* p_rx_comp_event_channel)
 
 	// Check device capabilities for max SG elements
 	uint32_t tx_max_inline = safe_mce_sys().tx_max_inline;
-	uint32_t rx_num_sge = (IS_VMAPOLL) ? 1 : MCE_DEFAULT_RX_NUM_SGE;
+	uint32_t rx_num_sge = (IS_SOCKETXTREME) ? 1 : MCE_DEFAULT_RX_NUM_SGE;
 	uint32_t tx_num_sge = MCE_DEFAULT_TX_NUM_SGE;
 
 	qp_init_attr.cap.max_send_wr = m_tx_num_wr;
@@ -246,10 +246,10 @@ int qp_mgr::configure(struct ibv_comp_channel* p_rx_comp_event_channel)
 	m_p_ahc_head = NULL;
 	m_p_ahc_tail = NULL;
 
-#ifdef DEFINED_VMAPOLL
+#ifdef DEFINED_SOCKETXTREME
 	struct verbs_qp *vqp = (struct verbs_qp *)m_qp;
 	m_mlx5_hw_qp = (struct mlx5_qp*)container_of(vqp, struct mlx5_qp, verbs_qp);
-#endif //DEFINED_VMAPOLL
+#endif //DEFINED_SOCKETXTREME
 	if (m_p_cq_mgr_tx) {
 		m_p_cq_mgr_tx->add_qp_tx(this);
 	}
@@ -295,13 +295,12 @@ void qp_mgr::down()
 void qp_mgr::modify_qp_to_error_state()
 {
 	qp_logdbg("");
-	if (!m_p_ib_ctx_handler->is_removed()) {
-		BULLSEYE_EXCLUDE_BLOCK_START
-		if (priv_ibv_modify_qp_to_err(m_qp)) {
-			qp_logdbg("ibv_modify_qp failure (errno = %d %m)", errno);
-		}
-		BULLSEYE_EXCLUDE_BLOCK_END
+
+	BULLSEYE_EXCLUDE_BLOCK_START
+	if (priv_ibv_modify_qp_to_err(m_qp)) {
+		qp_logdbg("ibv_modify_qp failure (errno = %d %m)", errno);
 	}
+	BULLSEYE_EXCLUDE_BLOCK_END
 }
 
 void qp_mgr::release_rx_buffers()
@@ -323,11 +322,14 @@ void qp_mgr::release_rx_buffers()
 	// Wait for all FLUSHed WQE on Rx CQ
 	qp_logdbg("draining rx cq_mgr %p (last_posted_rx_wr_id = %p)", m_p_cq_mgr_rx, m_last_posted_rx_wr_id);
 	uintptr_t last_polled_rx_wr_id = 0;
-	while (m_p_cq_mgr_rx && last_polled_rx_wr_id != m_last_posted_rx_wr_id) {
+	while (m_p_cq_mgr_rx &&
+			last_polled_rx_wr_id != m_last_posted_rx_wr_id &&
+			errno != EIO) {
 
 		// Process the FLUSH'ed WQE's
 		int ret = m_p_cq_mgr_rx->drain_and_proccess(&last_polled_rx_wr_id);
 		qp_logdbg("draining completed on rx cq_mgr (%d wce) last_polled_rx_wr_id = %p", ret, last_polled_rx_wr_id);
+
 		total_ret += ret;
 
 		// Add short delay (500 usec) to allow for WQE's to be flushed to CQ every poll cycle
@@ -343,7 +345,9 @@ void qp_mgr::release_tx_buffers()
 	int ret = 0;
 	uint64_t poll_sn;
 	qp_logdbg("draining tx cq_mgr %p", m_p_cq_mgr_tx);
-	while (m_p_cq_mgr_tx && (ret = m_p_cq_mgr_tx->poll_and_process_element_tx(&poll_sn)) > 0) {
+	while (m_p_cq_mgr_tx && m_qp &&
+			((ret = m_p_cq_mgr_tx->poll_and_process_element_tx(&poll_sn)) > 0) &&
+			errno != EIO) {
 		qp_logdbg("draining completed on tx cq_mgr (%d wce)", ret);
 	}
 }
@@ -399,7 +403,7 @@ void qp_mgr::trigger_completion_for_all_sent_packets()
 
 			p_ah = ibv_create_ah(m_p_ib_ctx_handler->get_ibv_pd(), &ah_attr);
 			BULLSEYE_EXCLUDE_BLOCK_START
-			if (!p_ah) {
+			if (!p_ah && (errno != EIO)) {
 				qp_logpanic("failed creating address handler (errno=%d %m)", errno);
 			}
 			BULLSEYE_EXCLUDE_BLOCK_END
@@ -431,7 +435,7 @@ void qp_mgr::trigger_completion_for_all_sent_packets()
 
 		send_to_wire(&send_wr, (vma_wr_tx_packet_attr)(VMA_TX_PACKET_L3_CSUM|VMA_TX_PACKET_L4_CSUM), true);
 		if (p_ah) {
-			IF_VERBS_FAILURE(ibv_destroy_ah(p_ah))
+			IF_VERBS_FAILURE_EX(ibv_destroy_ah(p_ah), EIO)
 			{
 				qp_logpanic("failed destroying address handle (errno=%d %m)", errno);
 			}ENDIF_VERBS_FAILURE;
@@ -476,65 +480,61 @@ uint32_t qp_mgr::get_rx_max_wr_num()
 	return m_rx_num_wr;
 }
 
-int qp_mgr::post_recv(mem_buf_desc_t* p_mem_buf_desc)
+void qp_mgr::post_recv_buffer(mem_buf_desc_t* p_mem_buf_desc)
+{
+	if (m_n_sysvar_rx_prefetch_bytes_before_poll) {
+		if (m_p_prev_rx_desc_pushed)
+			m_p_prev_rx_desc_pushed->p_prev_desc = p_mem_buf_desc;
+		m_p_prev_rx_desc_pushed = p_mem_buf_desc;
+	}
+
+	m_ibv_rx_wr_array[m_curr_rx_wr].wr_id  = (uintptr_t)p_mem_buf_desc;
+	m_ibv_rx_sg_array[m_curr_rx_wr].addr   = (uintptr_t)p_mem_buf_desc->p_buffer;
+	m_ibv_rx_sg_array[m_curr_rx_wr].length = p_mem_buf_desc->sz_buffer;
+	m_ibv_rx_sg_array[m_curr_rx_wr].lkey   = p_mem_buf_desc->lkey;
+
+	if (m_rq_wqe_idx_to_wrid) {
+		uint32_t index = m_rq_wqe_counter & (m_rx_num_wr - 1);
+		m_rq_wqe_idx_to_wrid[index] = (uintptr_t)p_mem_buf_desc;
+		++m_rq_wqe_counter;
+	}
+
+	if (m_curr_rx_wr == m_n_sysvar_rx_num_wr_to_post_recv - 1) {
+
+		m_last_posted_rx_wr_id = (uintptr_t)p_mem_buf_desc;
+
+		m_p_prev_rx_desc_pushed = NULL;
+		p_mem_buf_desc->p_prev_desc = NULL;
+
+		m_curr_rx_wr = 0;
+		struct ibv_recv_wr *bad_wr = NULL;
+		IF_VERBS_FAILURE(ibv_post_recv(m_qp, &m_ibv_rx_wr_array[0], &bad_wr)) {
+			uint32_t n_pos_bad_rx_wr = ((uint8_t*)bad_wr - (uint8_t*)m_ibv_rx_wr_array) / sizeof(struct ibv_recv_wr);
+			qp_logerr("failed posting list (errno=%d %m)", errno);
+			qp_logerr("bad_wr is %d in submitted list (bad_wr=%p, m_ibv_rx_wr_array=%p, size=%d)", n_pos_bad_rx_wr, bad_wr, m_ibv_rx_wr_array, sizeof(struct ibv_recv_wr));
+			qp_logerr("bad_wr info: wr_id=%#x, next=%p, addr=%#x, length=%d, lkey=%#x", bad_wr[0].wr_id, bad_wr[0].next, bad_wr[0].sg_list[0].addr, bad_wr[0].sg_list[0].length, bad_wr[0].sg_list[0].lkey);
+			qp_logerr("QP current state: %d", priv_ibv_query_qp_state(m_qp));
+
+			// Fix broken linked list of rx_wr
+			if (n_pos_bad_rx_wr != (m_n_sysvar_rx_num_wr_to_post_recv - 1)) {
+				m_ibv_rx_wr_array[n_pos_bad_rx_wr].next = &m_ibv_rx_wr_array[n_pos_bad_rx_wr+1];
+			}
+			throw;
+		} ENDIF_VERBS_FAILURE;
+		qp_logfunc("Successful ibv_post_recv");
+	}
+	else {
+		m_curr_rx_wr++;
+	}
+}
+
+void qp_mgr::post_recv_buffers(descq_t* p_buffers, size_t count)
 {
 	qp_logfuncall("");
 	// Called from cq_mgr context under cq_mgr::LOCK!
-	mem_buf_desc_t *next;
-	while (p_mem_buf_desc) {
-		next = p_mem_buf_desc->p_next_desc;
-		p_mem_buf_desc->p_next_desc = NULL;
-
-		if (m_n_sysvar_rx_prefetch_bytes_before_poll) {
-			if (m_p_prev_rx_desc_pushed)
-				m_p_prev_rx_desc_pushed->p_prev_desc = p_mem_buf_desc;
-			m_p_prev_rx_desc_pushed = p_mem_buf_desc;
-		}
-
-		m_ibv_rx_wr_array[m_curr_rx_wr].wr_id  = (uintptr_t)p_mem_buf_desc;
-		m_ibv_rx_sg_array[m_curr_rx_wr].addr   = (uintptr_t)p_mem_buf_desc->p_buffer;
-		m_ibv_rx_sg_array[m_curr_rx_wr].length = p_mem_buf_desc->sz_buffer;
-		m_ibv_rx_sg_array[m_curr_rx_wr].lkey   = p_mem_buf_desc->lkey;
-
-		if (m_rq_wqe_idx_to_wrid) {
-			uint32_t index = m_rq_wqe_counter & (m_rx_num_wr - 1);
-			m_rq_wqe_idx_to_wrid[index] = (uintptr_t)p_mem_buf_desc;
-			++m_rq_wqe_counter;
-		}
-
-		if (m_curr_rx_wr == m_n_sysvar_rx_num_wr_to_post_recv - 1) {
-
-			m_last_posted_rx_wr_id = (uintptr_t)p_mem_buf_desc;
-
-			m_p_prev_rx_desc_pushed = NULL;
-			p_mem_buf_desc->p_prev_desc = NULL;
-
-			m_curr_rx_wr = 0;
-			struct ibv_recv_wr *bad_wr = NULL;
-			IF_VERBS_FAILURE(ibv_post_recv(m_qp, &m_ibv_rx_wr_array[0], &bad_wr)) {
-				uint32_t n_pos_bad_rx_wr = ((uint8_t*)bad_wr - (uint8_t*)m_ibv_rx_wr_array) / sizeof(struct ibv_recv_wr);
-				qp_logerr("failed posting list (errno=%d %m)", errno);
-				qp_logerr("bad_wr is %d in submitted list (bad_wr=%p, m_ibv_rx_wr_array=%p, size=%d)", n_pos_bad_rx_wr, bad_wr, m_ibv_rx_wr_array, sizeof(struct ibv_recv_wr));
-				qp_logerr("bad_wr info: wr_id=%#x, next=%p, addr=%#x, length=%d, lkey=%#x", bad_wr[0].wr_id, bad_wr[0].next, bad_wr[0].sg_list[0].addr, bad_wr[0].sg_list[0].length, bad_wr[0].sg_list[0].lkey);
-				qp_logerr("QP current state: %d", priv_ibv_query_qp_state(m_qp));
-
-				// Fix broken linked list of rx_wr
-				if (n_pos_bad_rx_wr != (m_n_sysvar_rx_num_wr_to_post_recv - 1)) {
-					m_ibv_rx_wr_array[n_pos_bad_rx_wr].next = &m_ibv_rx_wr_array[n_pos_bad_rx_wr+1];
-				}
-				throw;
-			} ENDIF_VERBS_FAILURE;
-			qp_logfunc("Successful ibv_post_recv");
-		}
-		else {
-			m_curr_rx_wr++;
-		}
-
-
-		p_mem_buf_desc = next;
+	while (count--) {
+		post_recv_buffer(p_buffers->get_and_pop_front());
 	}
-
-	return 0;
 }
 
 inline int qp_mgr::send_to_wire(vma_ibv_send_wr* p_send_wqe, vma_wr_tx_packet_attr attr, bool request_comp)
@@ -647,9 +647,7 @@ void qp_mgr_eth::modify_qp_to_ready_state()
 		qp_logpanic("failed to modify QP from INIT to RTS state (ret = %d)", ret);
 	}
 
-	if (m_ratelimit_kbps) {
-		modify_qp_ratelimit(m_ratelimit_kbps);
-	}
+	modify_qp_ratelimit(m_rate_limit, RL_RATE | RL_BURST_SIZE | RL_PKT_SIZE);
 	BULLSEYE_EXCLUDE_BLOCK_END
 }
 
@@ -798,30 +796,74 @@ void qp_mgr_ib::update_pkey_index()
 	 * Note: mlx4 does not support this capability. Disable it explicitly because dynamic check
 	 * using ibv_create_qp does not help
 	 */
-	if (strncmp(m_p_ib_ctx_handler->get_ibv_device()->name, "mlx4", 4)) {
+	if (strncmp(m_p_ib_ctx_handler->get_ibname(), "mlx4", 4)) {
 		m_underly_qpn = m_p_ring->get_qpn();
 	}
-	qp_logdbg("IB: Use qpn = 0x%X for device: %s", m_underly_qpn, m_p_ib_ctx_handler->get_ibv_device()->name);
+	qp_logdbg("IB: Use qpn = 0x%X for device: %s", m_underly_qpn, m_p_ib_ctx_handler->get_ibname());
 #endif /* DEFINED_IBV_EXP_QP_INIT_ATTR_ASSOCIATED_QPN */
 }
 
-bool qp_mgr::set_qp_ratelimit(const uint32_t ratelimit_kbps)
+uint32_t qp_mgr::is_ratelimit_change(struct vma_rate_limit_t &rate_limit)
 {
-	if (m_ratelimit_kbps != ratelimit_kbps) {
-	    m_ratelimit_kbps = ratelimit_kbps;
-		return true;
+	uint32_t rl_changes = 0;
+
+	if (m_rate_limit.rate != rate_limit.rate) {
+		rl_changes |= RL_RATE;
 	}
-	else {
-		return false;
+	if (m_rate_limit.max_burst_sz != rate_limit.max_burst_sz) {
+		rl_changes |= RL_BURST_SIZE;
 	}
+	if (m_rate_limit.typical_pkt_sz != rate_limit.typical_pkt_sz) {
+		rl_changes |= RL_PKT_SIZE;
+	}
+
+	return rl_changes;
 }
 
-int qp_mgr::modify_qp_ratelimit(const uint32_t ratelimit_kbps)
+bool qp_mgr::is_ratelimit_supported(vma_ibv_device_attr *attr, struct vma_rate_limit_t &rate_limit)
 {
-	int ret = priv_ibv_modify_qp_ratelimit(m_qp, ratelimit_kbps);
+#ifdef DEFINED_IBV_EXP_QP_RATE_LIMIT
+	if (!(attr->comp_mask & IBV_EXP_DEVICE_ATTR_PACKET_PACING_CAPS))
+		return false;
+
+	ibv_exp_packet_pacing_caps pp_caps = attr->packet_pacing_caps;
+
+	/* for any rate limit settings the rate must be between the supported min and max values */
+	if (rate_limit.rate < pp_caps.qp_rate_limit_min || pp_caps.qp_rate_limit_max < rate_limit.rate) {
+		return false;
+	}
+
+	uint32_t rl_changes = is_ratelimit_change(rate_limit);
+
+	/* burst support capability is required to handle any burst/packet size change */
+	if (rl_changes & (RL_BURST_SIZE | RL_PKT_SIZE)) {
+#ifdef DEFINED_IBV_EXP_QP_SUPPORT_BURST
+		if (!(pp_caps.cap_flags & IBV_EXP_QP_SUPPORT_BURST)) {
+			return false;
+		}
+#else
+		return false;
+#endif
+	}
+
+	return true;
+#else
+	NOT_IN_USE(attr);
+	NOT_IN_USE(rate_limit);
+	return false;
+#endif
+}
+
+int qp_mgr::modify_qp_ratelimit(struct vma_rate_limit_t &rate_limit, uint32_t rl_changes)
+{
+	int ret;
+
+	ret = priv_ibv_modify_qp_ratelimit(m_qp, rate_limit, rl_changes);
 	if (ret) {
 		qp_logdbg("failed to modify qp ratelimit ret %d (errno=%d %m)", ret, errno);
 		return -1;
 	}
+
+	m_rate_limit = rate_limit;
 	return 0;
 }

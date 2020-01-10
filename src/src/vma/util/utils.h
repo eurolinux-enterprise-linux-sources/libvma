@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2001-2017 Mellanox Technologies, Ltd. All rights reserved.
+ * Copyright (c) 2001-2018 Mellanox Technologies, Ltd. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -57,6 +57,11 @@ struct iphdr; //forward declaration
 * Check if file type is regular
 **/
 int check_if_regular_file (char *path);
+
+/**
+ * L3 and L4 Header Checksum Calculation
+ */
+void compute_tx_checksum(mem_buf_desc_t* p_mem_buf_desc, bool l3_csum, bool l4_csum);
 
 /**
  * IP Header Checksum Calculation
@@ -214,6 +219,14 @@ int read_file_to_int(const char *path, int default_value);
  */
 int get_ifinfo_from_ip(const struct sockaddr& local_addr, char* ifname, uint32_t &ifflags);
 
+/**
+ * Get port number from interface name
+ * @param ifname input interface name of device (e.g. eth1, ib2)
+ *  should be of size IFNAMSIZ
+ * @return zero on failure, else port number
+ */
+int get_port_from_ifname(const char* ifname);
+
 /** 
  * Get interface type value from interface name
  * 
@@ -289,6 +302,8 @@ bool get_bond_active_slave_name(IN const char* bond_name, OUT char* active_slave
 bool get_bond_slave_state(IN const char* slave_name, OUT char* curr_state, IN int sz);
 bool get_bond_slaves_name_list(IN const char* bond_name, OUT char* slaves_list, IN int sz);
 bool check_device_exist(const char* ifname, const char *path);
+bool check_netvsc_device_exist(const char* ifname);
+bool get_netvsc_slave(IN const char* ifname, OUT char* slave_name, OUT unsigned int &slave_flags);
 bool get_interface_oper_state(IN const char* interface_name, OUT char* slaves_list, IN int sz);
 
 int validate_ipoib_prop(const char* ifname, unsigned int ifflags,
@@ -299,7 +314,7 @@ int validate_raw_qp_privliges();
 
 static inline int get_procname(int pid, char *proc, size_t size)
 {
-	char app_full_name[FILE_NAME_MAX_SIZE] = {0};
+	char app_full_name[PATH_MAX] = {0};
 	char proccess_proc_dir[FILE_NAME_MAX_SIZE] = {0};
 	char* app_base_name = NULL;
 	int n = -1;
@@ -323,6 +338,18 @@ static inline int get_procname(int pid, char *proc, size_t size)
 	}
 
 	return -1;
+}
+
+static inline in_addr_t prefix_to_netmask(int prefix_length)
+{
+    in_addr_t mask = 0;
+
+    if (prefix_length <= 0 || prefix_length > 32) {
+        return 0;
+    }
+    mask = ~mask << (32 - prefix_length);
+    mask = htonl(mask);
+    return mask;
 }
 
 //Creates multicast MAC from multicast IP

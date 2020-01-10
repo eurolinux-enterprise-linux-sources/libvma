@@ -336,6 +336,16 @@ tcp_listen_input(struct tcp_pcb_listen *pcb, tcp_in_data* in_data)
   struct tcp_pcb *npcb = NULL;
   err_t rc;
 
+  if (in_data->flags & TCP_RST) {
+    /* An incoming RST should be ignored. Return. */
+    return ERR_OK;
+  }
+
+  if (in_data->flags & TCP_FIN) {
+    /* An incoming FIN should be ignored. Return. */
+    return ERR_OK;
+  }
+
   /* In the LISTEN state, we check for incoming SYN segments,
      creates a new PCB, and responds with a SYN|ACK. */
   if (in_data->flags & TCP_ACK) {
@@ -763,6 +773,7 @@ tcp_receive(struct tcp_pcb *pcb, tcp_in_data* in_data)
   u32_t right_wnd_edge;
   u16_t new_tot_len;
   int found_dupack = 0;
+  s8_t persist = 0;
 
   if (in_data->flags & TCP_ACK) {
     right_wnd_edge = pcb->snd_wnd + pcb->snd_wl2;
@@ -780,10 +791,8 @@ tcp_receive(struct tcp_pcb *pcb, tcp_in_data* in_data)
       pcb->snd_wl1 = in_data->seqno;
       pcb->snd_wl2 = in_data->ackno;
       if (pcb->snd_wnd == 0) {
-        if (pcb->persist_backoff == 0 && pcb->unacked == NULL) {
-          /* start persist timer */
-          pcb->persist_cnt = 0;
-          pcb->persist_backoff = 1;
+        if (pcb->persist_backoff == 0) {
+          persist = 1;
         }
       } else if (pcb->persist_backoff > 0) {
         /* stop persist timer */
@@ -945,6 +954,11 @@ tcp_receive(struct tcp_pcb *pcb, tcp_in_data* in_data)
       /* If there's nothing left to acknowledge, stop the retransmit
          timer, otherwise reset it to start again */
       if(pcb->unacked == NULL) {
+        if (persist) {
+          /* start persist timer */
+          pcb->persist_cnt = 0;
+          pcb->persist_backoff = 1;
+        }
         pcb->rtime = -1;
       } else {
         pcb->rtime = 0;
@@ -1008,7 +1022,7 @@ tcp_receive(struct tcp_pcb *pcb, tcp_in_data* in_data)
       m = (s16_t)(tcp_ticks - pcb->rttest);
 
       LWIP_DEBUGF(TCP_RTO_DEBUG, ("tcp_receive: experienced rtt %"U16_F" ticks (%"U16_F" msec).\n",
-                                  m, m * TCP_SLOW_INTERVAL));
+                                  m, m * slow_tmr_interval));
 
       /* This is taken directly from VJs original code in his paper */
       m = m - (pcb->sa >> 3);
@@ -1021,7 +1035,7 @@ tcp_receive(struct tcp_pcb *pcb, tcp_in_data* in_data)
       pcb->rto = (pcb->sa >> 3) + pcb->sv;
 
       LWIP_DEBUGF(TCP_RTO_DEBUG, ("tcp_receive: RTO %"U16_F" (%"U16_F" milliseconds)\n",
-                                  pcb->rto, pcb->rto * TCP_SLOW_INTERVAL));
+                                  pcb->rto, pcb->rto * slow_tmr_interval));
 
       pcb->rttest = 0;
     }
@@ -1471,11 +1485,14 @@ tcp_parseopt(struct tcp_pcb *pcb, tcp_in_data* in_data)
           LWIP_DEBUGF(TCP_INPUT_DEBUG, ("tcp_parseopt: bad length\n"));
           return;
         }
-        /* An MSS option with the right option length. */
-        mss = (opts[c + 2] << 8) | opts[c + 3];
-        /* Limit the mss to the configured TCP_MSS and prevent division by zero */
-        snd_mss = ((mss > pcb->advtsd_mss) || (mss == 0)) ? pcb->advtsd_mss : mss;
-        UPDATE_PCB_BY_MSS(pcb, snd_mss);
+        /* Check if the incoming flag is SYN. */
+        if(in_data->flags & TCP_SYN) {
+          /* An MSS option with the right option length. */
+          mss = (opts[c + 2] << 8) | opts[c + 3];
+          /* Limit the mss to the configured TCP_MSS and prevent division by zero */
+          snd_mss = ((mss > pcb->advtsd_mss) || (mss == 0)) ? pcb->advtsd_mss : mss;
+          UPDATE_PCB_BY_MSS(pcb, snd_mss);
+        }
         /* Advance to next option */
         c += 0x04;
         break;

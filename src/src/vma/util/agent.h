@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2001-2017 Mellanox Technologies, Ltd. All rights reserved.
+ * Copyright (c) 2001-2018 Mellanox Technologies, Ltd. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -94,6 +94,7 @@ public:
 		unlock();
 		return msg;
 	}
+	int send_msg_flow(struct vma_msg_flow *data);
 
 private:
 	/* state of this object */

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2001-2017 Mellanox Technologies, Ltd. All rights reserved.
+ * Copyright (c) 2001-2018 Mellanox Technologies, Ltd. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -44,6 +44,7 @@
 #include "vma/util/libvma.h"
 #include "vma/util/verbs_extra.h"
 #include "vma/util/if.h"
+#include "vma/util/hash_map.h"
 #include "vma/lwip/opt.h"
 #include "vma/proto/mem_buf_desc.h"
 #include "vma/infra/sender.h"
@@ -108,7 +109,8 @@ public:
 	virtual void        up();
 	virtual void        down();
 
-	int                 post_recv(mem_buf_desc_t* p_mem_buf_desc); // Post for receive a list of mem_buf_desc
+	void                post_recv_buffer(mem_buf_desc_t* p_mem_buf_desc); // Post for receive single mem_buf_desc
+	void                post_recv_buffers(descq_t* p_buffers, size_t count); // Post for receive a list of mem_buf_desc
 	int                 send(vma_ibv_send_wr* p_send_wqe, vma_wr_tx_packet_attr attr);
 
 	uint32_t            get_max_inline_tx_data() const {return m_max_inline_data; }
@@ -126,7 +128,7 @@ public:
 	class cq_mgr*       get_tx_cq_mgr() const { return m_p_cq_mgr_tx; }
 	class cq_mgr*       get_rx_cq_mgr() const { return m_p_cq_mgr_rx; }
 	ib_ctx_handler*     get_ib_ctx_handler() const { return m_p_ib_ctx_handler; }
-	uint32_t            get_rx_max_wr_num();
+	virtual uint32_t    get_rx_max_wr_num();
 	// This function can be replaced with a parameter during ring creation.
 	// chain of calls may serve as cache warm for dummy send feature.
 	inline bool         get_hw_dummy_send_support() {return m_hw_dummy_send_support; }
@@ -140,17 +142,18 @@ public:
 	void                release_rx_buffers();
 	void                release_tx_buffers();
 	virtual void        trigger_completion_for_all_sent_packets();
-	bool                set_qp_ratelimit(const uint32_t ratelimit_kbps);
-	int                 modify_qp_ratelimit(const uint32_t ratelimit_kbps);
+	uint32_t            is_ratelimit_change(struct vma_rate_limit_t &rate_limit);
+	bool                is_ratelimit_supported(vma_ibv_device_attr *attr, struct vma_rate_limit_t &rate_limit);
+	int                 modify_qp_ratelimit(struct vma_rate_limit_t &rate_limit, uint32_t rl_changes);
 	static inline bool  is_lib_mlx5(const char* device_name) {return strstr(device_name, "mlx5");}
 	virtual void        dm_release_data(mem_buf_desc_t* buff) { NOT_IN_USE(buff); }
-
+	virtual bool        fill_hw_descriptors(vma_mlx_hw_device_data &data) {NOT_IN_USE(data);return false;};
 protected:
 	uint64_t            m_rq_wqe_counter;
 	uint64_t*           m_rq_wqe_idx_to_wrid;
-#ifdef DEFINED_VMAPOLL
+#ifdef DEFINED_SOCKETXTREME
 	struct mlx5_qp*	    m_mlx5_hw_qp;
-#endif // DEFINED_VMAPOLL
+#endif // DEFINED_SOCKETXTREME
 	struct ibv_qp*      m_qp;
 
 	ring_simple*        m_p_ring;
@@ -190,7 +193,7 @@ protected:
 	// generating packet IDs
 	uint16_t            m_n_ip_id_base;
 	uint16_t            m_n_ip_id_offset;
-	uint32_t            m_ratelimit_kbps;
+	struct vma_rate_limit_t m_rate_limit;
 
 	mgid_ref_count_map_t  m_attach_mc_grp_ref_cnt;
 

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2001-2017 Mellanox Technologies, Ltd. All rights reserved.
+ * Copyright (c) 2001-2018 Mellanox Technologies, Ltd. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -62,7 +62,7 @@ public:
 	virtual void              handle_timer_expired(void* user_data) = 0;
 	ts_conversion_mode_t      get_converter_status() { return m_converter_status; };
 
-	static ts_conversion_mode_t     get_devices_converter_status(struct ibv_context** ibv_context_list, int num_devices);
+	static ts_conversion_mode_t     get_devices_converter_status(struct ibv_device** ibv_dev_list, int num_devices);
 
 protected:
 	ts_conversion_mode_t      m_converter_status;

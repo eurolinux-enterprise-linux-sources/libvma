@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2001-2017 Mellanox Technologies, Ltd. All rights reserved.
+ * Copyright (c) 2001-2018 Mellanox Technologies, Ltd. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -92,6 +92,8 @@ char *sys_addr2dev(struct sockaddr_in *addr, char *buf, size_t size);
 int sys_dev2addr(char *dev, struct sockaddr_in *addr);
 
 int sys_gateway(struct sockaddr_in *addr);
+
+pid_t sys_procpid(const char* name);
 
 static INLINE char *sys_addr2str(struct sockaddr_in *addr)
 {

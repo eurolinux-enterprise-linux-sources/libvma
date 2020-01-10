@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2001-2017 Mellanox Technologies, Ltd. All rights reserved.
+ * Copyright (c) 2001-2018 Mellanox Technologies, Ltd. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -55,13 +55,12 @@ inline void cq_mgr::process_recv_buffer(mem_buf_desc_t* p_mem_buf_desc, void* pv
 inline void cq_mgr::compensate_qp_poll_failed()
 {
 	// Assume locked!!!
-	// Compensate QP for all completions debth
-	if (m_qp_rec.debth) {
+	// Compensate QP for all completions debt
+	if (m_qp_rec.debt) {
 		if (likely(m_rx_pool.size() || request_more_buffers())) {
-			do {
-				mem_buf_desc_t *buff_new = m_rx_pool.get_and_pop_front();
-				m_qp_rec.qp->post_recv(buff_new);
-			} while (--m_qp_rec.debth > 0 && m_rx_pool.size());
+			size_t buffers = std::min<size_t>(m_qp_rec.debt, m_rx_pool.size());
+			m_qp_rec.qp->post_recv_buffers(&m_rx_pool, buffers);
+			m_qp_rec.debt -= buffers;
 			m_p_cq_stat->n_buffer_pool_len = m_rx_pool.size();
 		}
 	}

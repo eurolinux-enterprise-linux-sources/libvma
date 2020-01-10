@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2001-2017 Mellanox Technologies, Ltd. All rights reserved.
+ * Copyright (c) 2001-2018 Mellanox Technologies, Ltd. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -60,6 +60,8 @@ struct module_cfg daemon_cfg;
 
 int main(int argc, char *argv[])
 {
+	int rc = 0;
+
 	/* Setup syslog logging */
 	openlog(MODULE_NAME, LOG_PID, LOG_LOCAL5);
 
@@ -118,16 +120,16 @@ int main(int argc, char *argv[])
 	}
 
 	/* Main loop */
-	proc_loop();
+	rc = proc_loop();
 
 	/* Finish up */
 	close(daemon_cfg.lock_fd);
 	unlink(daemon_cfg.lock_file);
 
-	log_info("Terminated\n");
+	log_info("Terminated with code %d\n", rc);
 	closelog();
 
-	return EXIT_SUCCESS;
+	return (rc < 0 ? EXIT_FAILURE : EXIT_SUCCESS);
 err:
 	return EXIT_FAILURE;
 }
@@ -283,6 +285,7 @@ static int config_set(int argc, char **argv)
 	int rc = 0;
 	static struct option long_options[] = {
 		{"console",      no_argument,       &daemon_cfg.opt.mode,      1},
+		{"notify-dir",   required_argument, 0,                         'n'},
 		{"verbose",      required_argument, 0,                         'v'},
 		{"pid",          required_argument, 0,                         'p'},
 		{"fid",          required_argument, 0,                         'f'},
@@ -293,11 +296,18 @@ static int config_set(int argc, char **argv)
 	int op;
 	int option_index;
 
-	while ((op = getopt_long(argc, argv, "v:p:f:h", long_options, &option_index)) != -1) {
+	while ((op = getopt_long(argc, argv, "v:n:p:f:h", long_options, &option_index)) != -1) {
 		switch (op) {
 			case 'v':
 				errno = 0;
 				daemon_cfg.opt.log_level = strtol(optarg, NULL, 0);
+				if (0 != errno) {
+					rc = -EINVAL;
+				}
+				break;
+			case 'n':
+				errno = 0;
+				daemon_cfg.notify_dir = optarg;
 				if (0 != errno) {
 					rc = -EINVAL;
 				}
@@ -351,12 +361,14 @@ static void usage(void)
 {
 	printf("Usage: " MODULE_NAME " [options]\n"
 		"\t--console               Enable foreground mode (default: %s)\n"
+		"\t--notify-dir            Sets the outout dir used by vmad (default: %s)\n"
 		"\t--pid,-p <num>          Set prime number as maximum of processes per node. (default: %d).\n"
 		"\t--fid,-f <num>          Set prime number as maximum of sockets per process. (default: %d).\n"
 		"\t--force-rst             Force internal RST. (default: %s).\n"
 		"\t--verbose,-v <level>    Output verbose level (default: %d).\n"
 		"\t--help,-h               Print help and exit\n",
 			(daemon_cfg.opt.mode ? "on" : "off"),
+			VMA_AGENT_PATH,
 			daemon_cfg.opt.max_pid_num,
 			daemon_cfg.opt.max_fid_num,
 			(daemon_cfg.opt.force_rst ? "on" : "off"),

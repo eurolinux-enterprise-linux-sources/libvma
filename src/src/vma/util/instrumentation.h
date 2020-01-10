@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2001-2017 Mellanox Technologies, Ltd. All rights reserved.
+ * Copyright (c) 2001-2018 Mellanox Technologies, Ltd. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -48,7 +48,7 @@
 
 #include <stdint.h>
 #include <unistd.h>
-#ifdef DEFINED_VMAPOLL
+#ifdef DEFINED_SOCKETXTREME
 #include "utils/rdtsc.h"
 #define __STDC_FORMAT_MACROS
 #include <inttypes.h>
@@ -98,7 +98,7 @@ extern char g_rdtsc_flow_names[RDTSC_FLOW_MAX][256];
 extern instr_info g_rdtsc_instr_info_arr[RDTSC_FLOW_MAX];
 
 #endif //RDTS_MEASURE
-#endif // DEFINED_VMAPOLL
+#endif // DEFINED_SOCKETXTREME
 
 //#define VMA_TIME_MEASURE 1
 #ifdef VMA_TIME_MEASURE

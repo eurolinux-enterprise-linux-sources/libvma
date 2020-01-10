@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2001-2017 Mellanox Technologies, Ltd. All rights reserved.
+ * Copyright (c) 2001-2018 Mellanox Technologies, Ltd. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -93,10 +93,14 @@ typedef enum {
 #define RX_MEDIUM_VIEW			" %-3d %-3s %10u %7u %8u %7u %6.1f %6u  %6u  %6u %7u %7u %7u %7u\n"
 #define TX_MEDIUM_VIEW			" %-3s %-3s %10u %7u %8u %7u %29s %7u %7u %7u %7u\n"
 #define CYCLES_SEPARATOR		"-------------------------------------------------------------------------------\n" 
-#define FORMAT_CQ_STATS_32bit		"%-20s %10u\n"
-#define FORMAT_CQ_STATS_64bit		"%-20s %10llu %-3s\n"
-#define FORMAT_DEV_MEM				"%-20s %lu KB / %lu / %lu [bytes/packets/oob] %-3s\n"
-#define FORMAT_CQ_STATS_percent		"%-20s %10.2f%%\n"
+#define FORMAT_STATS_32bit		"%-20s %10u\n"
+#define FORMAT_STATS_64bit		"%-20s %10llu %-3s\n"
+#define FORMAT_RING_32bit			"%-20s %u\n"
+#define FORMAT_RING_PACKETS			"%-20s %zu / %zu [kilobytes/packets] %-3s\n"
+#define FORMAT_RING_INTERRUPT		"%-20s %zu / %zu [requests/received] %-3s\n"
+#define FORMAT_RING_MODERATION		"%-20s %u / %u [frames/usec period] %-3s\n"
+#define FORMAT_RING_DM_STATS		"%-20s %zu / %zu / %zu [kilobytes/packets/oob] %-3s\n"
+#define FORMAT_RING_TAP_NAME		"%-20s %s\n"
 
 #define INTERVAL			1
 #define BYTES_TRAFFIC_UNIT		e_K
@@ -139,8 +143,6 @@ uint32_t 	g_fd_map_size = e_K;
 //statistic file
 FILE* g_stats_file = stdout;
 
-char g_vma_shmem_dir[FILE_NAME_MAX_SIZE];
-
 void usage(const char *argv0)
 {
 	printf("\nVMA Statistics\n");
@@ -151,7 +153,7 @@ void usage(const char *argv0)
 	printf("\tfind_pid=enabled, directory=\"%s\", view=1, details=1, interval=1, \n", MCE_DEFAULT_STATS_SHMEM_DIR);
 	printf("\n");
 	printf("Options:\n");
-	printf("  -p, --pid=<pid>\t\tShow VMA statistics for proccess with pid: <pid>\n");
+	printf("  -p, --pid=<pid>\t\tShow VMA statistics for process with pid: <pid>\n");
 	printf("  -k, --directory=<directory>\tSet shared memory directory path to <directory>\n");
 	printf("  -n, --name=<application>\tShow VMA statistics for application: <application>\n");
 	printf("  -f, --find_pid\t\tFind and show statistics for VMA instance running (default)\n");
@@ -229,17 +231,25 @@ void update_delta_ring_stat(ring_stats_t* p_curr_ring_stats, ring_stats_t* p_pre
 	if (p_curr_ring_stats && p_prev_ring_stats) {
 		p_prev_ring_stats->n_rx_byte_count = (p_curr_ring_stats->n_rx_byte_count - p_prev_ring_stats->n_rx_byte_count) / delay;
 		p_prev_ring_stats->n_rx_pkt_count = (p_curr_ring_stats->n_rx_pkt_count - p_prev_ring_stats->n_rx_pkt_count) / delay;
-		p_prev_ring_stats->n_rx_interrupt_received = (p_curr_ring_stats->n_rx_interrupt_received - p_prev_ring_stats->n_rx_interrupt_received) / delay;
-		p_prev_ring_stats->n_rx_interrupt_requests = (p_curr_ring_stats->n_rx_interrupt_requests - p_prev_ring_stats->n_rx_interrupt_requests) / delay;
-		p_prev_ring_stats->n_rx_cq_moderation_count = p_curr_ring_stats->n_rx_cq_moderation_count;
-		p_prev_ring_stats->n_rx_cq_moderation_period = p_curr_ring_stats->n_rx_cq_moderation_period;
+		p_prev_ring_stats->n_tx_byte_count = (p_curr_ring_stats->n_tx_byte_count - p_prev_ring_stats->n_tx_byte_count) / delay;
+		p_prev_ring_stats->n_tx_pkt_count = (p_curr_ring_stats->n_tx_pkt_count - p_prev_ring_stats->n_tx_pkt_count) / delay;
 		p_prev_ring_stats->n_tx_retransmits = (p_curr_ring_stats->n_tx_retransmits - p_prev_ring_stats->n_tx_retransmits) / delay;
-		p_prev_ring_stats->n_tx_dev_mem_allocated = p_curr_ring_stats->n_tx_dev_mem_allocated;
-		p_prev_ring_stats->n_tx_dev_mem_byte_count = (p_curr_ring_stats->n_tx_dev_mem_byte_count - p_prev_ring_stats->n_tx_dev_mem_byte_count) / delay;
-		p_prev_ring_stats->n_tx_dev_mem_pkt_count = (p_curr_ring_stats->n_tx_dev_mem_pkt_count - p_prev_ring_stats->n_tx_dev_mem_pkt_count) / delay;
-		p_prev_ring_stats->n_tx_dev_mem_oob = (p_curr_ring_stats->n_tx_dev_mem_oob - p_prev_ring_stats->n_tx_dev_mem_oob) / delay;
+		if (p_prev_ring_stats->n_type == RING_SIMPLE) {
+			p_prev_ring_stats->simple.n_rx_interrupt_received = (p_curr_ring_stats->simple.n_rx_interrupt_received - p_prev_ring_stats->simple.n_rx_interrupt_received) / delay;
+			p_prev_ring_stats->simple.n_rx_interrupt_requests = (p_curr_ring_stats->simple.n_rx_interrupt_requests - p_prev_ring_stats->simple.n_rx_interrupt_requests) / delay;
+			p_prev_ring_stats->simple.n_rx_cq_moderation_count = p_curr_ring_stats->simple.n_rx_cq_moderation_count;
+			p_prev_ring_stats->simple.n_rx_cq_moderation_period = p_curr_ring_stats->simple.n_rx_cq_moderation_period;
+			p_prev_ring_stats->simple.n_tx_dev_mem_allocated = p_curr_ring_stats->simple.n_tx_dev_mem_allocated;
+			p_prev_ring_stats->simple.n_tx_dev_mem_byte_count = (p_curr_ring_stats->simple.n_tx_dev_mem_byte_count - p_prev_ring_stats->simple.n_tx_dev_mem_byte_count) / delay;
+			p_prev_ring_stats->simple.n_tx_dev_mem_pkt_count = (p_curr_ring_stats->simple.n_tx_dev_mem_pkt_count - p_prev_ring_stats->simple.n_tx_dev_mem_pkt_count) / delay;
+			p_prev_ring_stats->simple.n_tx_dev_mem_oob = (p_curr_ring_stats->simple.n_tx_dev_mem_oob - p_prev_ring_stats->simple.n_tx_dev_mem_oob) / delay;
+		} else if (p_prev_ring_stats->n_type == RING_TAP) {
+			memcpy(p_prev_ring_stats->tap.s_tap_name, p_curr_ring_stats->tap.s_tap_name, sizeof(p_curr_ring_stats->tap.s_tap_name));
+			p_prev_ring_stats->tap.n_tap_fd = p_curr_ring_stats->tap.n_tap_fd;
+			p_prev_ring_stats->tap.n_rx_buffers = p_curr_ring_stats->tap.n_rx_buffers;
+			p_prev_ring_stats->tap.n_vf_plugouts = (p_curr_ring_stats->tap.n_vf_plugouts - p_prev_ring_stats->tap.n_vf_plugouts);
+		}
 	}
-
 }
 
 void update_delta_cq_stat(cq_stats_t* p_curr_cq_stats, cq_stats_t* p_prev_cq_stats)
@@ -275,20 +285,38 @@ void print_ring_stats(ring_instance_block_t* p_ring_inst_arr)
 			p_ring_stats = &p_ring_inst_arr[i].ring_stats;
 			printf("======================================================\n");
 			if (p_ring_stats->p_ring_master) {
-				printf("\tRING=[%u], MASTER=[%p]\n", i, p_ring_stats->p_ring_master);
+				if (p_ring_stats->n_type == RING_SIMPLE) {
+					printf("\tRING=[%u], MASTER=[%p]\n", i, p_ring_stats->p_ring_master);
+				} else {
+					printf("\tTAP=[%u],  MASTER=[%p]\n", i, p_ring_stats->p_ring_master);
+				}
 			} else {
 				printf("\tRING=[%u]\n", i);
 			}
-			printf(FORMAT_CQ_STATS_64bit, "Packets count:", (unsigned long long int)p_ring_stats->n_rx_pkt_count, post_fix);
-			printf(FORMAT_CQ_STATS_64bit, "Packets bytes:", (unsigned long long int)p_ring_stats->n_rx_byte_count, post_fix);
-			printf(FORMAT_CQ_STATS_64bit, "Interrupt requests:", (unsigned long long int)p_ring_stats->n_rx_interrupt_requests, post_fix);
-			printf(FORMAT_CQ_STATS_64bit, "Interrupt received:", (unsigned long long int)p_ring_stats->n_rx_interrupt_received, post_fix);
-			printf(FORMAT_CQ_STATS_32bit, "Moderation frame count:",p_ring_stats->n_rx_cq_moderation_count);
-			printf(FORMAT_CQ_STATS_32bit, "Moderation usec period:",p_ring_stats->n_rx_cq_moderation_period);
-			printf(FORMAT_CQ_STATS_64bit, "Retransmissions:", (unsigned long long int)p_ring_stats->n_tx_retransmits, post_fix);
-			if (p_ring_stats->n_tx_dev_mem_allocated) {
-				printf(FORMAT_CQ_STATS_32bit, "Dev Mem allocation:", p_ring_stats->n_tx_dev_mem_allocated);
-				printf(FORMAT_DEV_MEM, "Dev Mem stats:", p_ring_stats->n_tx_dev_mem_byte_count/BYTES_TRAFFIC_UNIT,  p_ring_stats->n_tx_dev_mem_pkt_count, p_ring_stats->n_tx_dev_mem_oob, post_fix);
+
+			printf(FORMAT_RING_PACKETS, "Tx Offload:", p_ring_stats->n_tx_byte_count/BYTES_TRAFFIC_UNIT, p_ring_stats->n_tx_pkt_count, post_fix);
+			printf(FORMAT_RING_PACKETS, "Rx Offload:", p_ring_stats->n_rx_byte_count/BYTES_TRAFFIC_UNIT, p_ring_stats->n_rx_pkt_count, post_fix);
+
+			if (p_ring_stats->n_tx_retransmits) {
+				printf(FORMAT_STATS_64bit, "Retransmissions:", (unsigned long long int)p_ring_stats->n_tx_retransmits, post_fix);
+			}
+
+			if (p_ring_stats->n_type == RING_SIMPLE) {
+				if (p_ring_stats->simple.n_rx_interrupt_requests || p_ring_stats->simple.n_rx_interrupt_received) {
+					printf(FORMAT_RING_INTERRUPT, "Interrupts:", p_ring_stats->simple.n_rx_interrupt_requests, p_ring_stats->simple.n_rx_interrupt_received, post_fix);
+				}
+				if (p_ring_stats->simple.n_rx_cq_moderation_count || p_ring_stats->simple.n_rx_cq_moderation_period) {
+					printf(FORMAT_RING_MODERATION, "Moderation:", p_ring_stats->simple.n_rx_cq_moderation_count, p_ring_stats->simple.n_rx_cq_moderation_period, post_fix);
+				}
+				if (p_ring_stats->simple.n_tx_dev_mem_allocated) {
+					printf(FORMAT_RING_32bit, "Dev Mem Alloc:", p_ring_stats->simple.n_tx_dev_mem_allocated);
+					printf(FORMAT_RING_DM_STATS, "Dev Mem Stats:", p_ring_stats->simple.n_tx_dev_mem_byte_count/BYTES_TRAFFIC_UNIT,  p_ring_stats->simple.n_tx_dev_mem_pkt_count, p_ring_stats->simple.n_tx_dev_mem_oob, post_fix);
+				}
+			} else {
+				printf(FORMAT_RING_32bit, "Rx Buffers:", p_ring_stats->tap.n_rx_buffers);
+				printf(FORMAT_RING_32bit, "VF Plugouts:", p_ring_stats->tap.n_vf_plugouts);
+				printf(FORMAT_RING_32bit, "Tap fd:", p_ring_stats->tap.n_tap_fd);
+				printf(FORMAT_RING_TAP_NAME, "Tap Device:", p_ring_stats->tap.s_tap_name);
 			}
 		}
 	}
@@ -308,10 +336,10 @@ void print_cq_stats(cq_instance_block_t* p_cq_inst_arr)
 			p_cq_stats = &p_cq_inst_arr[i].cq_stats;
 			printf("======================================================\n");
 			printf("\tCQ=[%u]\n", i);
-			printf(FORMAT_CQ_STATS_64bit, "Packets dropped:", (unsigned long long int)p_cq_stats->n_rx_pkt_drop, post_fix);
-			printf(FORMAT_CQ_STATS_32bit, "Packets queue len:",p_cq_stats->n_rx_sw_queue_len);
-			printf(FORMAT_CQ_STATS_32bit, "Drained max:", p_cq_stats->n_rx_drained_at_once_max);
-			printf(FORMAT_CQ_STATS_32bit, "Buffer pool size:",p_cq_stats->n_buffer_pool_len);
+			printf(FORMAT_STATS_64bit, "Packets dropped:", (unsigned long long int)p_cq_stats->n_rx_pkt_drop, post_fix);
+			printf(FORMAT_STATS_32bit, "Packets queue len:",p_cq_stats->n_rx_sw_queue_len);
+			printf(FORMAT_STATS_32bit, "Drained max:", p_cq_stats->n_rx_drained_at_once_max);
+			printf(FORMAT_STATS_32bit, "Buffer pool size:",p_cq_stats->n_buffer_pool_len);
 		}
 	}
 	printf("======================================================\n");
@@ -335,8 +363,8 @@ void print_bpool_stats(bpool_instance_block_t* p_bpool_inst_arr)
 				printf("\tBUFFER_POOL(TX)=[%u]\n", i);
 			else
 				printf("\tBUFFER_POOL=[%u]\n", i);
-			printf(FORMAT_CQ_STATS_32bit, "Size:", p_bpool_stats->n_buffer_pool_size);
-			printf(FORMAT_CQ_STATS_32bit, "No buffers error:", p_bpool_stats->n_buffer_pool_no_bufs);
+			printf(FORMAT_STATS_32bit, "Size:", p_bpool_stats->n_buffer_pool_size);
+			printf(FORMAT_STATS_32bit, "No buffers error:", p_bpool_stats->n_buffer_pool_no_bufs);
 		}
 	}
 	printf("======================================================\n");
@@ -936,8 +964,7 @@ void set_defaults()
 	user_params.cycles = DEFAULT_CYCLES;
 	user_params.fd_dump = STATS_FD_STATISTICS_DISABLED;
 	user_params.fd_dump_log_level = STATS_FD_STATISTICS_LOG_LEVEL_DEFAULT;
-	
-	strcpy(g_vma_shmem_dir, MCE_DEFAULT_STATS_SHMEM_DIR);
+	user_params.vma_stats_path = MCE_DEFAULT_STATS_SHMEM_DIR;
 	
 	alloc_fd_mask();
 	if (g_fd_mask)
@@ -1115,7 +1142,7 @@ out:
 
 bool check_if_app_match(char* app_name, char* pid_str)
 {
-	char app_full_name[FILE_NAME_MAX_SIZE] = {0};
+	char app_full_name[PATH_MAX] = {0};
 	char proccess_proc_dir[FILE_NAME_MAX_SIZE] = {0};
 	char* app_base_name = NULL;
 	int n = -1;
@@ -1142,9 +1169,9 @@ void clean_inactive_sh_ibj()
 	int module_name_size = strlen(MODULE_NAME);
 	int pid_offset = module_name_size + 1;
 	
-	dir = opendir(g_vma_shmem_dir);	
+	dir = opendir(user_params.vma_stats_path.c_str());
 	if (dir == NULL){ 
-		log_system_err("opendir %s failed\n", g_vma_shmem_dir);
+		log_system_err("opendir %s failed\n", user_params.vma_stats_path.c_str());
 		return;
 	}
 	dirent = readdir(dir);
@@ -1153,10 +1180,10 @@ void clean_inactive_sh_ibj()
 			bool proccess_running = false;
 			proccess_running = check_if_process_running(dirent->d_name + pid_offset);
 			if (!proccess_running) {
-				char to_delete[FILE_NAME_MAX_SIZE] = {0};
+				char to_delete[PATH_MAX + 1] = {0};
 				int n = -1;
 
-				n = snprintf(to_delete, sizeof(to_delete), "%s/%s", g_vma_shmem_dir, dirent->d_name);
+				n = snprintf(to_delete, sizeof(to_delete), "%s/%s", user_params.vma_stats_path.c_str(), dirent->d_name);
 				if (likely((0 < n) && (n < (int)sizeof(to_delete)))) {
 					unlink(to_delete);
 				}
@@ -1176,9 +1203,9 @@ char* look_for_vma_stat_active_sh_obj(char* app_name)
 	int module_name_size = strlen(MODULE_NAME);
 	int pid_offset = module_name_size + 1;
 	
-	dir = opendir(g_vma_shmem_dir);	
+	dir = opendir(user_params.vma_stats_path.c_str());
 	if (dir == NULL){ 
-		log_system_err("opendir %s failed\n", g_vma_shmem_dir);
+		log_system_err("opendir %s failed\n", user_params.vma_stats_path.c_str());
 		return NULL;
 	}
 	dirent = readdir(dir);
@@ -1297,12 +1324,19 @@ void zero_ring_stats(ring_stats_t* p_ring_stats)
 {
 	p_ring_stats->n_rx_pkt_count = 0;
 	p_ring_stats->n_rx_byte_count = 0;
-	p_ring_stats->n_rx_interrupt_received = 0;
-	p_ring_stats->n_rx_interrupt_requests = 0;
+	p_ring_stats->n_tx_pkt_count = 0;
+	p_ring_stats->n_tx_byte_count = 0;
 	p_ring_stats->n_tx_retransmits = 0;
-	p_ring_stats->n_tx_dev_mem_byte_count = 0;
-	p_ring_stats->n_tx_dev_mem_pkt_count = 0;
-	p_ring_stats->n_tx_dev_mem_oob = 0;
+	if (p_ring_stats->n_type == RING_SIMPLE) {
+		p_ring_stats->simple.n_rx_interrupt_received = 0;
+		p_ring_stats->simple.n_rx_interrupt_requests = 0;
+		p_ring_stats->simple.n_tx_dev_mem_byte_count = 0;
+		p_ring_stats->simple.n_tx_dev_mem_pkt_count = 0;
+		p_ring_stats->simple.n_tx_dev_mem_oob = 0;
+	}
+	else if (p_ring_stats->n_type == RING_TAP) {
+		p_ring_stats->tap.n_vf_plugouts = 0;
+	}
 }
 
 void zero_cq_stats(cq_stats_t* p_cq_stats)
@@ -1492,8 +1526,7 @@ int main (int argc, char **argv)
 			proc_desc[sizeof(proc_desc) - 1] = '\0';
 			break;	
 		case 'k': 
-			strncpy(g_vma_shmem_dir, optarg, sizeof(g_vma_shmem_dir) - 1);
-			g_vma_shmem_dir[sizeof(g_vma_shmem_dir) - 1] = '\0';;
+			user_params.vma_stats_path = std::string((char*)optarg);
 			break;			
 		case 's': {
 			if (update_fds_mask(optarg)) {
@@ -1621,12 +1654,13 @@ int  init_print_process_stats(sh_mem_info_t & sh_mem_info)
 	sh_mem_t* sh_mem;
 	int pid = sh_mem_info.pid;
 
-	sprintf(sh_mem_info.filename_sh_stats, "%s/vmastat.%d", g_vma_shmem_dir, pid);
+	sprintf(sh_mem_info.filename_sh_stats, "%s/vmastat.%d", user_params.vma_stats_path.c_str(), pid);
 	
-	if (user_params.write_auth)
-		sh_mem_info.fd_sh_stats = open(sh_mem_info.filename_sh_stats,O_RDWR, S_IRWXU|S_IROTH);
+	if (user_params.write_auth)//S_IRUSR | S_IWUSR | S_IRGRP
+		sh_mem_info.fd_sh_stats = open(sh_mem_info.filename_sh_stats,
+						O_RDWR, __S_IREAD | __S_IWRITE| S_IROTH);
 	else
-		sh_mem_info.fd_sh_stats = open(sh_mem_info.filename_sh_stats,  O_RDONLY);
+		sh_mem_info.fd_sh_stats = open(sh_mem_info.filename_sh_stats, O_RDONLY);
 	
 	if (sh_mem_info.fd_sh_stats < 0) {
 		log_err("VMA statistics data for process id %d not found\n", pid);
@@ -1715,9 +1749,9 @@ void get_all_processes_pids(std::vector<int> &pids)
 	const int MODULE_NAME_SIZE = strlen(MODULE_NAME);
 	const int PID_OFFSET = MODULE_NAME_SIZE + 1;
 
-	DIR *dir = opendir(g_vma_shmem_dir);
+	DIR *dir = opendir(user_params.vma_stats_path.c_str());
 	if (dir == NULL){
-		log_system_err("opendir %s failed\n", g_vma_shmem_dir);
+		log_system_err("opendir %s failed\n", user_params.vma_stats_path.c_str());
 		return;
 	}
 

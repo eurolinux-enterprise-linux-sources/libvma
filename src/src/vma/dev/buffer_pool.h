@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2001-2017 Mellanox Technologies, Ltd. All rights reserved.
+ * Copyright (c) 2001-2018 Mellanox Technologies, Ltd. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -53,18 +53,23 @@ inline static void free_lwip_pbuf(struct pbuf_custom *pbuf_custom)
 class buffer_pool
 {
 public:
-	buffer_pool(size_t buffer_count, size_t size, ib_ctx_handler *p_ib_ctx_h, mem_buf_desc_owner *owner, pbuf_free_custom_fn custom_free_function);
+	buffer_pool(size_t buffer_count, size_t size, pbuf_free_custom_fn custom_free_function);
 	~buffer_pool();
+
+	void register_memory();
+	void print_val_tbl();
 
 	uint32_t	find_lkey_by_ib_ctx_thread_safe(ib_ctx_handler* p_ib_ctx_h);
 
 	/**
 	 * Get buffers from the pool - thread safe
+	 * @parma pDeque List to put the buffers.
+	 * @param desc_owner The new owner of the buffers.
 	 * @param count Number of buffers required.
-	 * @param lkey the registered memory lkey.
-	 * @return List of buffers, or NULL if don't have enough buffers.
+	 * @param lkey The registered memory lkey.
+	 * @return False if no buffers are available, else True.
 	 */
-	mem_buf_desc_t *get_buffers_thread_safe(size_t count, uint32_t lkey);
+	bool get_buffers_thread_safe(descq_t &pDeque, mem_buf_desc_owner* desc_owner, size_t count, uint32_t lkey);
 
 	/**
 	 * Return buffers to the pool.
@@ -93,6 +98,7 @@ private:
 	// XXX-dummy buffer list head and count
 	// to be replaced with a bucket-sorted array
 
+	size_t		m_size; /* pool size in bytes */
 	size_t		m_n_buffers;
 	size_t		m_n_buffers_created;
 	mem_buf_desc_t *m_p_head;
@@ -104,14 +110,6 @@ private:
 	 * Add a buffer to the pool
 	 */
 	inline void	put_buffer_helper(mem_buf_desc_t *buff);
-
-	/**
-	 * Get buffers from the pool - no thread safe
-	 * @param count Number of buffers required.
-	 * @param lkey the registered memory lkey.
-	 * @return List of buffers, or NULL if don't have enough buffers.
-	 */
-	inline mem_buf_desc_t *get_buffers(size_t count, uint32_t lkey);
 
 	void		buffersPanic();
 

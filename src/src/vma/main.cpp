@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2001-2017 Mellanox Technologies, Ltd. All rights reserved.
+ * Copyright (c) 2001-2018 Mellanox Technologies, Ltd. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -83,11 +83,11 @@ void check_netperf_flags();
 // Start of vma_version_str - used in "$ strings libvma.so | grep VMA_VERSION"
 #define STR_EXPAND(x) #x
 #define STR(x) STR_EXPAND(x)
-#ifdef DEFINED_VMAPOLL
-const char *vma_version_str = "VMA_VERSION: " PACKAGE_VERSION "-" STR(VMA_LIBRARY_RELEASE) " (vmapoll)"
+#ifdef DEFINED_SOCKETXTREME
+const char *vma_version_str = "VMA_VERSION: " PACKAGE_VERSION "-" STR(VMA_LIBRARY_RELEASE) " (socketxtreme)"
 #else
 const char *vma_version_str = "VMA_VERSION: " PACKAGE_VERSION "-" STR(VMA_LIBRARY_RELEASE)
-#endif // DEFINED_VMAPOLL
+#endif // DEFINED_SOCKETXTREME
 
 #if _BullseyeCoverage
 			      " Bullseye"
@@ -310,17 +310,16 @@ void check_flow_steering_log_num_mgm_entry_size()
 {
 	char flow_steering_val[4] = {0};
 	if (priv_safe_try_read_file((const char*)FLOW_STEERING_MGM_ENTRY_SIZE_PARAM_FILE, flow_steering_val, sizeof(flow_steering_val)) == -1) {
-		vlog_printf(VLOG_DEBUG, "Flow steering option for mlx4 driver does not exist in current OFED version");
+		vlog_printf(VLOG_DEBUG, "Flow steering option for mlx4 driver does not exist in current OFED version\n");
 	}
-	else if (flow_steering_val[0] != '-' || flow_steering_val[1] != '1') {
+	else if (flow_steering_val[0] != '-' || (strtol(&flow_steering_val[1], NULL, 0) % 2) == 0) {
 		vlog_printf(VLOG_WARNING, "***************************************************************************************\n");
 		vlog_printf(VLOG_WARNING, "* VMA will not operate properly while flow steering option is disabled                *\n");
 		vlog_printf(VLOG_WARNING, "* In order to enable flow steering please restart your VMA applications after running *\n");
 		vlog_printf(VLOG_WARNING, "* the following:                                                                      *\n");
 		vlog_printf(VLOG_WARNING, "* For your information the following steps will restart your network interface        *\n");
 		vlog_printf(VLOG_WARNING, "* 1. \"echo options mlx4_core log_num_mgm_entry_size=-1 > /etc/modprobe.d/mlnx.conf\" *\n");
-		vlog_printf(VLOG_WARNING, "* 2. \"modprobe -r mlx4_ib mlx4_en mlx4_core\"                                        *\n");
-		vlog_printf(VLOG_WARNING, "* 5. \"modprobe mlx4_core\"                                                           *\n");
+		vlog_printf(VLOG_WARNING, "* 2. \"/etc/init.d/openibd restart\"                                                  *\n");
 		vlog_printf(VLOG_WARNING, "* Read more about the Flow Steering support in the VMA's User Manual                  *\n");
 		vlog_printf(VLOG_WARNING, "***************************************************************************************\n");
 	}
@@ -442,6 +441,7 @@ void print_vma_global_settings()
 	VLOG_STR_PARAM_STRING("Log File", safe_mce_sys().log_filename, MCE_DEFAULT_LOG_FILE, SYS_VAR_LOG_FILENAME, safe_mce_sys().log_filename);
 	VLOG_STR_PARAM_STRING("Stats File", safe_mce_sys().stats_filename, MCE_DEFAULT_STATS_FILE, SYS_VAR_STATS_FILENAME, safe_mce_sys().stats_filename);
 	VLOG_STR_PARAM_STRING("Stats shared memory directory", safe_mce_sys().stats_shmem_dirname, MCE_DEFAULT_STATS_SHMEM_DIR, SYS_VAR_STATS_SHMEM_DIRNAME, safe_mce_sys().stats_shmem_dirname);
+	VLOG_STR_PARAM_STRING("VMAD output directory", safe_mce_sys().vmad_notify_dir, MCE_DEFAULT_VMAD_FOLDER, SYS_VAR_VMAD_DIR, safe_mce_sys().vmad_notify_dir);
 	VLOG_PARAM_NUMBER("Stats FD Num (max)", safe_mce_sys().stats_fd_num_max, MCE_DEFAULT_STATS_FD_NUM, SYS_VAR_STATS_FD_NUM);
 	VLOG_STR_PARAM_STRING("Conf File", safe_mce_sys().conf_filename, MCE_DEFAULT_CONF_FILE, SYS_VAR_CONF_FILENAME, safe_mce_sys().conf_filename);
 	VLOG_STR_PARAM_STRING("Application ID", safe_mce_sys().app_id, MCE_DEFAULT_APP_ID, SYS_VAR_APPLICATION_ID, safe_mce_sys().app_id);
@@ -503,7 +503,7 @@ void print_vma_global_settings()
 	}
 
 	VLOG_PARAM_NUMBER("HW TS Conversion", safe_mce_sys().hw_ts_conversion_mode, MCE_DEFAULT_HW_TS_CONVERSION_MODE, SYS_VAR_HW_TS_CONVERSION_MODE);
-	VLOG_PARAM_NUMBER("Rx SW CSUM", safe_mce_sys().rx_sw_csum, MCE_DEFUALT_RX_SW_CSUM, SYS_VAR_RX_SW_CSUM);
+
 	if (safe_mce_sys().rx_poll_yield_loops) {
 		VLOG_PARAM_NUMBER("Rx Poll Yield", safe_mce_sys().rx_poll_yield_loops, MCE_DEFAULT_RX_POLL_YIELD, SYS_VAR_RX_POLL_YIELD);
 	}
@@ -685,9 +685,9 @@ extern "C" void sock_redirect_exit(void)
 	finit_instrumentation(safe_mce_sys().vma_time_measure_filename);
 #endif
 	vlog_printf(VLOG_DEBUG, "%s()\n", __FUNCTION__);
-#ifndef DEFINED_VMAPOLL // if not defined	
+#ifndef DEFINED_SOCKETXTREME // if not defined	
 	vma_shmem_stats_close();
-#endif // DEFINED_VMAPOLL
+#endif // DEFINED_SOCKETXTREME
 }
 
 #if _BullseyeCoverage
@@ -817,21 +817,22 @@ static void do_global_ctors_helper()
 	NEW_CTOR(g_p_netlink_handler, netlink_wrapper());
 
 	NEW_CTOR(g_p_ib_ctx_handler_collection, ib_ctx_handler_collection());
-        g_p_ib_ctx_handler_collection->map_ib_devices();
 
 	NEW_CTOR(g_p_neigh_table_mgr, neigh_table_mgr());
 
-	NEW_CTOR(g_p_net_device_table_mgr, net_device_table_mgr()); // net_device should be initialized after event_handler and before buffer pool and g_p_neigh_table_mgr.
+	// net_device should be initialized after event_handler and before buffer pool and g_p_neigh_table_mgr.
+	NEW_CTOR(g_p_net_device_table_mgr, net_device_table_mgr());
+
 	NEW_CTOR(g_p_rule_table_mgr, rule_table_mgr());
 
 	NEW_CTOR(g_p_route_table_mgr, route_table_mgr());
 
 	NEW_CTOR(g_p_igmp_mgr, igmp_mgr());
 
-	NEW_CTOR(g_buffer_pool_rx, buffer_pool(safe_mce_sys().rx_num_bufs, RX_BUF_SIZE(g_p_net_device_table_mgr->get_max_mtu()), NULL, NULL, buffer_pool::free_rx_lwip_pbuf_custom));
+	NEW_CTOR(g_buffer_pool_rx, buffer_pool(safe_mce_sys().rx_num_bufs, RX_BUF_SIZE(g_p_net_device_table_mgr->get_max_mtu()), buffer_pool::free_rx_lwip_pbuf_custom));
  	g_buffer_pool_rx->set_RX_TX_for_stats(true);
 
- 	NEW_CTOR(g_buffer_pool_tx, buffer_pool(safe_mce_sys().tx_num_bufs, get_lwip_tcp_mss(g_p_net_device_table_mgr->get_max_mtu(), safe_mce_sys().lwip_mss) + 92, NULL, NULL, buffer_pool::free_tx_lwip_pbuf_custom));
+ 	NEW_CTOR(g_buffer_pool_tx, buffer_pool(safe_mce_sys().tx_num_bufs, get_lwip_tcp_mss(g_p_net_device_table_mgr->get_max_mtu(), safe_mce_sys().lwip_mss) + 92, buffer_pool::free_tx_lwip_pbuf_custom));
  	g_buffer_pool_tx->set_RX_TX_for_stats(false);
 
  	NEW_CTOR(g_tcp_seg_pool,  tcp_seg_pool(safe_mce_sys().tx_num_segs_tcp));

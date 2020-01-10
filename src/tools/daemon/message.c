@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2001-2017 Mellanox Technologies, Ltd. All rights reserved.
+ * Copyright (c) 2001-2018 Mellanox Technologies, Ltd. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -53,9 +53,13 @@ int open_message(void);
 void close_message(void);
 int proc_message(void);
 
+extern int add_flow(struct store_pid *pid_value, struct store_flow *value);
+extern int del_flow(struct store_pid *pid_value, struct store_flow *value);
+
 static int proc_msg_init(struct vma_hdr *msg_hdr, size_t size, struct sockaddr_un *peeraddr);
 static int proc_msg_exit(struct vma_hdr *msg_hdr, size_t size);
 static int proc_msg_state(struct vma_hdr *msg_hdr, size_t size);
+static int proc_msg_flow(struct vma_hdr *msg_hdr, size_t size, struct sockaddr_un *peeraddr);
 
 
 int open_message(void)
@@ -136,7 +140,7 @@ int proc_message(void)
 again:
 	len = recvfrom(daemon_cfg.sock_fd, &msg_recv, sizeof(msg_recv), 0,
 			(struct sockaddr *) &peeraddr, &addrlen);
-	if ((len < 0 || len < (int)sizeof(struct vma_hdr))) {
+	if (len < 0) {
 		if (errno == EINTR) {
 			goto again;
 		}
@@ -168,9 +172,12 @@ again:
 		case VMA_MSG_EXIT:
 			rc = proc_msg_exit(msg_hdr, len);
 			break;
+		case VMA_MSG_FLOW:
+			rc = proc_msg_flow(msg_hdr, len, &peeraddr);
+			break;
 		default:
 			rc = -EPROTO;
-			log_error("Received unknow message errno %d (%s)\n", errno,
+			log_error("Received unknown message errno %d (%s)\n", errno,
 					strerror(errno));
 			goto err;
 		}
@@ -218,6 +225,7 @@ static int proc_msg_init(struct vma_hdr *msg_hdr, size_t size, struct sockaddr_u
 	value->pid = data->hdr.pid;
 	value->lib_ver = data->ver;
 	gettimeofday(&value->t_start, NULL);
+	INIT_LIST_HEAD(&value->flow_list);
 
 	value->ht = hash_create(&free, daemon_cfg.opt.max_fid_num);
 	if (NULL == value->ht) {
@@ -242,7 +250,7 @@ static int proc_msg_init(struct vma_hdr *msg_hdr, size_t size, struct sockaddr_u
 	data->hdr.ver = VMA_AGENT_VER;
 	if (0 > sys_sendto(daemon_cfg.sock_fd, data, sizeof(*data), 0,
 			(struct sockaddr *)peeraddr, sizeof(*peeraddr))) {
-		log_error("Failed sendto() message errno %d (%s)\n", errno,
+		log_warn("Failed sendto() message errno %d (%s)\n", errno,
 				strerror(errno));
 	}
 
@@ -252,6 +260,7 @@ static int proc_msg_init(struct vma_hdr *msg_hdr, size_t size, struct sockaddr_u
 static int proc_msg_exit(struct vma_hdr *msg_hdr, size_t size)
 {
 	struct vma_msg_exit *data;
+	struct store_pid *pid_value = NULL;
 
 	assert(msg_hdr);
 	assert(msg_hdr->code == VMA_MSG_EXIT);
@@ -262,7 +271,20 @@ static int proc_msg_exit(struct vma_hdr *msg_hdr, size_t size)
 		return -EBADMSG;
 	}
 
-	hash_del(daemon_cfg.ht, data->hdr.pid);
+	pid_value = hash_get(daemon_cfg.ht, data->hdr.pid);
+	if (pid_value) {
+		struct store_flow *flow_value = NULL;
+		struct list_head *cur_entry = NULL;
+		struct list_head *tmp_entry = NULL;
+		list_for_each_safe(cur_entry, tmp_entry, &pid_value->flow_list) {
+			flow_value = list_entry(cur_entry, struct store_flow, item);
+			list_del_init(&flow_value->item);
+			del_flow(pid_value, flow_value);
+			free(flow_value);
+		}
+
+		hash_del(daemon_cfg.ht, pid_value->pid);
+	}
 
 	log_debug("[%d] remove from the storage\n", data->hdr.pid);
 
@@ -286,9 +308,13 @@ static int proc_msg_state(struct vma_hdr *msg_hdr, size_t size)
 
 	pid_value = hash_get(daemon_cfg.ht, data->hdr.pid);
 	if (NULL == pid_value) {
-		log_error("Failed hash_get() for pid %d errno %d (%s)\n",
+		/* Return success because this case can be valid
+		 * if the process is terminated using abnormal way
+		 * So no needs in acknowledgement.
+		 */
+		log_debug("Failed hash_get() for pid %d errno %d (%s). The process should be abnormal terminated\n",
 				data->hdr.pid, errno, strerror(errno));
-		return -ENOENT;
+		return ((int)sizeof(*data));
 	}
 
 	/* Do not store information about closed socket
@@ -336,4 +362,123 @@ static int proc_msg_state(struct vma_hdr *msg_hdr, size_t size)
 					tcp_state_str[value->state] : "n/a"));
 
 	return (sizeof(*data));
+}
+
+static int proc_msg_flow(struct vma_hdr *msg_hdr, size_t size, struct sockaddr_un *peeraddr)
+{
+	int rc = 0;
+	struct vma_msg_flow *data;
+	struct store_pid *pid_value;
+	struct store_flow *value = NULL;
+	struct store_flow *cur_flow = NULL;
+	struct list_head *cur_entry = NULL;
+	int value_new = 0;
+
+	assert(msg_hdr);
+	assert(msg_hdr->code == VMA_MSG_FLOW);
+	assert(size);
+
+	data = (struct vma_msg_flow *)msg_hdr;
+	if (size < sizeof(*data)) {
+		rc = -EBADMSG;
+		goto err;
+	}
+
+	pid_value = hash_get(daemon_cfg.ht, data->hdr.pid);
+	if (NULL == pid_value) {
+		/* Return success because this case can be valid
+		 * if the process is terminated using abnormal way
+		 * So no needs in acknowledgement.
+		 */
+		log_debug("Failed hash_get() for pid %d errno %d (%s). The process should be abnormal terminated\n",
+				data->hdr.pid, errno, strerror(errno));
+		return ((int)sizeof(*data));
+	}
+
+	/* Allocate memory for this value in this place
+	 */
+	value = (void *)calloc(1, sizeof(*value));
+	if (NULL == value) {
+		rc = -ENOMEM;
+		goto err;
+	}
+
+	value->type = data->type;
+	value->if_id = data->if_id;
+	value->tap_id = data->tap_id;
+	value->flow.dst_ip = data->flow.dst_ip;
+	value->flow.dst_port = data->flow.dst_port;
+
+	switch (data->type) {
+	case VMA_MSG_FLOW_TCP_3T:
+	case VMA_MSG_FLOW_UDP_3T:
+		break;
+	case VMA_MSG_FLOW_TCP_5T:
+	case VMA_MSG_FLOW_UDP_5T:
+		value->flow.t5.src_ip = data->flow.t5.src_ip;
+		value->flow.t5.src_port = data->flow.t5.src_port;
+		break;
+	default:
+		log_error("Received unknown message errno %d (%s)\n", errno,
+				strerror(errno));
+		rc = -EPROTO;
+		goto err;
+	}
+
+	if (VMA_MSG_FLOW_ADD == data->action) {
+		list_for_each(cur_entry, &pid_value->flow_list) {
+			cur_flow = list_entry(cur_entry, struct store_flow, item);
+			if (value->type == cur_flow->type &&
+				value->if_id == cur_flow->if_id &&
+				value->tap_id == cur_flow->tap_id &&
+				!memcmp(&value->flow, &cur_flow->flow, sizeof(cur_flow->flow))) {
+				break;
+			}
+		}
+		if (cur_entry == &pid_value->flow_list) {
+			rc = add_flow(pid_value, value);
+			if (rc < 0) {
+				goto err;
+			}
+			value_new = 1; /* mark value as new to avoid releasing */
+			list_add_tail(&value->item, &pid_value->flow_list);
+
+			log_debug("[%d] add flow handle: 0x%08X type: %d if_id: %d tap_id: %d\n",
+					pid_value->pid, value->handle, value->type, value->if_id, value->tap_id);
+		}
+	}
+
+	if (VMA_MSG_FLOW_DEL == data->action) {
+		list_for_each(cur_entry, &pid_value->flow_list) {
+			cur_flow = list_entry(cur_entry, struct store_flow, item);
+			if (value->type == cur_flow->type &&
+				value->if_id == cur_flow->if_id &&
+				value->tap_id == cur_flow->tap_id &&
+				!memcmp(&value->flow, &cur_flow->flow, sizeof(cur_flow->flow))) {
+				log_debug("[%d] del flow handle: 0x%08X type: %d if_id: %d tap_id: %d\n",
+						pid_value->pid, cur_flow->handle, cur_flow->type, cur_flow->if_id, cur_flow->tap_id);
+				list_del_init(&cur_flow->item);
+				rc = del_flow(pid_value, cur_flow);
+				free(cur_flow);
+				break;
+			}
+		}
+	}
+
+err:
+	if (1 == data->hdr.status) {
+		data->hdr.code |= VMA_MSG_ACK;
+		data->hdr.status = (rc ? 1 : 0);
+		if (0 > sys_sendto(daemon_cfg.sock_fd, &data->hdr, sizeof(data->hdr), 0,
+				(struct sockaddr *)peeraddr, sizeof(*peeraddr))) {
+			log_warn("Failed sendto() message errno %d (%s)\n", errno,
+					strerror(errno));
+		}
+	}
+
+	if (value && !value_new) {
+		free(value);
+	}
+
+	return (rc ? rc : (int)sizeof(*data));
 }

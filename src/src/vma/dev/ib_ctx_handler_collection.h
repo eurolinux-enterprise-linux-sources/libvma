@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2001-2017 Mellanox Technologies, Ltd. All rights reserved.
+ * Copyright (c) 2001-2018 Mellanox Technologies, Ltd. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -39,26 +39,34 @@
 #include "vma/util/verbs_extra.h"
 #include "ib_ctx_handler.h"
 
-typedef std::tr1::unordered_map<struct ibv_context*, ib_ctx_handler*>  ib_context_map_t;
+typedef std::tr1::unordered_map<struct ibv_device*, ib_ctx_handler*>  ib_context_map_t;
 
 class ib_ctx_handler_collection
 {
 public:
 	ib_ctx_handler_collection();
 	~ib_ctx_handler_collection();
-	void            map_ib_devices(); //return num_devices, can use rdma_get_devices()
-	ib_ctx_handler* get_ib_ctx(struct ibv_context*);
-	size_t		get_num_devices() {return m_n_num_devices; };
-	size_t          mem_reg_on_all_devices(void* addr, size_t length,
-			ibv_mr** mr_array, size_t mr_array_sz,
-			uint64_t access);
-	ts_conversion_mode_t    get_ctx_time_conversion_mode();
+
+	void update_tbl();
+	void print_val_tbl();
+
+	inline ib_context_map_t* get_ib_cxt_list() {
+		return (m_ib_ctx_map.size() ? &m_ib_ctx_map : NULL);
+	}
+	ib_ctx_handler* get_ib_ctx(const char *ifa_name);
+	void del_ib_ctx(ib_ctx_handler* ib_ctx);
+
+	inline size_t get_num_devices() {
+		return m_ib_ctx_map.size();
+	};
+	inline ts_conversion_mode_t get_ctx_time_conversion_mode() {
+		return m_ctx_time_conversion_mode;
+	};
 
 private:
+
 	ib_context_map_t	m_ib_ctx_map;
-	int			m_n_num_devices;
-	ts_conversion_mode_t    m_ctx_time_conversion_mode;
-	void			free_ibchc_resources(void);
+	ts_conversion_mode_t m_ctx_time_conversion_mode;
 };
 
 extern ib_ctx_handler_collection* g_p_ib_ctx_handler_collection;

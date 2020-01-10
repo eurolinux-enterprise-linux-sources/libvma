@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2001-2017 Mellanox Technologies, Ltd. All rights reserved.
+ * Copyright (c) 2001-2018 Mellanox Technologies, Ltd. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -40,6 +40,7 @@
 #include "utils/bullseye.h"
 #include "vma/util/utils.h"
 #include "vma/util/valgrind.h"
+#include "vma/util/sg_array.h"
 #include "vma/proto/ip_frag.h"
 #include "vma/proto/L2_address.h"
 #include "vma/proto/igmp_mgr.h"
@@ -60,6 +61,17 @@
 #define MODULE_HDR MODULE_NAME "%d:%s() "
 
 #define ALIGN_WR_DOWN(_num_wr_) (max(32, ((_num_wr_      ) & ~(0xf))))
+#define RING_TX_BUFS_COMPENSATE 256
+
+#define RING_LOCK_AND_RUN(__lock__, __func_and_params__) 	\
+		__lock__.lock(); __func_and_params__; __lock__.unlock();
+
+#define RING_LOCK_RUN_AND_UPDATE_RET(__lock__, __func_and_params__) 	\
+		__lock__.lock(); ret = __func_and_params__; __lock__.unlock();
+
+#define RING_TRY_LOCK_RUN_AND_UPDATE_RET(__lock__, __func_and_params__) \
+		if (!__lock__.trylock()) { ret = __func_and_params__; __lock__.unlock(); } \
+		else { errno = EBUSY; }
 
 /**/
 /** inlining functions can only help if they are implemented before their usage **/
@@ -76,6 +88,11 @@ inline void ring_simple::send_status_handler(int ret, vma_ibv_send_wr* p_send_wq
 		}
 	}
 	else {
+		// Update TX statistics
+		sg_array sga(p_send_wqe->sg_list, p_send_wqe->num_sge);
+		m_p_ring_stat->n_tx_byte_count += sga.length();
+		++m_p_ring_stat->n_tx_pkt_count;
+
 		// Decrease counter in order to keep track of how many missing buffers we have when
 		// doing ring->restart() and then drain_tx_buffers_to_buffer_pool()
 		m_missing_buf_ref_count--;
@@ -86,21 +103,19 @@ inline void ring_simple::send_status_handler(int ret, vma_ibv_send_wr* p_send_wq
 qp_mgr* ring_eth::create_qp_mgr(const ib_ctx_handler* ib_ctx, uint8_t port_num, struct ibv_comp_channel* p_rx_comp_event_channel)
 {
 #if defined(HAVE_INFINIBAND_MLX5_HW_H)
-	if (!m_b_is_hypervisor && qp_mgr::is_lib_mlx5(((ib_ctx_handler*)ib_ctx)->get_ibv_device()->name)) {
+	if (!m_b_is_hypervisor && qp_mgr::is_lib_mlx5(((ib_ctx_handler*)ib_ctx)->get_ibname())) {
 		return new qp_mgr_eth_mlx5(this, ib_ctx, port_num, p_rx_comp_event_channel, get_tx_num_wr(), get_partition());
 	}
 #endif
 	return new qp_mgr_eth(this, ib_ctx, port_num, p_rx_comp_event_channel, get_tx_num_wr(), get_partition());
 }
 
-bool ring_eth::is_ratelimit_supported(uint32_t rate)
+bool ring_eth::is_ratelimit_supported(struct vma_rate_limit_t &rate_limit)
 {
 #ifdef DEFINED_IBV_EXP_QP_RATE_LIMIT
-	ibv_exp_packet_pacing_caps &pp_caps =
-			m_p_ib_ctx->get_ibv_device_attr().packet_pacing_caps;
-	return rate >= pp_caps.qp_rate_limit_min && rate <= pp_caps.qp_rate_limit_max;
+	return m_p_qp_mgr->is_ratelimit_supported(m_p_ib_ctx->get_ibv_device_attr(), rate_limit);
 #else
-	NOT_IN_USE(rate);
+	NOT_IN_USE(rate_limit);
 	return false;
 #endif
 }
@@ -110,57 +125,72 @@ qp_mgr* ring_ib::create_qp_mgr(const ib_ctx_handler* ib_ctx, uint8_t port_num, s
 	return new qp_mgr_ib(this, ib_ctx, port_num, p_rx_comp_event_channel, get_tx_num_wr(), get_partition());
 }
 
-bool ring_ib::is_ratelimit_supported(uint32_t rate)
+bool ring_ib::is_ratelimit_supported(struct vma_rate_limit_t &rate_limit)
 {
-	NOT_IN_USE(rate);
+	NOT_IN_USE(rate_limit);
 	return false;
 }
 
-ring_simple::ring_simple(ring_resource_creation_info_t* p_ring_info, in_addr_t local_if, uint16_t partition_sn, int count, transport_type_t transport_type, uint32_t mtu, ring* parent /*=NULL*/):
-	ring(count, mtu), m_p_qp_mgr(NULL), m_p_cq_mgr_rx(NULL),
+ring_simple::ring_simple(int if_index, ring* parent /*=NULL*/):
+	ring_slave(if_index, parent, RING_SIMPLE),
+	m_p_ib_ctx(NULL),
+	m_p_qp_mgr(NULL),
+	m_p_cq_mgr_rx(NULL),
 	m_lock_ring_rx("ring_simple:lock_rx"),
-	m_b_is_hypervisor(safe_mce_sys().is_hypervisor),
-	m_p_ring_stat(NULL),
-	m_lock_ring_tx("ring_simple:lock_tx"), m_p_cq_mgr_tx(NULL),
+	m_p_cq_mgr_tx(NULL),
+	m_lock_ring_tx("ring_simple:lock_tx"),
+	m_b_is_hypervisor(safe_mce_sys().hypervisor),
 	m_lock_ring_tx_buf_wait("ring:lock_tx_buf_wait"), m_tx_num_bufs(0), m_tx_num_wr(0), m_tx_num_wr_free(0),
 	m_b_qp_tx_first_flushed_completion_handled(false), m_missing_buf_ref_count(0),
-	m_tx_lkey(g_buffer_pool_tx->find_lkey_by_ib_ctx_thread_safe(p_ring_info->p_ib_ctx)),
-	m_partition(partition_sn), m_gro_mgr(safe_mce_sys().gro_streams_max, MAX_GRO_BUFS), m_up(false),
-	m_p_rx_comp_event_channel(NULL), m_p_tx_comp_event_channel(NULL), m_p_l2_addr(NULL),
-	m_local_if(local_if), m_transport_type(transport_type)
+	m_tx_lkey(0),
+	m_gro_mgr(safe_mce_sys().gro_streams_max, MAX_GRO_BUFS), m_up(false),
+	m_p_rx_comp_event_channel(NULL), m_p_tx_comp_event_channel(NULL), m_p_l2_addr(NULL)
 	, m_b_sysvar_eth_mc_l2_only_rules(safe_mce_sys().eth_mc_l2_only_rules)
 	, m_b_sysvar_mc_force_flowtag(safe_mce_sys().mc_force_flowtag)
-#ifdef DEFINED_VMAPOLL
+#ifdef DEFINED_SOCKETXTREME
 	, m_rx_buffs_rdy_for_free_head(NULL) 
 	, m_rx_buffs_rdy_for_free_tail(NULL) 
-#endif // DEFINED_VMAPOLL		
+#endif // DEFINED_SOCKETXTREME		
 	, m_flow_tag_enabled(false)
 {
+	net_device_val* p_ndev = g_p_net_device_table_mgr->get_net_device_val(m_parent->get_if_index());
+	const slave_data_t * p_slave = p_ndev->get_slave(get_if_index());
+
+	ring_logdbg("new ring_simple()");
+
+	/* m_p_ib_ctx, m_tx_lkey should be initialized to be used
+	 * in ring_eth_direct, ring_eth_cb constructors
+	 */
 	BULLSEYE_EXCLUDE_BLOCK_START
+	m_p_ib_ctx = p_slave->p_ib_ctx;
+	if(m_p_ib_ctx == NULL) {
+		ring_logpanic("m_p_ib_ctx = NULL. It can be related to wrong bonding configuration");
+	}
+
+	m_tx_lkey = g_buffer_pool_tx->find_lkey_by_ib_ctx_thread_safe(m_p_ib_ctx);
 	if (m_tx_lkey == 0) {
 		__log_info_panic("invalid lkey found %lu", m_tx_lkey);
 	}
 	BULLSEYE_EXCLUDE_BLOCK_END
-	if (count != 1)
-		ring_logpanic("Error creating simple ring with more than 1 resource");
-	if (parent) {
-		m_parent = parent;
-	} else {
-		m_parent = this;
-	}
+
+	/* initialize m_partition in ring_eth() or ring_ib() */
+	m_partition = 0;
+
+	/* initialization basing on ndev information */
+	m_local_if = p_ndev->get_local_addr();
+	m_mtu = p_ndev->get_mtu();
 
 	 // coverity[uninit_member]
-	m_tx_pool.set_id("ring (%p) : m_tx_pool", this);
+	m_tx_pool.set_id("ring_simple (%p) : m_tx_pool", this);
 }
 
 ring_simple::~ring_simple()
 {
-	ring_logdbg("delete ring()");
+	ring_logdbg("delete ring_simple()");
 
 	// Go over all hash and for each flow: 1.Detach from qp 2.Delete related rfs object 3.Remove flow from hash
 	m_lock_ring_rx.lock();
-	flow_udp_uc_del_all();
-	flow_udp_mc_del_all();
+	flow_udp_del_all();
 	flow_tcp_del_all();
 	m_lock_ring_rx.unlock();
 
@@ -172,12 +202,12 @@ ring_simple::~ring_simple()
 	m_lock_ring_rx.lock();
 	m_lock_ring_tx.lock();
 
-#ifdef DEFINED_VMAPOLL	
+#ifdef DEFINED_SOCKETXTREME	
 	if (m_rx_buffs_rdy_for_free_head) {
-		m_p_cq_mgr_rx->vma_poll_reclaim_recv_buffer_helper(m_rx_buffs_rdy_for_free_head);
+		m_p_cq_mgr_rx->socketxtreme_reclaim_recv_buffer_helper(m_rx_buffs_rdy_for_free_head);
 		m_rx_buffs_rdy_for_free_head = m_rx_buffs_rdy_for_free_tail = NULL;
 	}
-#endif // DEFINED_VMAPOLL		
+#endif // DEFINED_SOCKETXTREME		
 
 	if (m_p_qp_mgr) {
 		// 'down' the active QP/CQ
@@ -191,8 +221,13 @@ ring_simple::~ring_simple()
 	delete_l2_address();
 
 	// Delete the rx channel fd from the global fd collection
-	if (g_p_fd_collection && m_p_rx_comp_event_channel) {
-		g_p_fd_collection->del_cq_channel_fd(m_p_rx_comp_event_channel->fd, true);
+	if (g_p_fd_collection) {
+		if (m_p_rx_comp_event_channel) {
+			g_p_fd_collection->del_cq_channel_fd(m_p_rx_comp_event_channel->fd, true);
+		}
+		if (m_p_tx_comp_event_channel) {
+			g_p_fd_collection->del_cq_channel_fd(m_p_tx_comp_event_channel->fd, true);
+		}
 	}
 
 	if (m_p_rx_comp_event_channel) {
@@ -226,31 +261,19 @@ ring_simple::~ring_simple()
 		m_p_tx_comp_event_channel = NULL;
 	}
 
-	if (m_p_ring_stat) {
-		vma_stats_instance_remove_ring_block(m_p_ring_stat);
-	}
-
 	/* coverity[double_unlock] TODO: RM#1049980 */
 	m_lock_ring_rx.unlock();
 	m_lock_ring_tx.unlock();
 
-	ring_logdbg("delete ring() completed");
+	ring_logdbg("delete ring_simple() completed");
 }
 
-void ring_simple::create_resources(ring_resource_creation_info_t* p_ring_info, bool active)
+void ring_simple::create_resources()
 {
-	ring_logdbg("new ring()");
+	net_device_val* p_ndev = g_p_net_device_table_mgr->get_net_device_val(m_parent->get_if_index());
+	const slave_data_t * p_slave = p_ndev->get_slave(get_if_index());
 
-	BULLSEYE_EXCLUDE_BLOCK_START
-	if(p_ring_info == NULL) {
-		ring_logpanic("p_ring_info = NULL");
-	}
-
-	if(p_ring_info->p_ib_ctx == NULL) {
-		ring_logpanic("p_ring_info.p_ib_ctx = NULL. It can be related to wrong bonding configuration");
-	}
-	m_p_ib_ctx = p_ring_info->p_ib_ctx;
-	save_l2_address(p_ring_info->p_l2_addr);
+	save_l2_address(p_slave->p_L2_addr);
 	m_p_tx_comp_event_channel = ibv_create_comp_channel(m_p_ib_ctx->get_ibv_context());
 	if (m_p_tx_comp_event_channel == NULL) {
 		VLOG_PRINTF_INFO_ONCE_THEN_ALWAYS(VLOG_ERROR, VLOG_DEBUG, "ibv_create_comp_channel for tx failed. m_p_tx_comp_event_channel = %p (errno=%d %m)", m_p_tx_comp_event_channel, errno);
@@ -262,8 +285,7 @@ void ring_simple::create_resources(ring_resource_creation_info_t* p_ring_info, b
 	BULLSEYE_EXCLUDE_BLOCK_END
 	VALGRIND_MAKE_MEM_DEFINED(m_p_tx_comp_event_channel, sizeof(struct ibv_comp_channel));
 	// Check device capabilities for max QP work requests
-	vma_ibv_device_attr& r_ibv_dev_attr = m_p_ib_ctx->get_ibv_device_attr();
-	uint32_t max_qp_wr = ALIGN_WR_DOWN(r_ibv_dev_attr.max_qp_wr - 1);
+	uint32_t max_qp_wr = ALIGN_WR_DOWN(m_p_ib_ctx->get_ibv_device_attr()->max_qp_wr - 1);
 	m_tx_num_wr = safe_mce_sys().tx_num_wr;
 	if (m_tx_num_wr > max_qp_wr) {
 		ring_logwarn("Allocating only %d Tx QP work requests while user requested %s=%d for QP on interface %d.%d.%d.%d",
@@ -288,12 +310,13 @@ void ring_simple::create_resources(ring_resource_creation_info_t* p_ring_info, b
 	}
 	BULLSEYE_EXCLUDE_BLOCK_END
 	VALGRIND_MAKE_MEM_DEFINED(m_p_rx_comp_event_channel, sizeof(struct ibv_comp_channel));
-	m_p_n_rx_channel_fds = new int[m_n_num_resources];
+	m_p_n_rx_channel_fds = new int[1];
 	m_p_n_rx_channel_fds[0] = m_p_rx_comp_event_channel->fd;
 	// Add the rx channel fd to the global fd collection
 	if (g_p_fd_collection) {
 		// Create new cq_channel info in the global fd collection
 		g_p_fd_collection->add_cq_channel_fd(m_p_n_rx_channel_fds[0], this);
+		g_p_fd_collection->add_cq_channel_fd(m_p_tx_comp_event_channel->fd, this);
 	}
 
 #if 0
@@ -305,7 +328,7 @@ remain below as in master?
 	request_more_tx_buffers(RING_TX_BUFS_COMPENSATE);
 	m_tx_num_bufs = m_tx_pool.size();
 #endif // 0
-	m_p_qp_mgr = create_qp_mgr(m_p_ib_ctx, p_ring_info->port_num, m_p_rx_comp_event_channel);
+	m_p_qp_mgr = create_qp_mgr(m_p_ib_ctx, p_slave->port_num, m_p_rx_comp_event_channel);
 	BULLSEYE_EXCLUDE_BLOCK_START
 	if (m_p_qp_mgr == NULL) {
 		ring_logerr("Failed to allocate qp_mgr!");
@@ -317,34 +340,19 @@ remain below as in master?
 	m_p_cq_mgr_rx = m_p_qp_mgr->get_rx_cq_mgr();
 	m_p_cq_mgr_tx = m_p_qp_mgr->get_tx_cq_mgr();
 
-	request_more_tx_buffers(RING_TX_BUFS_COMPENSATE);
-	m_tx_num_bufs = m_tx_pool.size();
+	init_tx_buffers(RING_TX_BUFS_COMPENSATE);
 
-	// use local copy of stats by default
-	m_p_ring_stat = &m_ring_stat_static;
-	memset(m_p_ring_stat , 0, sizeof(*m_p_ring_stat));
-	if (m_parent != this) {
-		m_ring_stat_static.p_ring_master = m_parent;
-	}
 	if (safe_mce_sys().cq_moderation_enable) {
 		modify_cq_moderation(safe_mce_sys().cq_moderation_period_usec, safe_mce_sys().cq_moderation_count);
 	}
 
-	if (active) {
+	if (p_slave->active) {
 		// 'up' the active QP/CQ resource
 		m_up = true;
 		m_p_qp_mgr->up();
 	}
 
-	vma_stats_instance_create_ring_block(m_p_ring_stat);
-
-	ring_logdbg("new ring() completed");
-}
-
-void ring_simple::restart(ring_resource_creation_info_t* p_ring_info)
-{
-	NOT_IN_USE(p_ring_info);
-	ring_logpanic("Can't restart a simple ring");
+	ring_logdbg("new ring_simple() completed");
 }
 
 bool ring_simple::attach_flow(flow_tuple& flow_spec_5t, pkt_rcvr_sink *sink)
@@ -395,7 +403,11 @@ bool ring_simple::attach_flow(flow_tuple& flow_spec_5t, pkt_rcvr_sink *sink)
 
 	/* Get the appropriate hash map (tcp, uc or mc) from the 5t details */
 	if (flow_spec_5t.is_udp_uc()) {
-		flow_spec_udp_uc_key_t key_udp_uc(flow_spec_5t.get_dst_port());
+		flow_spec_udp_key_t key_udp_uc(flow_spec_5t.get_dst_ip(), flow_spec_5t.get_dst_port());
+		if (flow_tag_id && si->flow_in_reuse()) {
+			flow_tag_id = FLOW_TAG_MASK;
+			ring_logdbg("UC flow tag for socketinfo=%p is disabled: SO_REUSEADDR or SO_REUSEPORT were enabled", si);
+		}
 		p_rfs = m_flow_udp_uc_map.get(key_udp_uc, NULL);
 		if (p_rfs == NULL) {
 			// No rfs object exists so a new one must be created and inserted in the flow map
@@ -422,15 +434,15 @@ bool ring_simple::attach_flow(flow_tuple& flow_spec_5t, pkt_rcvr_sink *sink)
 			}
 		}
 	} else if (flow_spec_5t.is_udp_mc()) {
-		flow_spec_udp_mc_key_t key_udp_mc(flow_spec_5t.get_dst_ip(), flow_spec_5t.get_dst_port());
+		flow_spec_udp_key_t key_udp_mc(flow_spec_5t.get_dst_ip(), flow_spec_5t.get_dst_port());
 
 		if (flow_tag_id) {
-			if (m_b_sysvar_mc_force_flowtag || !si->addr_in_reuse()) {
-				ring_logdbg("MC flow tag ID=%d for socketinfo=%p is enabled: force_flowtag=%d, SO_REUSEADDR=%d",
-					flow_tag_id, si, m_b_sysvar_mc_force_flowtag, si->addr_in_reuse());
+			if (m_b_sysvar_mc_force_flowtag || !si->flow_in_reuse()) {
+				ring_logdbg("MC flow tag ID=%d for socketinfo=%p is enabled: force_flowtag=%d, SO_REUSEADDR | SO_REUSEPORT=%d",
+					flow_tag_id, si, m_b_sysvar_mc_force_flowtag, si->flow_in_reuse());
 			} else {
 				flow_tag_id = FLOW_TAG_MASK;
-				ring_logdbg("MC flow tag for socketinfo=%p is disabled: force_flowtag=0, SO_REUSEADDR=1", si);
+				ring_logdbg("MC flow tag for socketinfo=%p is disabled: force_flowtag=0, SO_REUSEADDR or SO_REUSEPORT were enabled", si);
 			}
 		}
 		// Note for CX3:
@@ -474,14 +486,16 @@ bool ring_simple::attach_flow(flow_tuple& flow_spec_5t, pkt_rcvr_sink *sink)
 			}
 		}
 	} else if (flow_spec_5t.is_tcp()) {
-		flow_spec_tcp_key_t key_tcp(flow_spec_5t.get_src_ip(), flow_spec_5t.get_dst_port(), flow_spec_5t.get_src_port());
+		flow_spec_tcp_key_t key_tcp(flow_spec_5t.get_dst_ip(), flow_spec_5t.get_src_ip(),
+				flow_spec_5t.get_dst_port(), flow_spec_5t.get_src_port());
+		rule_key_t rule_key(flow_spec_5t.get_dst_ip(), flow_spec_5t.get_dst_port());
 		rfs_rule_filter* tcp_dst_port_filter = NULL;
 		if (safe_mce_sys().tcp_3t_rules) {
-			rule_filter_map_t::iterator tcp_dst_port_iter = m_tcp_dst_port_attach_map.find(key_tcp.dst_port);
+			rule_filter_map_t::iterator tcp_dst_port_iter = m_tcp_dst_port_attach_map.find(rule_key.key);
 			if (tcp_dst_port_iter == m_tcp_dst_port_attach_map.end()) {
-				m_tcp_dst_port_attach_map[key_tcp.dst_port].counter = 1;
+				m_tcp_dst_port_attach_map[rule_key.key].counter = 1;
 			} else {
-				m_tcp_dst_port_attach_map[key_tcp.dst_port].counter = ((tcp_dst_port_iter->second.counter) + 1);
+				m_tcp_dst_port_attach_map[rule_key.key].counter = ((tcp_dst_port_iter->second.counter) + 1);
 			}
 		}
 
@@ -490,7 +504,7 @@ bool ring_simple::attach_flow(flow_tuple& flow_spec_5t, pkt_rcvr_sink *sink)
 			m_lock_ring_rx.unlock();
 			if (safe_mce_sys().tcp_3t_rules) {
 				flow_tuple tcp_3t_only(flow_spec_5t.get_dst_ip(), flow_spec_5t.get_dst_port(), 0, 0, flow_spec_5t.get_protocol());
-				tcp_dst_port_filter = new rfs_rule_filter(m_tcp_dst_port_attach_map, key_tcp.dst_port, tcp_3t_only);
+				tcp_dst_port_filter = new rfs_rule_filter(m_tcp_dst_port_attach_map, rule_key.key, tcp_3t_only);
 			}
 			if(safe_mce_sys().gro_streams_max && flow_spec_5t.is_5_tuple()) {
 				// When the gro mechanism is being used, packets must be processed in the rfs
@@ -562,7 +576,7 @@ bool ring_simple::detach_flow(flow_tuple& flow_spec_5t, pkt_rcvr_sink* sink)
 
 	/* Get the appropriate hash map (tcp, uc or mc) from the 5t details */
 	if (flow_spec_5t.is_udp_uc()) {
-		flow_spec_udp_uc_key_t key_udp_uc(flow_spec_5t.get_dst_port());
+		flow_spec_udp_key_t key_udp_uc(flow_spec_5t.get_dst_ip(), flow_spec_5t.get_dst_port());
 		p_rfs = m_flow_udp_uc_map.get(key_udp_uc, NULL);
 		BULLSEYE_EXCLUDE_BLOCK_START
 		if (p_rfs == NULL) {
@@ -581,7 +595,7 @@ bool ring_simple::detach_flow(flow_tuple& flow_spec_5t, pkt_rcvr_sink* sink)
 		}
 	} else if (flow_spec_5t.is_udp_mc()) {
 		int keep_in_map = 1;
-		flow_spec_udp_mc_key_t key_udp_mc(flow_spec_5t.get_dst_ip(), flow_spec_5t.get_dst_port());
+		flow_spec_udp_key_t key_udp_mc(flow_spec_5t.get_dst_ip(), flow_spec_5t.get_dst_port());
 		if (m_transport_type == VMA_TRANSPORT_IB || m_b_sysvar_eth_mc_l2_only_rules) {
 			rule_filter_map_t::iterator l2_mc_iter = m_l2_mc_ip_attach_map.find(key_udp_mc.dst_ip);
 			BULLSEYE_EXCLUDE_BLOCK_START
@@ -613,15 +627,17 @@ bool ring_simple::detach_flow(flow_tuple& flow_spec_5t, pkt_rcvr_sink* sink)
 		}
 	} else if (flow_spec_5t.is_tcp()) {
 		int keep_in_map = 1;
-		flow_spec_tcp_key_t key_tcp(flow_spec_5t.get_src_ip(), flow_spec_5t.get_dst_port(), flow_spec_5t.get_src_port());
+		flow_spec_tcp_key_t key_tcp(flow_spec_5t.get_dst_ip(), flow_spec_5t.get_src_ip(),
+				flow_spec_5t.get_dst_port(), flow_spec_5t.get_src_port());
+		rule_key_t rule_key(flow_spec_5t.get_dst_ip(), flow_spec_5t.get_dst_port());
 		if (safe_mce_sys().tcp_3t_rules) {
-			rule_filter_map_t::iterator tcp_dst_port_iter = m_tcp_dst_port_attach_map.find(key_tcp.dst_port);
+			rule_filter_map_t::iterator tcp_dst_port_iter = m_tcp_dst_port_attach_map.find(rule_key.key);
 			BULLSEYE_EXCLUDE_BLOCK_START
 			if (tcp_dst_port_iter == m_tcp_dst_port_attach_map.end()) {
 				ring_logdbg("Could not find matching counter for TCP src port!");
 				BULLSEYE_EXCLUDE_BLOCK_END
 			} else {
-				keep_in_map = m_tcp_dst_port_attach_map[key_tcp.dst_port].counter = MAX(0 , ((tcp_dst_port_iter->second.counter) - 1));
+				keep_in_map = m_tcp_dst_port_attach_map[rule_key.key].counter = MAX(0 , ((tcp_dst_port_iter->second.counter) - 1));
 			}
 		}
 		p_rfs = m_flow_tcp_map.get(key_tcp, NULL);
@@ -634,7 +650,7 @@ bool ring_simple::detach_flow(flow_tuple& flow_spec_5t, pkt_rcvr_sink* sink)
 
 		p_rfs->detach_flow(sink);
 		if(!keep_in_map){
-			m_tcp_dst_port_attach_map.erase(m_tcp_dst_port_attach_map.find(key_tcp.dst_port));
+			m_tcp_dst_port_attach_map.erase(m_tcp_dst_port_attach_map.find(rule_key.key));
 		}
 		if (p_rfs->get_num_of_sinks() == 0) {
 			BULLSEYE_EXCLUDE_BLOCK_START
@@ -653,91 +669,6 @@ bool ring_simple::detach_flow(flow_tuple& flow_spec_5t, pkt_rcvr_sink* sink)
 
 	return true;
 }
-
-/*
-void ring::print_ring_flow_to_rfs_map(flow_spec_map_t *p_flow_map)
-{
-	rfs *curr_rfs;
-	flow_spec_5_tuple_key_t map_key;
-	flow_spec_map_t::iterator itr;
-
-	for (itr = p_flow_map->begin(); itr != p_flow_map->end(); ++itr) {
-		curr_rfs = itr->second;
-		map_key = itr->first;
-		if (!curr_rfs) {
-			ring_logdbg("key: [%d.%d.%d.%d:%d; %d.%d.%d.%d:%d;%s], rfs: NULL",
-					 NIPQUAD(map_key.dst_ip), map_key.dst_port,
-					 NIPQUAD(map_key.src_ip), map_key.src_port,
-					 flow_type_to_str(map_key.l4_protocol));
-		}
-		else {
-			ring_logdbg("key: [%d.%d.%d.%d:%d; %d.%d.%d.%d:%d;%s], rfs: num of sinks = %d",
-					NIPQUAD(map_key.dst_ip), map_key.dst_port,
-					NIPQUAD(map_key.src_ip), map_key.src_port,
-					flow_type_to_str(map_key.l4_protocol), curr_rfs->get_num_of_sinks());
-		}
-	}
-}
-*/
-
-//code coverage
-#if 0
-void ring::print_flow_to_rfs_udp_uc_map(flow_spec_udp_uc_map_t *p_flow_map)
-{
-	rfs *curr_rfs;
-	flow_spec_udp_uc_key_t map_key;
-	flow_spec_udp_uc_map_t::iterator itr;
-
-	// This is an internal function (within ring and 'friends'). No need for lock mechanism.
-
-	ring_logdbg("\n\n********** Printing UDP UC map *********");
-
-	itr = p_flow_map->begin();
-	if (!(itr != p_flow_map->end())) {
-		ring_logdbg("flow_spec_udp_uc_map is EMPTY!\n");
-	} else {
-		for (itr = p_flow_map->begin(); itr != p_flow_map->end(); ++itr) {
-			curr_rfs = itr->second;
-			map_key = itr->first;
-			if (!curr_rfs) {
-				ring_logdbg("######### key: port = %d, rfs: NULL", ntohs(map_key.dst_port));
-			}
-			else {
-				ring_logdbg("######### key: port = %d, rfs = %p, num of sinks = %d", ntohs(map_key.dst_port), curr_rfs, curr_rfs->get_num_of_sinks());
-			}
-		}
-	}
-}
-
-void ring_simple::print_flow_to_rfs_tcp_map(flow_spec_tcp_map_t *p_flow_map)
-{
-	rfs *curr_rfs;
-	flow_spec_tcp_key_t map_key;
-	flow_spec_tcp_map_t::iterator itr;
-
-	// This is an internal function (within ring and 'friends'). No need for lock mechanism.
-
-	ring_logdbg("\n\n********** Printing TCP map *********");
-
-	itr = p_flow_map->begin();
-	if (!(itr != p_flow_map->end())) {
-		ring_logdbg("flow_spec_tcp_map is EMPTY!\n");
-	} else {
-		for (itr = p_flow_map->begin(); itr != p_flow_map->end(); ++itr) {
-			curr_rfs = itr->second;
-			map_key = itr->first;
-			if (!curr_rfs) {
-				ring_logdbg("######### key: port = %d, rfs: NULL", ntohs(map_key.dst_port));
-			}
-			else {
-				ring_logdbg("######### key: src=%d.%d.%d.%d:%d, dst_port=%d rfs: num of sinks = %d",
-					NIPQUAD(map_key.src_ip), ntohs(map_key.src_port),
-					ntohs(map_key.dst_port), curr_rfs->get_num_of_sinks());
-			}
-		}
-	}
-}
-#endif
 
 #ifndef IGMP_V3_MEMBERSHIP_REPORT
 #define IGMP_V3_MEMBERSHIP_REPORT	0x22	/* V3 version of 0x11 */ /* ALEXR: taken from <linux/igmp.h> */
@@ -796,12 +727,12 @@ bool ring_simple::rx_process_buffer(mem_buf_desc_t* p_rx_wc_buf_desc, void* pv_f
 	struct iphdr* p_ip_h = NULL;
 	struct udphdr* p_udp_h = NULL;
 
-#ifdef DEFINED_VMAPOLL
+#ifdef DEFINED_SOCKETXTREME
 	NOT_IN_USE(ip_tot_len);
 	NOT_IN_USE(ip_frag_off);
 	NOT_IN_USE(n_frag_offset);
 	NOT_IN_USE(p_udp_h);
-#endif // DEFINED_VMAPOLL
+#endif // DEFINED_SOCKETXTREME
 
 	// Validate buffer size
 	sz_data = p_rx_wc_buf_desc->sz_data;
@@ -817,12 +748,13 @@ bool ring_simple::rx_process_buffer(mem_buf_desc_t* p_rx_wc_buf_desc, void* pv_f
 	m_cq_moderation_info.bytes += sz_data;
 	++m_cq_moderation_info.packets;
 
-	m_ring_stat_static.n_rx_byte_count += sz_data;
-	++m_ring_stat_static.n_rx_pkt_count;
+	m_p_ring_stat->n_rx_byte_count += sz_data;
+	++m_p_ring_stat->n_rx_pkt_count;
 
 	// This is an internal function (within ring and 'friends'). No need for lock mechanism.
 	if (likely(m_flow_tag_enabled && p_rx_wc_buf_desc->rx.flow_tag_id &&
-		   (p_rx_wc_buf_desc->rx.flow_tag_id != FLOW_TAG_MASK))) {
+		   p_rx_wc_buf_desc->rx.flow_tag_id != FLOW_TAG_MASK &&
+		   !p_rx_wc_buf_desc->rx.is_sw_csum_need)) {
 		sockinfo* si = NULL;
 		// trying to get sockinfo per flow_tag_id-1 as it was incremented at attach
 		// to allow mapping sockfd=0
@@ -1105,10 +1037,11 @@ bool ring_simple::rx_process_buffer(mem_buf_desc_t* p_rx_wc_buf_desc, void* pv_f
 		p_rx_wc_buf_desc->rx.sz_payload          = sz_payload;
 
 		// Find the relevant hash map and pass the packet to the rfs for dispatching
-		if (!(IN_MULTICAST_N(p_rx_wc_buf_desc->rx.dst.sin_addr.s_addr))) {	// This is UDP UC packet
-			p_rfs = m_flow_udp_uc_map.get(flow_spec_udp_uc_key_t(p_rx_wc_buf_desc->rx.dst.sin_port), NULL);
-		} else {	// This is UDP MC packet
-			p_rfs = m_flow_udp_mc_map.get(flow_spec_udp_mc_key_t(p_rx_wc_buf_desc->rx.dst.sin_addr.s_addr,
+		if (!(IN_MULTICAST_N(p_rx_wc_buf_desc->rx.dst.sin_addr.s_addr))) {      // This is UDP UC packet
+			p_rfs = m_flow_udp_uc_map.get(flow_spec_udp_key_t(p_rx_wc_buf_desc->rx.dst.sin_addr.s_addr,
+				p_rx_wc_buf_desc->rx.dst.sin_port), NULL);
+		} else {        // This is UDP MC packet
+			p_rfs = m_flow_udp_mc_map.get(flow_spec_udp_key_t(p_rx_wc_buf_desc->rx.dst.sin_addr.s_addr,
 				p_rx_wc_buf_desc->rx.dst.sin_port), NULL);
 		}
 	}
@@ -1144,13 +1077,15 @@ bool ring_simple::rx_process_buffer(mem_buf_desc_t* p_rx_wc_buf_desc, void* pv_f
 		p_rx_wc_buf_desc->rx.tcp.p_tcp_h = p_tcp_h;
 
 		// Find the relevant hash map and pass the packet to the rfs for dispatching
-		p_rfs = m_flow_tcp_map.get(flow_spec_tcp_key_t(p_rx_wc_buf_desc->rx.src.sin_addr.s_addr,
-			p_rx_wc_buf_desc->rx.dst.sin_port, p_rx_wc_buf_desc->rx.src.sin_port), NULL);
+		p_rfs = m_flow_tcp_map.get(flow_spec_tcp_key_t(p_rx_wc_buf_desc->rx.dst.sin_addr.s_addr,
+				p_rx_wc_buf_desc->rx.src.sin_addr.s_addr, p_rx_wc_buf_desc->rx.dst.sin_port,
+				p_rx_wc_buf_desc->rx.src.sin_port), NULL);
 
 		p_rx_wc_buf_desc->rx.tcp.n_transport_header_len = transport_header_len;
 
 		if (unlikely(p_rfs == NULL)) {	// If we didn't find a match for TCP 5T, look for a match with TCP 3T
-			p_rfs = m_flow_tcp_map.get(flow_spec_tcp_key_t(0, p_rx_wc_buf_desc->rx.dst.sin_port, 0), NULL);
+			p_rfs = m_flow_tcp_map.get(flow_spec_tcp_key_t(p_rx_wc_buf_desc->rx.dst.sin_addr.s_addr, 0,
+					p_rx_wc_buf_desc->rx.dst.sin_port, 0), NULL);
 		}
 	}
 	break;
@@ -1198,7 +1133,7 @@ int ring_simple::request_notification(cq_type_t cq_type, uint64_t poll_sn)
 	if (likely(CQT_RX == cq_type)) {
 		RING_TRY_LOCK_RUN_AND_UPDATE_RET(m_lock_ring_rx,
 				m_p_cq_mgr_rx->request_notification(poll_sn);
-				++m_ring_stat_static.n_rx_interrupt_requests);
+				++m_p_ring_stat->simple.n_rx_interrupt_requests);
 	}
 	else {
 		RING_TRY_LOCK_RUN_AND_UPDATE_RET(m_lock_ring_tx, m_p_cq_mgr_tx->request_notification(poll_sn));
@@ -1213,8 +1148,8 @@ int ring_simple::poll_and_process_element_rx(uint64_t* p_cq_poll_sn, void* pv_fd
 	return ret;
 }
 
-#ifdef DEFINED_VMAPOLL
-int ring_simple::vma_poll(struct vma_completion_t *vma_completions, unsigned int ncompletions, int flags)
+#ifdef DEFINED_SOCKETXTREME
+int ring_simple::socketxtreme_poll(struct vma_completion_t *vma_completions, unsigned int ncompletions, int flags)
 {
 	int ret = 0;
 	int i = 0;
@@ -1225,17 +1160,17 @@ int ring_simple::vma_poll(struct vma_completion_t *vma_completions, unsigned int
 	if (likely(vma_completions) && ncompletions) {
 		struct ring_ec *ec = NULL;
 
-		m_vma_poll_completion = vma_completions;
+		m_socketxtreme_completion = vma_completions;
 
 		while (!g_b_exit && (i < (int)ncompletions)) {
-			m_vma_poll_completion->events = 0;
+			m_socketxtreme_completion->events = 0;
 			/* Check list size to avoid locking */
 			if (!list_empty(&m_ec_list)) {
 				ec = get_ec();
 				if (ec) {
-					memcpy(m_vma_poll_completion, &ec->completion, sizeof(ec->completion));
+					memcpy(m_socketxtreme_completion, &ec->completion, sizeof(ec->completion));
 					ec->clear();
-					m_vma_poll_completion++;
+					m_socketxtreme_completion++;
 					i++;
 				}
 			} else {
@@ -1244,11 +1179,11 @@ int ring_simple::vma_poll(struct vma_completion_t *vma_completions, unsigned int
 				 * in right order. It is done to avoid locking and
 				 * may be it is not so critical
 				 */
-				if (likely(m_p_cq_mgr_rx->vma_poll_and_process_element_rx(&desc))) {
-					desc->rx.vma_polled = true;
+				if (likely(m_p_cq_mgr_rx->socketxtreme_and_process_element_rx(&desc))) {
+					desc->rx.socketxtreme_polled = true;
 					rx_process_buffer(desc, NULL);
-					if (m_vma_poll_completion->events) {
-						m_vma_poll_completion++;
+					if (m_socketxtreme_completion->events) {
+						m_socketxtreme_completion++;
 						i++;
 					}
 				} else {
@@ -1257,7 +1192,7 @@ int ring_simple::vma_poll(struct vma_completion_t *vma_completions, unsigned int
 			}
 		}
 
-		m_vma_poll_completion = NULL;
+		m_socketxtreme_completion = NULL;
 
 		ret = i;
 	}
@@ -1268,23 +1203,19 @@ int ring_simple::vma_poll(struct vma_completion_t *vma_completions, unsigned int
 
 	return ret;
 }
-#endif // DEFINED_VMAPOLL
+#endif // DEFINED_SOCKETXTREME
 
-int ring_simple::wait_for_notification_and_process_element(cq_type_t cq_type, int cq_channel_fd, uint64_t* p_cq_poll_sn, void* pv_fd_ready_array /*NULL*/)
+int ring_simple::wait_for_notification_and_process_element(int cq_channel_fd, uint64_t* p_cq_poll_sn, void* pv_fd_ready_array /*NULL*/)
 {
 	int ret = -1;
-	if (likely(CQT_RX == cq_type)) {
-		if (m_p_cq_mgr_rx != NULL) {
-			RING_TRY_LOCK_RUN_AND_UPDATE_RET(m_lock_ring_rx,
-					m_p_cq_mgr_rx->wait_for_notification_and_process_element(p_cq_poll_sn, pv_fd_ready_array);
-					++m_ring_stat_static.n_rx_interrupt_received);
-		} else {
-			ring_logerr("Can't find rx_cq for the rx_comp_event_channel_fd (= %d)", cq_channel_fd);
-		}
+	if (m_p_cq_mgr_rx != NULL) {
+		RING_TRY_LOCK_RUN_AND_UPDATE_RET(m_lock_ring_rx,
+				m_p_cq_mgr_rx->wait_for_notification_and_process_element(p_cq_poll_sn, pv_fd_ready_array);
+		++m_p_ring_stat->simple.n_rx_interrupt_received);
+	} else {
+		ring_logerr("Can't find rx_cq for the rx_comp_event_channel_fd (= %d)", cq_channel_fd);
 	}
-	else {
-		RING_TRY_LOCK_RUN_AND_UPDATE_RET(m_lock_ring_tx, m_p_cq_mgr_tx->wait_for_notification_and_process_element(p_cq_poll_sn, pv_fd_ready_array));
-	}
+
 	return ret;
 }
 
@@ -1295,18 +1226,13 @@ bool ring_simple::reclaim_recv_buffers(descq_t *rx_reuse)
 	return ret;
 }
 
-bool ring_simple::reclaim_recv_buffers_no_lock(descq_t *rx_reuse)
-{
-	return m_p_cq_mgr_rx->reclaim_recv_buffers_no_lock(rx_reuse);
-}
-
 bool ring_simple::reclaim_recv_buffers_no_lock(mem_buf_desc_t* rx_reuse_lst)
 {
 	return m_p_cq_mgr_rx->reclaim_recv_buffers(rx_reuse_lst);
 }
 
-#ifdef DEFINED_VMAPOLL
-int ring_simple::vma_poll_reclaim_single_recv_buffer(mem_buf_desc_t* rx_reuse_buff)
+#ifdef DEFINED_SOCKETXTREME
+int ring_simple::socketxtreme_reclaim_single_recv_buffer(mem_buf_desc_t* rx_reuse_buff)
 {
 	int ret_val = 0;
 
@@ -1334,18 +1260,18 @@ int ring_simple::vma_poll_reclaim_single_recv_buffer(mem_buf_desc_t* rx_reuse_bu
 	return ret_val;
 }
 
-void ring_simple::vma_poll_reclaim_recv_buffers(mem_buf_desc_t* rx_reuse_lst)
+void ring_simple::socketxtreme_reclaim_recv_buffers(mem_buf_desc_t* rx_reuse_lst)
 {
 	m_lock_ring_rx.lock();
 	if (m_rx_buffs_rdy_for_free_head) {
-		m_p_cq_mgr_rx->vma_poll_reclaim_recv_buffer_helper(m_rx_buffs_rdy_for_free_head);
+		m_p_cq_mgr_rx->socketxtreme_reclaim_recv_buffer_helper(m_rx_buffs_rdy_for_free_head);
 		m_rx_buffs_rdy_for_free_head = m_rx_buffs_rdy_for_free_tail = NULL;
 	}
 
-	m_p_cq_mgr_rx->vma_poll_reclaim_recv_buffer_helper(rx_reuse_lst);
+	m_p_cq_mgr_rx->socketxtreme_reclaim_recv_buffer_helper(rx_reuse_lst);
 	m_lock_ring_rx.unlock();
 }
-#endif // DEFINED_VMAPOLL
+#endif // DEFINED_SOCKETXTREME
 
 void ring_simple::mem_buf_desc_completion_with_error_rx(mem_buf_desc_t* p_rx_wc_buf_desc)
 {
@@ -1381,15 +1307,10 @@ void ring_simple::mem_buf_desc_return_single_to_owner_tx(mem_buf_desc_t* p_mem_b
 	RING_LOCK_AND_RUN(m_lock_ring_tx, put_tx_single_buffer(p_mem_buf_desc));
 }
 
-int ring_simple::drain_and_proccess(cq_type_t cq_type)
+int ring_simple::drain_and_proccess()
 {
 	int ret = 0;
-	if (likely(CQT_RX == cq_type)) {
-		RING_TRY_LOCK_RUN_AND_UPDATE_RET(m_lock_ring_rx, m_p_cq_mgr_rx->drain_and_proccess());
-	}
-	else {
-		RING_TRY_LOCK_RUN_AND_UPDATE_RET(m_lock_ring_tx, m_p_cq_mgr_tx->drain_and_proccess());
-	}
+	RING_TRY_LOCK_RUN_AND_UPDATE_RET(m_lock_ring_rx, m_p_cq_mgr_rx->drain_and_proccess());
 	return ret;
 }
 
@@ -1562,59 +1483,68 @@ bool ring_simple::get_hw_dummy_send_support(ring_user_id_t id, vma_ibv_send_wr* 
 void ring_simple::send_ring_buffer(ring_user_id_t id, vma_ibv_send_wr* p_send_wqe, vma_wr_tx_packet_attr attr)
 {
 	NOT_IN_USE(id);
+
+#ifdef DEFINED_SW_CSUM
+	{
+#else
+	if (attr & VMA_TX_SW_CSUM) {
+#endif
+		compute_tx_checksum((mem_buf_desc_t*)(p_send_wqe->wr_id), attr & VMA_TX_PACKET_L3_CSUM, attr & VMA_TX_PACKET_L4_CSUM);
+		attr = (vma_wr_tx_packet_attr) (attr & ~(VMA_TX_PACKET_L3_CSUM | VMA_TX_PACKET_L4_CSUM));
+	}
+
 	auto_unlocker lock(m_lock_ring_tx);
 	p_send_wqe->sg_list[0].lkey = m_tx_lkey;	// The ring keeps track of the current device lkey (In case of bonding event...)
 	int ret = send_buffer(p_send_wqe, attr);
 	send_status_handler(ret, p_send_wqe);
 }
 
-void ring_simple::send_lwip_buffer(ring_user_id_t id, vma_ibv_send_wr* p_send_wqe, bool b_block)
+void ring_simple::send_lwip_buffer(ring_user_id_t id, vma_ibv_send_wr* p_send_wqe, vma_wr_tx_packet_attr attr)
 {
 	NOT_IN_USE(id);
+
+#ifdef DEFINED_SW_CSUM
+	compute_tx_checksum((mem_buf_desc_t*)(p_send_wqe->wr_id), attr & VMA_TX_PACKET_L3_CSUM, attr & VMA_TX_PACKET_L4_CSUM);
+	attr = (vma_wr_tx_packet_attr) (attr & ~(VMA_TX_PACKET_L3_CSUM | VMA_TX_PACKET_L4_CSUM));
+#endif
+
 	auto_unlocker lock(m_lock_ring_tx);
 	p_send_wqe->sg_list[0].lkey = m_tx_lkey; // The ring keeps track of the current device lkey (In case of bonding event...)
 	mem_buf_desc_t* p_mem_buf_desc = (mem_buf_desc_t*)(p_send_wqe->wr_id);
 	p_mem_buf_desc->lwip_pbuf.pbuf.ref++;
-	vma_wr_tx_packet_attr attr = (vma_wr_tx_packet_attr)((b_block*VMA_TX_PACKET_BLOCK)|VMA_TX_PACKET_L3_CSUM|VMA_TX_PACKET_L4_CSUM);
 	int ret = send_buffer(p_send_wqe, attr);
 	send_status_handler(ret, p_send_wqe);
 }
 
-void ring_simple::flow_udp_uc_del_all()
+void ring_simple::flow_udp_del_all()
 {
-	flow_spec_udp_uc_key_t map_key_udp_uc;
-	flow_spec_udp_uc_map_t::iterator itr_udp_uc;
+	flow_spec_udp_key_t map_key_udp;
+	flow_spec_udp_map_t::iterator itr_udp;
 
-	itr_udp_uc = m_flow_udp_uc_map.begin();
-	while (itr_udp_uc != m_flow_udp_uc_map.end()) {
-		rfs *p_rfs = itr_udp_uc->second;
-		map_key_udp_uc = itr_udp_uc->first;
+	itr_udp = m_flow_udp_uc_map.begin();
+	while (itr_udp != m_flow_udp_uc_map.end()) {
+		rfs *p_rfs = itr_udp->second;
+		map_key_udp = itr_udp->first;
 		if (p_rfs) {
 			delete p_rfs;
 		}
-		if (!(m_flow_udp_uc_map.del(map_key_udp_uc))) {
+		if (!(m_flow_udp_uc_map.del(map_key_udp))) {
 			ring_logdbg("Could not find rfs object to delete in ring udp uc hash map!");
 		}
-		itr_udp_uc =  m_flow_udp_uc_map.begin();
+		itr_udp =  m_flow_udp_uc_map.begin();
 	}
-}
 
-void ring_simple::flow_udp_mc_del_all()
-{
-	flow_spec_udp_mc_key_t map_key_udp_mc;
-	flow_spec_udp_mc_map_t::iterator itr_udp_mc;
-
-	itr_udp_mc = m_flow_udp_mc_map.begin();
-	while (itr_udp_mc != m_flow_udp_mc_map.end()) {
-		rfs *p_rfs = itr_udp_mc->second;
-		map_key_udp_mc = itr_udp_mc->first;
+	itr_udp = m_flow_udp_mc_map.begin();
+	while (itr_udp != m_flow_udp_mc_map.end()) {
+		rfs *p_rfs = itr_udp->second;
+		map_key_udp = itr_udp->first;
 		if (p_rfs) {
 			delete p_rfs;
 		}
-		if (!(m_flow_udp_mc_map.del(map_key_udp_mc))) {
+		if (!(m_flow_udp_mc_map.del(map_key_udp))) {
 			ring_logdbg("Could not find rfs object to delete in ring udp mc hash map!");
 		}
-		itr_udp_mc = m_flow_udp_mc_map.begin();
+		itr_udp =  m_flow_udp_mc_map.begin();
 	}
 }
 
@@ -1733,26 +1663,21 @@ bool ring_simple::is_available_qp_wr(bool b_block)
 //call under m_lock_ring_tx lock
 bool ring_simple::request_more_tx_buffers(uint32_t count)
 {
-	mem_buf_desc_t *p_temp_desc_list, *p_temp_buff;
-
 	ring_logfuncall("Allocating additional %d buffers for internal use", count);
 
-	//todo have get_buffers_thread_safe with given m_tx_pool as parameter, to save assembling and disassembling of buffer chain
-	p_temp_desc_list = g_buffer_pool_tx->get_buffers_thread_safe(count, m_tx_lkey);
-	if (p_temp_desc_list == NULL) {
+	bool res = g_buffer_pool_tx->get_buffers_thread_safe(m_tx_pool, this, count, m_tx_lkey);
+	if (!res) {
 		ring_logfunc("Out of mem_buf_desc from TX free pool for internal object pool");
 		return false;
 	}
 
-	while (p_temp_desc_list) {
-		p_temp_buff = p_temp_desc_list;
-		p_temp_desc_list = p_temp_buff->p_next_desc;
-		p_temp_buff->p_desc_owner = this;
-		p_temp_buff->p_next_desc = NULL;
-		m_tx_pool.push_back(p_temp_buff);
-	}
-
 	return true;
+}
+
+void ring_simple::init_tx_buffers(uint32_t count)
+{
+	request_more_tx_buffers(count);
+	m_tx_num_bufs = m_tx_pool.size();
 }
 
 //call under m_lock_ring_tx lock
@@ -1785,6 +1710,15 @@ mem_buf_desc_t* ring_simple::get_tx_buffers(uint32_t n_num_mem_bufs)
 	return head;
 }
 
+void ring_simple::return_to_global_pool()
+{
+	if (unlikely(m_tx_pool.size() > (m_tx_num_bufs / 2) &&  m_tx_num_bufs >= RING_TX_BUFS_COMPENSATE * 2)) {
+		int return_bufs = m_tx_pool.size() / 2;
+		m_tx_num_bufs -= return_bufs;
+		g_buffer_pool_tx->put_buffers_thread_safe(&m_tx_pool, return_bufs);
+	}
+}
+
 //call under m_lock_ring_tx lock
 int ring_simple::put_tx_buffers(mem_buf_desc_t* buff_list)
 {
@@ -1814,11 +1748,7 @@ int ring_simple::put_tx_buffers(mem_buf_desc_t* buff_list)
 	}
 	ring_logfunc("buf_list: %p count: %d freed: %d\n", buff_list, count, freed);
 
-	if (unlikely(m_tx_pool.size() > (m_tx_num_bufs / 2) &&  m_tx_num_bufs >= RING_TX_BUFS_COMPENSATE * 2)) {
-		int return_to_global_pool = m_tx_pool.size() / 2;
-		m_tx_num_bufs -= return_to_global_pool;
-		g_buffer_pool_tx->put_buffers_thread_safe(&m_tx_pool, return_to_global_pool);
-	}
+	return_to_global_pool();
 
 	return count;
 }
@@ -1847,11 +1777,7 @@ int ring_simple::put_tx_single_buffer(mem_buf_desc_t* buff)
 		}
 	}
 
-	if (unlikely(m_tx_pool.size() > (m_tx_num_bufs / 2) &&  m_tx_num_bufs >= RING_TX_BUFS_COMPENSATE * 2)) {
-		int return_to_global_pool = m_tx_pool.size() / 2;
-		m_tx_num_bufs -= return_to_global_pool;
-		g_buffer_pool_tx->put_buffers_thread_safe(&m_tx_pool, return_to_global_pool);
-	}
+	return_to_global_pool();
 
 	return count;
 }
@@ -1869,8 +1795,8 @@ void ring_simple::modify_cq_moderation(uint32_t period, uint32_t count)
 	m_cq_moderation_info.period = period;
 	m_cq_moderation_info.count = count;
 
-	m_ring_stat_static.n_rx_cq_moderation_period = period;
-	m_ring_stat_static.n_rx_cq_moderation_count = count;
+	m_p_ring_stat->simple.n_rx_cq_moderation_period = period;
+	m_p_ring_stat->simple.n_rx_cq_moderation_count = count;
 
 	//todo all cqs or just active? what about HA?
 	m_p_cq_mgr_rx->modify_cq_moderation(period, count);
@@ -1959,40 +1885,43 @@ bool ring_simple::is_up() {
 	return m_up;
 }
 
-void ring_simple::inc_tx_retransmissions(ring_user_id_t id) {
-	NOT_IN_USE(id);
-	m_p_ring_stat->n_tx_retransmits++;
-}
-
-bool ring_simple::is_active_member(mem_buf_desc_owner* rng, ring_user_id_t id)
+int ring_simple::modify_ratelimit(struct vma_rate_limit_t &rate_limit)
 {
-	NOT_IN_USE(id);
-	return (this == rng);
-}
+	uint32_t rl_changes = m_p_qp_mgr->is_ratelimit_change(rate_limit);
 
-bool ring_simple::is_member(mem_buf_desc_owner* rng) {
-	return (this == rng);
-}
+	if (m_up && rl_changes)
+		return m_p_qp_mgr->modify_qp_ratelimit(rate_limit, rl_changes);
 
-ring_user_id_t ring_simple::generate_id() {
 	return 0;
 }
 
-ring_user_id_t ring_simple::generate_id(const address_t src_mac, const address_t dst_mac, uint16_t eth_proto, uint16_t encap_proto, uint32_t src_ip, uint32_t dst_ip, uint16_t src_port, uint16_t dst_port) {
-	NOT_IN_USE(src_mac);
-	NOT_IN_USE(dst_mac);
-	NOT_IN_USE(eth_proto);
-	NOT_IN_USE(encap_proto);
-	NOT_IN_USE(src_ip);
-	NOT_IN_USE(dst_ip);
-	NOT_IN_USE(src_port);
-	NOT_IN_USE(dst_port);
-	return 0;
-}
-
-int ring_simple::modify_ratelimit(const uint32_t ratelimit_kbps) {
-	if (m_p_qp_mgr->set_qp_ratelimit(ratelimit_kbps) && m_up) {
-		return m_p_qp_mgr->modify_qp_ratelimit(ratelimit_kbps);
+int ring_simple::get_ring_descriptors(vma_mlx_hw_device_data &d)
+{
+	d.dev_data.vendor_id = m_p_ib_ctx->get_ibv_device_attr()->vendor_id;
+	d.dev_data.vendor_part_id = m_p_ib_ctx->get_ibv_device_attr()->vendor_part_id;
+	if (vma_is_packet_pacing_supported(m_p_ib_ctx->get_ibv_device_attr())) {
+		d.dev_data.device_cap |= VMA_HW_PP_EN;
 	}
+	if (vma_is_umr_supported(m_p_ib_ctx->get_ibv_device_attr())) {
+		d.dev_data.device_cap |= VMA_HW_UMR_EN;
+	}
+	if (vma_is_mp_rq_supported(m_p_ib_ctx->get_ibv_device_attr())) {
+		d.dev_data.device_cap |= VMA_HW_MP_RQ_EN;
+	}
+	d.valid_mask = DATA_VALID_DEV;
+
+	ring_logdbg("found device with Vendor-ID %u, ID %u, Device cap %u", d.dev_data.vendor_part_id,
+		    d.dev_data.vendor_id, d.dev_data.device_cap);
+	if (!m_p_qp_mgr->fill_hw_descriptors(d)) {
+		return -1;
+	}
+	if (m_p_cq_mgr_rx->fill_cq_hw_descriptors(d.rq_data.wq_data.cq_data)) {
+		d.valid_mask |= DATA_VALID_RQ;
+	}
+
+	if (m_p_cq_mgr_tx->fill_cq_hw_descriptors(d.sq_data.wq_data.cq_data)) {
+		d.valid_mask |= DATA_VALID_SQ;
+	}
+	VALGRIND_MAKE_MEM_DEFINED(&d, sizeof(d));
 	return 0;
 }

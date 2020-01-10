@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2001-2017 Mellanox Technologies, Ltd. All rights reserved.
+ * Copyright (c) 2001-2018 Mellanox Technologies, Ltd. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -38,7 +38,7 @@
 
 #include "vma/util/vtypes.h"
 #include "vma/util/verbs_extra.h"
-#include "vma/dev/ring.h"
+#include "vma/dev/ring_simple.h"
 #include "vma/proto/mem_buf_desc.h"
 #include "vma/proto/flow_tuple.h"
 
@@ -55,8 +55,6 @@
 
 class qp_mgr;
 class pkt_rcvr_sink;
-class ring_simple;
-
 
 /* ETHERNET
  */
@@ -205,9 +203,9 @@ typedef std::vector<attach_flow_data_t*> attach_flow_data_vector_t;
 class rfs_rule_filter
 {
 public:
-	rfs_rule_filter(rule_filter_map_t& map, uint32_t key, flow_tuple& flow_tuple) : m_map(map), m_key(key), m_flow_tuple(flow_tuple) {}
+	rfs_rule_filter(rule_filter_map_t& map, uint64_t key, flow_tuple& flow_tuple) : m_map(map), m_key(key), m_flow_tuple(flow_tuple) {}
 	rule_filter_map_t& m_map;
-	uint32_t m_key;
+	uint64_t m_key;
 	flow_tuple m_flow_tuple;
 };
 
@@ -223,7 +221,7 @@ public:
 class rfs
 {
 public:
-	rfs(flow_tuple *flow_spec_5t, ring_simple *p_ring,
+	rfs(flow_tuple *flow_spec_5t, ring_slave *p_ring,
 	    rfs_rule_filter* rule_filter = NULL, uint32_t flow_tag_id = 0);
 	virtual ~rfs();
 
@@ -243,7 +241,7 @@ public:
 
 protected:
 	flow_tuple		m_flow_tuple;
-	ring_simple*		m_p_ring;
+	ring_slave*		m_p_ring;
 	rfs_rule_filter*	m_p_rule_filter;
 	attach_flow_data_vector_t m_attach_flow_data_vector;
 	pkt_rcvr_sink**		m_sinks_list;

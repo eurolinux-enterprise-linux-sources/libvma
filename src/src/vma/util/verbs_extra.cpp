@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2001-2017 Mellanox Technologies, Ltd. All rights reserved.
+ * Copyright (c) 2001-2018 Mellanox Technologies, Ltd. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -35,6 +35,7 @@
 #include <vlogger/vlogger.h>
 
 #include "verbs_extra.h"
+#include "vma_extra.h"
 #include "valgrind.h"
 
 #undef  MODULE_NAME
@@ -143,7 +144,7 @@ int priv_ibv_modify_qp_to_err(struct ibv_qp *qp)
 	memset(&qp_attr, 0, sizeof(qp_attr));
 	qp_attr.qp_state = IBV_QPS_ERR;
 	BULLSEYE_EXCLUDE_BLOCK_START
-	IF_VERBS_FAILURE(vma_ibv_modify_qp(qp, &qp_attr, IBV_QP_STATE)) {
+	IF_VERBS_FAILURE_EX(vma_ibv_modify_qp(qp, &qp_attr, IBV_QP_STATE), EIO) {
 		return -1;
 	} ENDIF_VERBS_FAILURE;
 	BULLSEYE_EXCLUDE_BLOCK_END
@@ -318,39 +319,57 @@ int priv_ibv_query_flow_tag_supported(struct ibv_qp *qp, uint8_t port_num)
 
 int vma_rdma_lib_reset() {
 #ifdef HAVE_RDMA_LIB_RESET
-	vlog_printf(VLOG_DEBUG, "rdma_lib_reset called");
+	vlog_printf(VLOG_DEBUG, "rdma_lib_reset called\n");
 	return rdma_lib_reset();
 #else
-	vlog_printf(VLOG_DEBUG, "rdma_lib_reset doesn't exist returning 0");
+	vlog_printf(VLOG_DEBUG, "rdma_lib_reset doesn't exist returning 0\n");
 	return 0;
 #endif
 }
 
 // be advised that this method will change packet pacing value and also change state to RTS
-int priv_ibv_modify_qp_ratelimit(struct ibv_qp *qp, uint32_t ratelimit_kbps )
+int priv_ibv_modify_qp_ratelimit(struct ibv_qp *qp, struct vma_rate_limit_t &rate_limit, uint32_t rl_changes)
 {
 #ifdef DEFINED_IBV_EXP_QP_RATE_LIMIT
 	vma_ibv_qp_attr qp_attr;
+	uint64_t exp_attr_mask = IBV_QP_STATE;
 
 	if (priv_ibv_query_qp_state(qp) != IBV_QPS_RTS) {
-		vlog_printf(VLOG_DEBUG, "failed querying QP");
+		vlog_printf(VLOG_DEBUG, "failed querying QP\n");
 		return -1;
 	}
 	memset(&qp_attr, 0, sizeof(qp_attr));
 	qp_attr.qp_state = IBV_QPS_RTS;
-	qp_attr.rate_limit = ratelimit_kbps;
+
+	if (rate_limit.rate && (rl_changes & RL_RATE)) {
+		qp_attr.rate_limit = rate_limit.rate;
+		exp_attr_mask |= IBV_EXP_QP_RATE_LIMIT;
+	}
+#ifdef DEFINED_IBV_EXP_QP_SUPPORT_BURST
+	if (rate_limit.max_burst_sz && rate_limit.typical_pkt_sz && (rl_changes & (RL_BURST_SIZE | RL_PKT_SIZE))) {
+		qp_attr.burst_info.max_burst_sz = rate_limit.max_burst_sz;
+		qp_attr.burst_info.typical_pkt_sz = rate_limit.typical_pkt_sz;
+		qp_attr.comp_mask |= IBV_EXP_QP_ATTR_BURST_INFO;
+	}
+#endif
 	BULLSEYE_EXCLUDE_BLOCK_START
-	IF_VERBS_FAILURE(vma_ibv_modify_qp(qp, &qp_attr, IBV_QP_STATE | IBV_EXP_QP_RATE_LIMIT)) {
-		vlog_printf(VLOG_WARNING, "failed setting rate limit");
+	IF_VERBS_FAILURE(vma_ibv_modify_qp(qp, &qp_attr, exp_attr_mask)) {
+		vlog_printf(VLOG_WARNING, "failed setting rate limit\n");
 		return -2;
 	} ENDIF_VERBS_FAILURE;
 	BULLSEYE_EXCLUDE_BLOCK_END
-	vlog_printf(VLOG_DEBUG, "qp was set to rate limit %d", ratelimit_kbps);
+#ifdef DEFINED_IBV_EXP_QP_SUPPORT_BURST
+	vlog_printf(VLOG_DEBUG, "qp was set to rate limit %d, burst size %d, packet size %d\n",
+			rate_limit.rate, rate_limit.max_burst_sz, rate_limit.typical_pkt_sz);
+#else
+	vlog_printf(VLOG_DEBUG, "qp was set to rate limit %d\n", rate_limit.rate);
+#endif
 	return 0;
 #else
-	vlog_printf(VLOG_DEBUG, "rate limit not supported");
+	vlog_printf(VLOG_DEBUG, "rate limit not supported\n");
 	NOT_IN_USE(qp);
-	NOT_IN_USE(ratelimit_kbps);
+	NOT_IN_USE(rate_limit);
+	NOT_IN_USE(rl_changes);
 	return 0;
 #endif
 }

@@ -1,3 +1,346 @@
+Version 8.6.10-0:
+Date + Time 2018-06-27
+=============================================================
+Fixed:
+        - RM #1387232 Fix issue with default path mismatch
+
+Version 8.6.9-0:
+Date + Time 2018-06-27
+=============================================================
+Added:
+        - RM #1436435 Remove duplicate Hugepages warning
+        - RM #1433896 Enhance ib_ctx handler debug information
+Fixed:
+        - RM #1435682 Fix incorrect TCP seqno after zero-wnd-probe
+        - RM #1432927 Fix traffic stop after second fail over
+
+Version 8.6.8-0:
+Date + Time 2018-06-21
+=============================================================
+Added:
+        - RM #1431683 Add retransmissions counter to ring_tap
+        - RM #1178926 Add HW RX checksum support for SocketXtreme
+        - RM #1431297 Remove VMA_RX_SW_CSUM control
+        - RM #1284069 Set MLX5_DEVICE_FATAL_CLEANUP env for mlx5 device
+        - RM #1387232 Add vmad configurable notify dir
+        - RM #1428737 Add pending to remove list to daemon
+        - RM #1284069 Improve device removing in plugout case
+        - RM #1392361 Improve daemon logging verbosity
+        - RM #1424159 Modify TC rule to offload only non-frag packets
+        - RM #1424157 Modify daemon flow structure
+        - RM #1423874 Offload UDP traffic to TAP
+        - RM #1423819 Enable Blue Flame send for NetVSC interfaces
+        - RM #1420228 Modify mem_buf_desc_t constructor
+        - RM #1365423 Use mmap to allocate huge pages
+        - RM #1413354 Add Ring tap enhancements
+
+Fixed:
+        - RM #1431269 Fix ring_bond_netvsc with more than 2 resources error
+        - RM #1365423 Fix fallback memory allocation logic
+        - RM #1418682 Fix TCP on ring tap from multiple processes on the same IP
+        - RM #1424602 Fix crash while valgrind is loaded without SRIOV
+        - RM #1405641 Fix crash when m_net_device_map_index is empty
+        - RM #1403118 Fix incorrect release memory of Tx buffers
+        - RM #1417243 Fix gcc8 build warnings
+        - RM #1418379 Fix incorrect handling of IF_DOWN event
+        - RM #1417077 Fix TCP bind to device same interface failure
+
+Version 8.6.7-0:
+Date + Time 2018-06-06
+=============================================================
+Added:
+        - RM #1383463 Report warning if there is no connection with daemon
+        - RM #1405041 Improve hypervisor type detection
+        - RM #1348872 Remove bad pointer check when getting memory info
+        - RM #1413587 Modify warning while log_num_mgm_entry_size != -1
+        - RM #1402512 Daemon is able to detect VMA zombie process
+        - RM #1403631 Add support master slave for qp direct
+
+Fixed:
+        - RM #1416053 Fix valgrind invalid read warning
+        - RM #1403304 Fix duplicate UDP Tx packets w/o SRIOV
+        - RM #1404279 Fix TCP sockets of secondary IPs are not offloaded
+        - RM #1405898 Fix get_net_device_val search method
+        - RM #1405113 Fix VMA crash if qp creation failed
+        - RM #1405111 When using tx prm verify cq_size is power of 2
+
+Version 8.6.6-0:
+Date + Time 2018-05-29
+=============================================================
+Added:
+        - RM #1284069 Calculate csum at the ring level
+        - RM #1284069 Reclaim not owned buffers on socket close
+        - RM #1284069 Verify ib device before vf creation
+        - RM #1284069 Add plugout counter into statistic
+        - RM #1284069 Add IF_VERBS_FAILURE_EX macro
+        - RM #1284069 Pass if_index to slave_data_t constructor
+        - RM #1284069 Introduce plugin support under Hypervisor
+        - RM #1284069 Introduce register_memory() for buffer_pool
+        - RM #1284069 Improve code readability
+        - RM #1284069 Add ibv_exp_get_device_list usage
+        - RM #1284069 Introduce plugout support under Hypervisor
+        - RM #1284069 Add extra RX buffers reclaim
+        - RM #1284069 Validate memory allocation type for VM
+        - RM #1284069 Suppress error message for update_epfd()
+        - RM #1284069 Optimize m_p_tx_mem_buf_desc_list releasing
+        - RM #1284069 Improve ib_ctx_handler_collection::update_tbl()
+        - RM #1284069 Improve net_device_table_mgr processing
+        - RM #1284069 Introduce update_netvsc_slaves()
+        - RM #1284069 Introduce allocator::deregister_memory()
+        - RM #1284069 Improve ib memory registration
+        - RM #1284069 Change ring::restart() prototype
+
+Fixed:
+        - RM #1284069 Fix issue in UDP checksum calculation
+        - RM #1284069 Fix issue with csum ability detection
+        - RM #1284069 Fix issue in dst_entry::return_buffers_pool()
+        - RM #1398946 Fix issue with incorrect ring_eth_cb creation
+
+Version 8.6.5-0:
+Date + Time 2018-05-24
+=============================================================
+Added:
+        - RM #1284069 Support outcome UDP traffic in ring_tap
+        - RM #1284069 Support outcome TCP traffic in ring_tap
+        - RM #1284069 Store flow:sink pair in ring_bond
+        - RM #1284069 Redirect traffic from tap to netvsc
+        - RM #1284069 Use m_neigh_cma_event_channel in case IB exists only
+        - RM #1284069 Allow memory allocation w/o registering
+        - RM #1284069 Remove m_p_cma_event_channel from fd_collection
+        - RM #1284069 Display message in case there is no IB devices
+        - RM #1284069 Ring tap support rfs creation
+        - RM #1284069 Use ring_slave in rfs classes
+        - RM #1284069 Introduce ring_slave::m_type
+        - RM #1284069 Introduce ring_tap
+        - RM #1338066 Disable flow tag for unicast flows
+        - RM #1382889 Add Tx statistics to ring
+
+Fixed:
+        - RM #1387232 Fix creating write permission files
+
+Version 8.6.4-0:
+Date + Time 2018-05-22
+=============================================================
+Added:
+        - RM #1284069 Update valgrind suppression file
+        - RM #1284069 Add print_val() for ring
+        - RM #1284069 Use if_index only to create any ring
+        - RM #1284069 Add special methods to add/remove slave ring
+        - RM #1284069 Change type of m_bond_rings to vector
+        - RM #1284069 Reduce m_active_rings usage from ring_bond
+        - RM #1284069 Remove active parameter from all ring CTORs
+        - RM #1284069 Pass if_index into ring_eth/ib constructor
+        - RM #1284069 Pass if_index into ring_bond constructor
+        - RM #1284069 Use ifindex in slave_data
+        - RM #1284069 Set MLX4_DEVICE_FATAL_CLEANUP env for mlx4 device
+        - RM #1284069 Set device type in net_device_val()
+        - RM #1284069 Enable RTM_NEWLINK, RTM_DELLINK notification
+        - RM #1284069 Move inc_tx_retransmissions to ring_slave
+        - RM #1284069 Use slave_ring in ring_bond
+        - RM #1284069 Move few methods to ring_slave
+        - RM #1284069 Move statistic to slave ring
+        - RM #1284069 Introduce ring slave
+        - RM #1331580 Remove redundant variables from ring
+        - RM #1331577 Remove dead code from_ring simple
+        - RM #1331574 Move flow spec declarations to ring_simple
+
+Fixed:
+        - RM #1284069 Fix memory leak for ring_bond::m_p_n_rx_channel_fds
+
+Version 8.6.3-0:
+Date + Time 2018-05-14
+=============================================================
+Added:
+        - RM #1284069 Modify get_ib_ctx() to process bonding mode=4
+        - RM #1284069 Update valgrind suppression file
+        - RM #1284069 Add ib_ctx_handle::get_ibname()
+        - RM #1284069 Modify operations with lkey
+        - RM #1284069 Remove rdma cm from vet_device_val()
+        - RM #1284069 Cleanup ib_ctx_handler_collection
+        - RM #1284069 Use Verbs API to create ib devices
+        - RM #1284069 Get ib_ctx_handler using ifname
+
+Fixed:
+        - RM #1284069 Valgrind strtok fix
+        - RM #1284069 Fix issue in deregestering memory in ring_eth_cb
+
+Version 8.6.2-0:
+Date + Time 2018-05-10
+=============================================================
+Added:
+        - RM #1284069 Unify flow_spec_udp
+        - RM #1284069 Improve code readability
+        - RM #1284069 Optimize storage for access net_device_val
+        - RM #1284069 Remove net_device_val::local_addr
+        - RM #1284069 Use netlink during device mapping
+        - RM #1284069 Net device enhancements
+        - RM #1284069 Add m_ip to net_dev_val
+        - RM #1284069 Add set_ip_array()
+        - RM #1284069 Improve net_dev_val verification functions
+        - RM #1284069 Modify net_dev_val parameters assignment
+        - RM #1284069 Modify map_device logic
+
+Version 8.6.1-0:
+Date + Time 2018-05-06
+=============================================================
+Added:
+        - RM #1348872 Add capabiliy mask to device data
+        - RM #1348872 Add support retrieving the memory used by RING_CB
+        - RM #1348872 Add support to get RING_CB HW descriptors
+        - RM #1348872 add external mem support for RING_CB
+        - RM #1376089 Always use at least four WQEs with MP_RQ
+        - RM #1376088 use DUMP_LKEY to strip down network
+        - RM #1182150 Support UDP HW RX timestamp in SocketXtreme (#605)
+        - RM #1353974 Use ib_ctx inside ring to convert CQE TS to timespec (#599)
+        - RM #1332983 Add some debug prints to ring_cb (#595)
+        - RM #1075188 Reduce unnecessary socketxtreme code
+        - RM #1075188 Unify setsockopt/getsockopt
+Fixed:
+        - RM #1375982 Modify libnl3-route-dev error message (#608)
+        - RM #1357010 Fix setsockopt(IP_MULTICAST_IF) with struct mreq (#613)
+        - RM #1354251 Fix statistics for socketXreme income data (#611)
+
+Version 8.6.0-0:
+Date + Time 2018-03-22
+=============================================================
+Added:
+        - RM #issue: 1330652 Use kbps value for setting enhanced rate limit (#591)
+Fixed:
+        - RM #1322084 Fix TCP MSS incompatibility with RFC-793
+        - RM #1262560 Fix zero-window ack probe
+        - RM #1190638 Align lwip timer interval to VMA tcp timer interval
+        - RM #1311399 Remove cq_type parameter from ring functions
+
+Version 8.5.7-0:
+Date + Time 2018-02-19
+=============================================================
+Added:
+        - RM #1284081 Extend gtest with vmad_flow tests
+        - RM #1284081 Extend gtest with vmad_state tests
+        - RM #1284081 Extend gtest with vmad_init tests
+        - RM #1284081 Extend gtest with vmad_hash tests
+        - RM #1284081 Extend gtest with vmad_bitmap tests
+        - RM #1284081 Create gtest/vmad unit
+        - RM #1284081 Extend gtest with mix_list tests
+Fixed:
+        - RM #1308755 Fix no traffic for Alias NetVSC interfaces
+        - RM #1284081 Fix issues found by gtest/vmad_hash
+        - RM #1284081 Fix issues found by gtest/vmad_bitmap
+
+Version 8.5.6-0:
+Date + Time 2018-02-08
+=============================================================
+Added:
+        - RM #1276626 Add support for padded stridingRQ
+Fixed:
+        - RM #1254846 Fix rate limit if no connection established yet
+        - RM #1149532 Fix Deadlock on blocking TCP send
+        - RM #1262610 Changed bucket node choice for 5t flow
+        - RM #1284253 Move dm_context class from util to dev
+        - RM #1172298 Rename jenkins target vmapoll with socketxtreme
+        - RM #1280902 Fix issues in tcp_split_segment function
+
+Version 8.5.5-0:
+Date + Time 2018-02-01
+=============================================================
+Added:
+        - RM #1254846 Align burst control with libibverbs new API
+        - RM #1279684 Modify TAP interface name
+        - RM #1226478 Add valgrind detection macro to ring_eth_direct
+        - RM #1279599 Update License date to 2018
+Fixed:
+        - RM #1280126 Inline private function in ring_bond_eth_netvsc
+        - RM #1279340 Fix Ubuntu 17.10 issue in build_deb.sh
+
+Version 8.5.4-0:
+Date + Time 2018-01-28
+=============================================================
+Fixed:
+        - RM #1279344 Fix gcc7 format-truncation warning
+
+Version 8.5.3-0:
+Date + Time 2018-01-27
+=============================================================
+Added:
+        - RM #1262610 Improve handle for 5t rule
+        - RM #1262610 Add free htid detection
+        - RM #1262610 Add VMA_MSG_FLOW processing
+        - RM #1262610 Inform daemon about flows
+        - RM #1272182 Add TAP statistics
+        - RM #1160029 Add ring_bond_eth_netvsc
+        - RM #1160029 Detect NetVSC interfaces
+        - RM #1277704 Cleanup redundant poll_sn occurrences
+        - RM #1277085 Update recommended installation command
+        - RM #1265099 Add get ib_ctx object from interface name
+        - RM #1272179 Arrange Ring statistics
+        - RM #1272183 Clean stats_printer.cpp
+        - RM #1248968 Add support for IP_TOS in setsockopt
+        - RM #1254846 Add support for packet packing burst control
+        - RM #1254784 Add support for pcp setting in setsockopt
+        - RM #1254782 Merge kernel setsockopt from TCP and UDP sockets
+        - RM #1254780 Minor changes in flow_table operators
+        - RM #1264431 Detect device port without rdma_cm
+        - RM #1264919 Improve vma.service unit for inbox
+        - RM #1259552 Optimize global get buffers procedure
+        - RM #1248705 Add extra api to get ring TX fd from socket
+Fixed:
+        - RM #1262610 Resolve issue from static analysis tools
+        - RM #1262610 Workaround for tc u32 thable deletion issue
+        - RM #1262198 Fix epoll_wait returns fd EPOLLOUT event twice
+        - RM #1226478 Fix direct QP and CQ destruction
+        - RM #1263120 Fix compilation if libibverbs doesn't use libnl
+        - RM #1172298 Compile Sockperf for Jenkins against actual libvma
+        - RM #1226478 Fix SQ buf pointer
+
+Version 8.5.2-0:
+Date + Time 2018-01-11
+=============================================================
+Added:
+        - RM #1262144 Print warning when extra api functions are not supported
+        - RM #1256248 Improve debian package build script
+        - RM #1226478 Add direct-ring creation and HW descriptors logic
+        - RM #1226473 Expose network header using new extra_api
+        - RM #1248697 Make profiles unique in the map
+        - RM #1178934 Add new structs for external ring type
+        - RM #1250147 Reorder netlink event registration at startup
+        - RM #1055916 Add support for Pattern Klm in MP-RQ
+        - RM #1151606 Modify valgrind suppression file
+        - RM #1069965 Remove ldconfig from installation
+        - RM #1171143 Add write combining barrier for Blue Flame send
+Fixed:
+        - RM #1256248 Fix systemd mode in debian package
+        - RM #1247358 Fix crash when VMA could not resolve neighbor
+        - RM #1258245 Fix SYN messages are sent to invalid peer
+
+Version 8.5.1-0:
+Date + Time 2017-12-24
+=============================================================
+Added:
+        - RM #1172298 Use --enable-socketxtreme configuration in jenkins
+        - RM #1172298 Add failure message for --enable-vmapoll
+        - RM #1172298 Rename inside tests
+        - RM #1172298 Rename vmapoll internal functions
+        - RM #1172298 Rename vmapoll interfaces
+        - RM #1172298 Use --enable-socketxtreme option
+        - RM #1214066 Add support for route and rule extended table id
+        - RM #1242606 Disable TCP congestion control using VMA parameter
+        - RM #1148076 Remove volatile when handling CQE in MP_RQ
+        - RM #1214451 Add systemd support for daemon
+        - RM #1056823 Improve build configure structure
+        - RM #1214453 Improve selection of filesystem monitor method
+        - RM #1235810 Allow to override build date
+        - RM #1168028 Add support for static ARP entries
+        - RM #1080998 Optimize ib_ctx_handler class
+Fixed:
+        - RM #1248185 Revert some vma_extra sockeXtreme names change
+        - RM #1247022 Fix typo in CQ struct debth->debt
+        - RM #1235797 Not respond to incoming FIN in the listen state
+        - RM #1229443 Not respond to incoming RST in the listen state
+        - RM #1214453 Fix daemon for powerpc
+        - RM #1214453 Fix issue in inotify processing
+        - RM #1222660 Correct warning check for flow steering
+        - RM #1224020 Fix typos in README.txt
+
 Version 8.4.10-0:
 Date + Time 2017-11-23
 =============================================================

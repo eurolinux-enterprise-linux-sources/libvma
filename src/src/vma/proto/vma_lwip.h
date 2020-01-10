@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2001-2017 Mellanox Technologies, Ltd. All rights reserved.
+ * Copyright (c) 2001-2018 Mellanox Technologies, Ltd. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -66,6 +66,7 @@ static inline const char* lwip_cc_algo_str(uint32_t algo)
 {
 	switch (algo) {
 	case CC_MOD_CUBIC:	return "(CUBIC)";
+	case CC_MOD_NONE:	return "(NONE)";
 	case CC_MOD_LWIP:
 	default:		return "(LWIP)";
 	}
@@ -76,8 +77,7 @@ static inline const char* lwip_cc_algo_str(uint32_t algo)
 #endif
 
 
-class vma_lwip : 
-	public lock_spin_recursive, public timer_handler
+class vma_lwip : public timer_handler
 {
 public:
 	vma_lwip();

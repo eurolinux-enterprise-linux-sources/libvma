@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2001-2017 Mellanox Technologies, Ltd. All rights reserved.
+ * Copyright (c) 2001-2018 Mellanox Technologies, Ltd. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -134,8 +134,10 @@ void qp_mgr_eth_mlx5::init_sq()
 			m_qp, m_qp_num, m_sq_wqes, m_sq_wqes_end,  m_tx_num_wr, m_sq_bf_reg, m_sq_bf_buf_size, m_sq_bf_offset);
 }
 
-qp_mgr_eth_mlx5::qp_mgr_eth_mlx5(const ring_simple* p_ring, const ib_ctx_handler* p_context, const uint8_t port_num,
-		struct ibv_comp_channel* p_rx_comp_event_channel, const uint32_t tx_num_wr, const uint16_t vlan):
+qp_mgr_eth_mlx5::qp_mgr_eth_mlx5(const ring_simple* p_ring,
+		const ib_ctx_handler* p_context, const uint8_t port_num,
+		struct ibv_comp_channel* p_rx_comp_event_channel,
+		const uint32_t tx_num_wr, const uint16_t vlan, bool call_configure):
 	qp_mgr_eth(p_ring, p_context, port_num, p_rx_comp_event_channel, tx_num_wr, vlan, false)
 	,m_hw_qp(NULL)
 	,m_sq_wqe_idx_to_wrid(NULL)
@@ -151,7 +153,7 @@ qp_mgr_eth_mlx5::qp_mgr_eth_mlx5(const ring_simple* p_ring, const ib_ctx_handler
 	,m_sq_wqe_counter(0)
 	,m_dm_enabled(0)
 {
-	if(configure(p_rx_comp_event_channel)) {
+	if (call_configure && configure(p_rx_comp_event_channel)) {
 		throw_vma_exception("failed creating qp_mgr_eth");
 	}
 
@@ -163,12 +165,12 @@ void qp_mgr_eth_mlx5::up()
 	init_sq();
 	qp_mgr::up();
 
-	m_dm_enabled = m_dm_context.dm_allocate_resources(m_p_ib_ctx_handler, m_p_ring->m_p_ring_stat);
+	m_dm_enabled = m_dm_mgr.allocate_resources(m_p_ib_ctx_handler, m_p_ring->m_p_ring_stat);
 }
 
 void qp_mgr_eth_mlx5::down()
 {
-	m_dm_context.dm_release_resources();
+	m_dm_mgr.release_resources();
 
 	qp_mgr::down();
 }
@@ -202,7 +204,7 @@ cq_mgr* qp_mgr_eth_mlx5::init_rx_cq_mgr(struct ibv_comp_channel* p_rx_comp_event
 		return NULL;
 	}
 
-#ifdef DEFINED_VMAPOLL
+#ifdef DEFINED_SOCKETXTREME
 	return new cq_mgr(m_p_ring, m_p_ib_ctx_handler, m_rx_num_wr, p_rx_comp_event_channel, true);
 #else
 	return new cq_mgr_mlx5(m_p_ring, m_p_ib_ctx_handler, m_rx_num_wr, p_rx_comp_event_channel, true);
@@ -211,6 +213,7 @@ cq_mgr* qp_mgr_eth_mlx5::init_rx_cq_mgr(struct ibv_comp_channel* p_rx_comp_event
 
 cq_mgr* qp_mgr_eth_mlx5::init_tx_cq_mgr()
 {
+	m_tx_num_wr = align32pow2(m_tx_num_wr);
 	return new cq_mgr_mlx5(m_p_ring, m_p_ib_ctx_handler, m_tx_num_wr, m_p_ring->get_tx_comp_event_channel(), false);
 }
 
@@ -256,6 +259,12 @@ inline void qp_mgr_eth_mlx5::send_by_bf(uint64_t* addr, int num_wqebb)
 
 	copy_bf((uint64_t*)((uint8_t*)m_sq_bf_reg + m_sq_bf_offset), addr, num_wqebb);
 	dbg_dump_wqe((uint32_t*)addr, num_wqebb*WQEBB);
+
+	/* Use wc_wmb() to ensure write combining buffers are flushed out
+	 * of the running CPU.
+	 * sfence instruction affects only the WC buffers of the CPU that executes it
+	 */
+	wc_wmb();
 	m_sq_bf_offset ^= m_sq_bf_buf_size;
 }
 
@@ -271,6 +280,12 @@ inline void qp_mgr_eth_mlx5::send_by_bf_wrap_up(uint64_t* bottom_addr, int num_w
 	wc_wmb();
 	// Copying two times for wrap-up, first at the end of SQ and second from the start
 	copy_bf2((uint64_t*)((uint8_t*)m_sq_bf_reg+m_sq_bf_offset), bottom_addr, (uint64_t*)m_sq_wqes, num_wqebb_bottom, num_wqebb_top);
+
+	/* Use wc_wmb() to ensure write combining buffers are flushed out
+	 * of the running CPU.
+	 * sfence instruction affects only the WC buffers of the CPU that executes it
+	 */
+	wc_wmb();
 	m_sq_bf_offset ^= m_sq_bf_buf_size;
 }
 
@@ -307,7 +322,7 @@ inline int qp_mgr_eth_mlx5::fill_ptr_segment(sg_array &sga, struct mlx5_wqe_data
 		dp_seg->byte_count = htonl(len);
 
 		// Try to copy data to On Device Memory
-		if (!(m_dm_enabled && m_dm_context.dm_copy_data(dp_seg, data_addr, data_len, buffer))) {
+		if (!(m_dm_enabled && m_dm_mgr.copy_data(dp_seg, data_addr, data_len, buffer))) {
 			// Use the registered buffer if copying did not succeed
 			dp_seg->lkey = htonl(sga.get_current_lkey());
 			dp_seg->addr = htonll((uint64_t)data_addr);
@@ -349,7 +364,7 @@ inline int qp_mgr_eth_mlx5::fill_wqe(vma_ibv_send_wr *pswr)
 		// Filling inline data segment
 		// size of BlueFlame buffer is 4*WQEBBs, 3*OCTOWORDS of the first
 		// was allocated for control and ethernet segment so we have 3*WQEBB+16-4
-		int rest_space = min((int)(m_sq_wqes_end-cur_seg-4), (3*WQEBB+OCTOWORD-4));
+		int rest_space = std::min((int)(m_sq_wqes_end-cur_seg-4), (3*WQEBB+OCTOWORD-4));
 		// Filling till the end of inline WQE segment or
 		// to end of WQEs
 		if (likely(max_inline_len <= rest_space)) {

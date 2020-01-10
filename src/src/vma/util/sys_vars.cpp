@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2001-2017 Mellanox Technologies, Ltd. All rights reserved.
+ * Copyright (c) 2001-2018 Mellanox Technologies, Ltd. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -385,6 +385,79 @@ exit:
 	return ret;
 }
 
+/*
+ * Intel and AMD CPUs have reserved bit 31 of ECX of CPUID leaf 0x1 as the hypervisor present bit.
+ * This bit allows hypervisors to indicate their presence to the guest operating system.
+ * Hypervisors set this bit and physical CPUs (all existing and future CPUs) set this bit to zero.
+ * Guest operating systems can test bit 31 to detect if they are running inside a virtual machine.
+ */
+bool mce_sys_var::cpuid_hv()
+{
+#if defined(__x86_64__)
+	uint32_t _ecx;
+	__asm__ __volatile__("cpuid" \
+            : "=c"(_ecx) \
+	        : "a"(0x01));
+	usleep(0);
+	return (bool)((_ecx >> 31) & 0x1);
+#else
+	return check_cpuinfo_flag(VIRTUALIZATION_FLAG);
+#endif
+}
+
+/*
+ * Intel and AMD have also reserved CPUID leaves 0x40000000 - 0x400000FF for software use.
+ * Hypervisors can use these leaves to provide an interface to pass information from the
+ * hypervisor to the guest operating system running inside a virtual machine.
+ * The hypervisor bit indicates the presence of a hypervisor and that it is safe to test
+ * these additional software leaves. VMware defines the 0x40000000 leaf as the hypervisor CPUID
+ * information leaf. Code running on a VMware hypervisor can test the CPUID information leaf
+ * for the hypervisor signature. VMware stores the string "VMwareVMware" in
+ * EBX, ECX, EDX of CPUID leaf 0x40000000.
+ */
+const char* mce_sys_var::cpuid_hv_vendor()
+{
+	static __thread char vendor[13] = {0};
+
+    if (!cpuid_hv()) {
+    	return NULL;
+    }
+#if defined(__x86_64__)
+	uint32_t _ebx = 0, _ecx = 0, _edx = 0;
+	__asm__ __volatile__("cpuid" \
+            : "=b"(_ebx), \
+            "=c"(_ecx), \
+            "=d"(_edx) \
+            : "a"(0x40000000));
+	sprintf(vendor,     "%c%c%c%c", _ebx, (_ebx >> 8), (_ebx >> 16), (_ebx >> 24));
+	sprintf(vendor + 4, "%c%c%c%c", _ecx, (_ecx >> 8), (_ecx >> 16), (_ecx >> 24));
+	sprintf(vendor + 8, "%c%c%c%c", _edx, (_edx >> 8), (_edx >> 16), (_edx >> 24));
+	vendor[12] = 0x00;
+#endif
+	return vendor;
+}
+
+void mce_sys_var::read_hv()
+{
+	const char *hyper_vendor_id = NULL;
+
+	hypervisor = mce_sys_var::HYPER_NONE;
+	hyper_vendor_id = cpuid_hv_vendor();
+	if (hyper_vendor_id) {
+		if (!strncmp("XenVMMXenVMM", hyper_vendor_id, 12)) {
+			hypervisor = HYPER_XEN;
+		} else if (!strncmp("KVMKVMKVM", hyper_vendor_id, 9)) {
+			hypervisor = HYPER_KVM;
+		} else if (!strncmp("Microsoft Hv", hyper_vendor_id, 12)) {
+			hypervisor = HYPER_MSHV;
+		} else if (!strncmp("VMwareVMware", hyper_vendor_id, 12)) {
+			hypervisor = HYPER_VMWARE;
+		} else {
+			hypervisor = HYPER_NONE;
+		}
+	}
+}
+
 void mce_sys_var::get_env_params()
 {
 	int c = 0, len =0;
@@ -426,12 +499,14 @@ void mce_sys_var::get_env_params()
 	app_name[len-1] = '\0';
 	fclose(fp);
 
-	bzero(vma_time_measure_filename, sizeof(vma_time_measure_filename));
+	memset(vma_time_measure_filename, 0, sizeof(vma_time_measure_filename));
 	strcpy(vma_time_measure_filename, MCE_DEFAULT_TIME_MEASURE_DUMP_FILE);
-	bzero(log_filename, sizeof(log_filename));
-	bzero(stats_filename, sizeof(stats_filename));
-	bzero(stats_shmem_dirname, sizeof(stats_shmem_dirname));
+	memset(log_filename, 0, sizeof(log_filename));
+	memset(stats_filename, 0, sizeof(stats_filename));
+	memset(stats_shmem_dirname, 0, sizeof(stats_shmem_dirname));
+	memset(vmad_notify_dir, 0, sizeof(vmad_notify_dir));
 	strcpy(stats_filename, MCE_DEFAULT_STATS_FILE);
+	strcpy(vmad_notify_dir, MCE_DEFAULT_VMAD_FOLDER);
 	strcpy(stats_shmem_dirname, MCE_DEFAULT_STATS_SHMEM_DIR);
 	strcpy(conf_filename, MCE_DEFAULT_CONF_FILE);
 	strcpy(app_id, MCE_DEFAULT_APP_ID);
@@ -473,7 +548,6 @@ void mce_sys_var::get_env_params()
 	rx_poll_num_init        = MCE_DEFAULT_RX_NUM_POLLS_INIT;
 	rx_udp_poll_os_ratio    = MCE_DEFAULT_RX_UDP_POLL_OS_RATIO;
 	hw_ts_conversion_mode   = MCE_DEFAULT_HW_TS_CONVERSION_MODE;
-	rx_sw_csum         	= MCE_DEFUALT_RX_SW_CSUM;
 	rx_poll_yield_loops     = MCE_DEFAULT_RX_POLL_YIELD;
 	select_handle_cpu_usage_stats   = MCE_DEFAULT_SELECT_CPU_USAGE_STATS;
 	rx_ready_byte_min_limit = MCE_DEFAULT_RX_BYTE_MIN_LIMIT;
@@ -545,6 +619,8 @@ void mce_sys_var::get_env_params()
 #ifdef VMA_TIME_MEASURE
 	vma_time_measure_num_samples = MCE_DEFAULT_TIME_MEASURE_NUM_SAMPLES;
 #endif
+
+	read_hv();
 
 	if ((env_ptr = getenv(SYS_VAR_SPEC)) != NULL){
 		mce_spec = (uint32_t)vma_spec::from_str(env_ptr, MCE_SPEC_NONE);
@@ -676,9 +752,7 @@ void mce_sys_var::get_env_params()
 		break;
 	}
 
-	is_hypervisor = check_cpuinfo_flag(VIRTUALIZATION_FLAG);
-
-       if ((env_ptr = getenv(SYS_VAR_SPEC_PARAM1)) != NULL)
+	if ((env_ptr = getenv(SYS_VAR_SPEC_PARAM1)) != NULL)
 		mce_spec_param1 = (uint32_t)atoi(env_ptr);
 
 	if ((env_ptr = getenv(SYS_VAR_SPEC_PARAM2)) != NULL)
@@ -698,6 +772,10 @@ void mce_sys_var::get_env_params()
 
 	if ((env_ptr = getenv(SYS_VAR_CONF_FILENAME)) != NULL){
 		read_env_variable_with_pid(conf_filename, sizeof(conf_filename), env_ptr);
+	}
+
+	if ((env_ptr = getenv(SYS_VAR_VMAD_DIR)) != NULL){
+		read_env_variable_with_pid(vmad_notify_dir, sizeof(vmad_notify_dir), env_ptr);
 	}
 
 	if ((env_ptr = getenv(SYS_VAR_LOG_LEVEL)) != NULL)
@@ -837,10 +915,6 @@ void mce_sys_var::get_env_params()
 			vlog_printf(VLOG_WARNING,"HW TS conversion size out of range [%d] (min=%d, max=%d). using default [%d]\n", hw_ts_conversion_mode, TS_CONVERSION_MODE_DISABLE , TS_CONVERSION_MODE_LAST - 1, MCE_DEFAULT_HW_TS_CONVERSION_MODE);
 			hw_ts_conversion_mode = MCE_DEFAULT_HW_TS_CONVERSION_MODE;
 		}
-	}
-
-	if ((env_ptr = getenv(SYS_VAR_RX_SW_CSUM)) != NULL) {
-		rx_sw_csum = atoi(env_ptr) ? true : false;
 	}
 
 	//The following 2 params were replaced by SYS_VAR_RX_UDP_POLL_OS_RATIO
@@ -1107,7 +1181,7 @@ void mce_sys_var::get_env_params()
 	if ((getenv(SYS_VAR_HUGETBL)) != NULL)
 	{
 		vlog_printf(VLOG_WARNING, "**********************************************************************************************************************\n");
-		vlog_printf(VLOG_WARNING, "The '%s' paramaeter is no longer supported, please refer to '%s' in README.txt for more info\n", SYS_VAR_HUGETBL, SYS_VAR_MEM_ALLOC_TYPE);
+		vlog_printf(VLOG_WARNING, "The '%s' parameter is no longer supported, please refer to '%s' in README.txt for more info\n", SYS_VAR_HUGETBL, SYS_VAR_MEM_ALLOC_TYPE);
 		vlog_printf(VLOG_WARNING, "**********************************************************************************************************************\n");
 	}
 
@@ -1115,6 +1189,16 @@ void mce_sys_var::get_env_params()
 		mem_alloc_type = (alloc_mode_t)atoi(env_ptr);
 	if (mem_alloc_type < 0 || mem_alloc_type >= ALLOC_TYPE_LAST)
 		mem_alloc_type = MCE_DEFAULT_MEM_ALLOC_TYPE;
+	if (mce_sys_var::HYPER_MSHV == hypervisor && mem_alloc_type == ALLOC_TYPE_CONTIG) {
+		char mem_str[sizeof(int) + 1] = {0};
+		len = snprintf(mem_str, sizeof(mem_str), "%d", ALLOC_TYPE_HUGEPAGES);
+		if (likely((0 < len) && (len < (int)sizeof(mem_str)))) {
+			setenv(SYS_VAR_MEM_ALLOC_TYPE, mem_str, 1); // Setenv to avoid core dump while valgrind is used.
+		}
+		vlog_printf(VLOG_DEBUG, "The '%s' parameter can not be %d for %s.\n",
+				SYS_VAR_MEM_ALLOC_TYPE, mem_alloc_type, cpuid_hv_vendor());
+		mem_alloc_type = ALLOC_TYPE_HUGEPAGES;
+	}
 
 	if ((env_ptr = getenv(SYS_VAR_BF)) != NULL)
 		handle_bf = atoi(env_ptr) ? true : false;
@@ -1166,30 +1250,39 @@ void set_env_params()
 
 	//setenv("MLX4_SINGLE_THREADED", "1", 0);
 
-	if(safe_mce_sys().handle_bf){
-                setenv("MLX4_POST_SEND_PREFER_BF", "1", 1);
-		setenv("MLX5_POST_SEND_PREFER_BF", "1", 1);
-        } else {
-		/* todo - these seem not to work if inline is on, since libmlx is doing (inl || bf) when deciding to bf*/
-                setenv("MLX4_POST_SEND_PREFER_BF", "0", 1);
-		setenv("MLX5_POST_SEND_PREFER_BF", "0", 1);
-        }
+	/*
+	 * MLX4_DEVICE_FATAL_CLEANUP/MLX5_DEVICE_FATAL_CLEANUP tells
+	 * ibv_destroy functions we want to get success errno value
+	 * in case of calling them when the device was removed.
+	 * It helps to destroy resources in DEVICE_FATAL state
+	 */
+	setenv("MLX4_DEVICE_FATAL_CLEANUP", "1", 1);
+	setenv("MLX5_DEVICE_FATAL_CLEANUP", "1", 1);
 
-        switch (safe_mce_sys().mem_alloc_type) {
-        case ALLOC_TYPE_ANON:
-                setenv("MLX_QP_ALLOC_TYPE", "ANON", 0);
-                setenv("MLX_CQ_ALLOC_TYPE", "ANON", 0);
-                break;
-        case ALLOC_TYPE_HUGEPAGES:
-                setenv("RDMAV_HUGEPAGES_SAFE", "1", 0);
-                setenv("MLX_QP_ALLOC_TYPE", "ALL", 0);
-                setenv("MLX_CQ_ALLOC_TYPE", "ALL", 0);
-                break;
-        case ALLOC_TYPE_CONTIG:
-        default:
-                setenv("MLX_QP_ALLOC_TYPE", "PREFER_CONTIG", 0);
-                setenv("MLX_CQ_ALLOC_TYPE", "PREFER_CONTIG", 0);
-                break;
-        }
+	if (safe_mce_sys().handle_bf) {
+		setenv("MLX4_POST_SEND_PREFER_BF", "1", 1);
+		setenv("MLX5_POST_SEND_PREFER_BF", "1", 1);
+	} else {
+		/* todo - these seem not to work if inline is on, since libmlx is doing (inl || bf) when deciding to bf*/
+		setenv("MLX4_POST_SEND_PREFER_BF", "0", 1);
+		setenv("MLX5_POST_SEND_PREFER_BF", "0", 1);
+	}
+
+	switch (safe_mce_sys().mem_alloc_type) {
+	case ALLOC_TYPE_ANON:
+		setenv("MLX_QP_ALLOC_TYPE", "ANON", 0);
+		setenv("MLX_CQ_ALLOC_TYPE", "ANON", 0);
+		break;
+	case ALLOC_TYPE_HUGEPAGES:
+		setenv("RDMAV_HUGEPAGES_SAFE", "1", 0);
+		setenv("MLX_QP_ALLOC_TYPE", "ALL", 0);
+		setenv("MLX_CQ_ALLOC_TYPE", "ALL", 0);
+		break;
+	case ALLOC_TYPE_CONTIG:
+	default:
+		setenv("MLX_QP_ALLOC_TYPE", "PREFER_CONTIG", 0);
+		setenv("MLX_CQ_ALLOC_TYPE", "PREFER_CONTIG", 0);
+		break;
+	}
 }
 

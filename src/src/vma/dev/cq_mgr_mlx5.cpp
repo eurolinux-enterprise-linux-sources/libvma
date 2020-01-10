@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2001-2017 Mellanox Technologies, Ltd. All rights reserved.
+ * Copyright (c) 2001-2018 Mellanox Technologies, Ltd. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -314,7 +314,7 @@ int cq_mgr_mlx5::drain_and_proccess(uintptr_t* p_recycle_buffers_last_wr_id /*=N
 
 	/* Update cq statistics */
 	m_p_cq_stat->n_rx_sw_queue_len = m_rx_queue.size();
-	m_p_cq_stat->n_rx_drained_at_once_max = max(ret_total, m_p_cq_stat->n_rx_drained_at_once_max);
+	m_p_cq_stat->n_rx_drained_at_once_max = std::max(ret_total, m_p_cq_stat->n_rx_drained_at_once_max);
 
 	return ret_total;
 }
@@ -349,8 +349,7 @@ mem_buf_desc_t* cq_mgr_mlx5::process_cq_element_rx(mem_buf_desc_t* p_mem_buf_des
 	p_mem_buf_desc->rx.is_vma_thr = false;
 	p_mem_buf_desc->rx.context = this;
 
-	if (unlikely((status != BS_OK) ||
-			     (m_b_is_rx_hw_csum_on && p_mem_buf_desc->rx.is_sw_csum_need))) {
+	if (unlikely(status != BS_OK)) {
 		m_p_next_rx_desc_poll = NULL;
 		if (p_mem_buf_desc->p_desc_owner) {
 			p_mem_buf_desc->p_desc_owner->mem_buf_desc_completion_with_error_rx(p_mem_buf_desc);
@@ -370,7 +369,7 @@ mem_buf_desc_t* cq_mgr_mlx5::process_cq_element_rx(mem_buf_desc_t* p_mem_buf_des
 	VALGRIND_MAKE_MEM_DEFINED(p_mem_buf_desc->p_buffer, p_mem_buf_desc->sz_data);
 
 	prefetch_range((uint8_t*)p_mem_buf_desc->p_buffer + m_sz_transport_header,
-	min(p_mem_buf_desc->sz_data - m_sz_transport_header, (size_t)m_n_sysvar_rx_prefetch_bytes));
+	std::min(p_mem_buf_desc->sz_data - m_sz_transport_header, (size_t)m_n_sysvar_rx_prefetch_bytes));
 
 
 	return p_mem_buf_desc;
@@ -578,6 +577,7 @@ void cq_mgr_mlx5::set_qp_rq(qp_mgr* qp)
 	m_cq_dbell = m_mlx5_cq->dbrec;
 	m_cqe_log_sz = ilog_2(m_mlx5_cq->cqe_sz);
 	m_cqes = ((uint8_t*)m_mlx5_cq->active_buf->buf) + m_mlx5_cq->cqe_sz - sizeof(struct mlx5_cqe64);
+	m_cq_size = m_p_ibv_cq->cqe + 1;
 }
 
 void cq_mgr_mlx5::add_qp_rx(qp_mgr* qp)
@@ -620,8 +620,35 @@ void cq_mgr_mlx5::add_qp_tx(qp_mgr* qp)
 	m_qp = static_cast<qp_mgr_eth_mlx5*> (qp);
 	m_cq_dbell = m_mlx5_cq->dbrec;
 	m_cqe_log_sz = ilog_2(m_mlx5_cq->cqe_sz);
+	m_cq_size = m_p_ibv_cq->cqe + 1;
 	m_cqes = ((uint8_t *)m_mlx5_cq->active_buf->buf) + m_mlx5_cq->cqe_sz - sizeof(struct mlx5_cqe64);
 	cq_logfunc("qp_mgr=%p m_cq_dbell=%p m_cqes=%p", m_qp, m_cq_dbell, m_cqes);
 }
 
+bool cq_mgr_mlx5::fill_cq_hw_descriptors(struct hw_cq_data &data)
+{
+
+	ibv_mlx5_cq_info cq_info;
+
+	memset(&cq_info, 0, sizeof(cq_info));
+
+	if (ibv_mlx5_exp_get_cq_info(m_p_ibv_cq, &cq_info)) {
+		cq_logerr("ibv_mlx5_exp_get_cq_info failed,"
+			"cq was already used, cannot use it in direct mode, "
+					"%p", m_p_ibv_cq);
+	}
+	cq_logdbg("Returning HW descriptors for CQ %p cqn %u cqe_cnt %u buf %p "
+		"dbrec %p cqe_size %u", m_p_ibv_cq, cq_info.cqn, cq_info.cqe_cnt,
+		cq_info.buf, cq_info.dbrec, cq_info.cqe_size);
+	data.buf = cq_info.buf;
+	data.cons_idx = &m_mlx5_cq->cons_index;
+	data.cq_size = m_cq_size;
+	data.cqe_size = cq_info.cqe_size;
+	data.cqn = cq_info.cqn;
+
+	data.dbrec = cq_info.dbrec;
+	/* Not supported yet */
+	data.uar = NULL;
+	return true;
+}
 #endif//HAVE_INFINIBAND_MLX5_HW_H

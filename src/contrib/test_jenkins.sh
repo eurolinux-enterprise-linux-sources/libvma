@@ -2,7 +2,7 @@
 #
 # Testing script for VMA, to run from Jenkins CI
 #
-# Copyright (C) Mellanox Technologies Ltd. 2001-2017.  ALL RIGHTS RESERVED.
+# Copyright (C) Mellanox Technologies Ltd. 2001-2018.  ALL RIGHTS RESERVED.
 #
 # See file LICENSE for terms.
 #
@@ -87,7 +87,7 @@ for target_v in "${target_list[@]}"; do
     echo "======================================================"
     set -x
 
-    if [ "${target_name}" = "vmapoll" ]; then
+    if [ "${target_name}" = "socketxtreme" ]; then
         if [ $(bc <<< "${jenkins_ofed} < 3.3") == 1 ]; then
             set +x
             echo "======================================================"

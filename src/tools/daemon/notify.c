@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2001-2017 Mellanox Technologies, Ltd. All rights reserved.
+ * Copyright (c) 2001-2018 Mellanox Technologies, Ltd. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -54,7 +54,7 @@
 #include "daemon.h"
 
 #ifndef KERNEL_O_LARGEFILE
-#if defined(__aarch64__)
+#if defined(__aarch64__) || defined(__powerpc__)
 /* Check architecture: if we are running on ARM,
  * omit KERNEL_O_LARGEFILE from fanotify_init invocation because
  * KERNEL_O_LARGEFILE breaks program on armv running at least kernel 4.4+
@@ -100,8 +100,12 @@ int open_notify(void);
 void close_notify(void);
 int proc_notify(void);
 
+extern int add_flow(struct store_pid *pid_value, struct store_flow *value);
+extern int del_flow(struct store_pid *pid_value, struct store_flow *value);
+
+static int setup_notify(void);
 static int create_raw_socket(void);
-static int send_peer_notification(pid_t pid);
+static int clean_process(pid_t pid);
 static int check_process(pid_t pid);
 static unsigned short calc_csum(unsigned short *ptr, int nbytes);
 static int get_seqno(struct rst_info *rst);
@@ -129,19 +133,10 @@ int open_notify(void)
 {
 	int rc = 0;
 
-	/* Set method for processing
-	 * fanotify has the highest priority because it has better
-	 * performance
-	 */
-#if defined(HAVE_SYS_INOTIFY_H)
-	do_open_notify = open_inotify;
-	do_proc_notify = proc_inotify;
-#endif
-
-#if defined(HAVE_SYS_FANOTIFY_H)
-	do_open_notify = open_fanotify;
-	do_proc_notify = proc_fanotify;
-#endif
+	rc = setup_notify();
+	if (rc < 0) {
+		goto err;
+	}
 
 	rc = create_raw_socket();
 	if (rc < 0) {
@@ -200,6 +195,46 @@ err:
 	return rc;
 }
 
+static int setup_notify(void)
+{
+	int fd = -1;
+
+	/* Set method for processing
+	 * fanotify has the highest priority because it has better
+	 * performance
+	 */
+	errno = 0;
+#if defined(HAVE_SYS_FANOTIFY_H)
+	fd = fanotify_init(0, KERNEL_O_LARGEFILE);
+	if (fd >= 0) {
+		do_open_notify = open_fanotify;
+		do_proc_notify = proc_fanotify;
+		close(fd);
+		return 0;
+	} else {
+		log_debug("fanotify_init() errno %d (%s)\n", errno,
+			(ENOSYS == errno ? "missing support for fanotify (check CONFIG_FANOTIFY=y)\n" : strerror(errno)));
+	}
+#endif
+
+#if defined(HAVE_SYS_INOTIFY_H)
+	fd = inotify_init();
+	if (fd >= 0) {
+		do_open_notify = open_inotify;
+		do_proc_notify = proc_inotify;
+		close(fd);
+		return 0;
+	} else {
+		log_debug("inotify_init() errno %d (%s)\n", errno,
+			(ENOSYS == errno ? "missing support for inotify (check CONFIG_INOTIFY_USER=y)\n" : strerror(errno)));
+	}
+#endif
+
+	log_error("Failed notify way selection, check kernel configuration errno %d (%s)\n", errno,
+			strerror(errno));
+	return -ENOSYS;
+}
+
 static int create_raw_socket(void)
 {
 	int rc = 0;
@@ -228,11 +263,10 @@ err:
 	return rc;
 }
 
-static int send_peer_notification(pid_t pid)
+static int clean_process(pid_t pid)
 {
 	int rc = -ESRCH;
 	int wait = 0;
-	struct rst_info rst;
 
 	wait = 100;
 	do {
@@ -243,9 +277,14 @@ static int send_peer_notification(pid_t pid)
 			log_debug("[%d] detect abnormal termination\n", pid);
 			pid_value = hash_get(daemon_cfg.ht, pid);
 			if (pid_value) {
-				struct store_fid *fid_value;
+				struct rst_info rst;
+				struct store_fid *fid_value = NULL;
+				struct store_flow *flow_value = NULL;
+				struct list_head *cur_entry = NULL;
+				struct list_head *tmp_entry = NULL;
 				int i, j;
 
+				/* Cleanup fid store */
 				j = 0;
 				for (i = 0; (i < hash_size(pid_value->ht)) &&
 							(j < hash_count(pid_value->ht)); i++) {
@@ -256,17 +295,17 @@ static int send_peer_notification(pid_t pid)
 
 					j++;
 					log_debug("[%d] #%d found fid: %d type: %d state: %d\n",
-							pid, j,
+							pid_value->pid, j,
 							fid_value->fid, fid_value->type, fid_value->state);
 
 					if (STATE_ESTABLISHED != fid_value->state) {
 						log_debug("[%d] #%d skip fid: %d\n",
-								pid, j, fid_value->fid);
+								pid_value->pid, j, fid_value->fid);
 						continue;
 					}
 
 					log_debug("[%d] #%d process fid: %d\n",
-							pid, j, fid_value->fid);
+							pid_value->pid, j, fid_value->fid);
 
 					/* Notification is based on sending RST packet to all peers
 					 * and looks as spoofing attacks that uses a technique
@@ -295,6 +334,19 @@ static int send_peer_notification(pid_t pid)
 					}
 				}
 
+				/* Cleanup flow store */
+				j = 0;
+				list_for_each_safe(cur_entry, tmp_entry, &pid_value->flow_list) {
+					flow_value = list_entry(cur_entry, struct store_flow, item);
+					j++;
+					log_debug("[%d] #%d found handle: 0x%08X type: %d if_id: %d tap_id: %d\n",
+							pid_value->pid, j,
+							flow_value->handle, flow_value->type, flow_value->if_id, flow_value->tap_id);
+					list_del_init(&flow_value->item);
+					del_flow(pid_value, flow_value);
+					free(flow_value);
+				}
+
 				hash_del(daemon_cfg.ht, pid);
 				log_debug("[%d] remove from the storage\n", pid);
 
@@ -311,15 +363,26 @@ static int send_peer_notification(pid_t pid)
 
 static int check_process(pid_t pid)
 {
-	char pid_str[NAME_MAX];
-	char proccess_proc_dir[PATH_MAX];
-	struct stat st;
+	char process_file[PATH_MAX];
+	int rc = 0;
 
-	sprintf(pid_str, "%d", pid);
-	memset((void*)proccess_proc_dir, 0, sizeof(PATH_MAX));
-	strcat(strcpy(proccess_proc_dir, "/proc/"), pid_str);
-	return stat(proccess_proc_dir, &st) == 0;
+	rc = snprintf(process_file, sizeof(process_file), "/proc/%d/stat", pid);
+	if ((0 < rc) && (rc < (int)sizeof(process_file))) {
+		FILE* fd = fopen(process_file, "r");;
+		if (fd) {
+			int pid_v = 0;
+			char name_v[32];
+			char stat_v = 0;
 
+			rc = fscanf(fd, "%d %30s %c", &pid_v, name_v, &stat_v);
+			fclose(fd);
+			if (rc == 3 && stat_v != 'Z') {
+				return 1;
+			}
+		}
+	}
+
+	return 0;
 }
 
 static unsigned short calc_csum(unsigned short *ptr, int nbytes)
@@ -533,7 +596,8 @@ static int open_fanotify(void)
 	}
 
 	rc = fanotify_mark(daemon_cfg.notify_fd, FAN_MARK_ADD,
-			FAN_CLOSE | FAN_EVENT_ON_CHILD, AT_FDCWD, VMA_AGENT_PATH);
+			FAN_CLOSE | FAN_EVENT_ON_CHILD, AT_FDCWD,
+			daemon_cfg.notify_dir);
 	if (rc < 0) {
 		rc = -errno;
 		log_error("Failed to add watch for directory %s errno %d (%s)\n",
@@ -591,7 +655,7 @@ static int proc_fanotify(void *buffer, int nbyte)
 					data->mask, data->pid, data->fd, pathname);
 
 			rc = snprintf(buf, sizeof(buf) - 1, "%s/%s.%d.pid",
-					VMA_AGENT_PATH, VMA_AGENT_BASE_NAME, data->pid);
+					daemon_cfg.notify_dir, VMA_AGENT_BASE_NAME, data->pid);
 			if ((rc < 0 ) || (rc == (sizeof(buf) - 1) )) {
 				rc = -ENOMEM;
 				log_error("failed allocate pid file errno %d (%s)\n", errno,
@@ -601,7 +665,7 @@ static int proc_fanotify(void *buffer, int nbyte)
 
 			/* Process event related pid file only */
 			rc = 0;
-			if (!strcmp(buf, pathname)) {
+			if (!strncmp(buf, pathname, strlen(buf))) {
 				log_debug("[%d] check the event\n", data->pid);
 
 				/* Check if termination is unexpected and send RST to peers
@@ -609,13 +673,15 @@ static int proc_fanotify(void *buffer, int nbyte)
 				 * nonzero in case we decide that processes exited accurately
 				 * or some internal error happens during RST send
 				 */
-				rc = send_peer_notification(data->pid);
+				rc = clean_process(data->pid);
 				if (0 == rc) {
 					/* Cleanup unexpected termination */
 					log_debug("[%d] cleanup after unexpected termination\n", data->pid);
+					/* To suppress TOCTOU (time-of-check, time-of-use race condition) */
+					strcpy(pathname, buf);
 					unlink(pathname);
 					if (snprintf(pathname, sizeof(pathname) - 1, "%s/%s.%d.sock",
-							VMA_AGENT_PATH, VMA_AGENT_BASE_NAME, data->pid) > 0) {
+							daemon_cfg.notify_dir, VMA_AGENT_BASE_NAME, data->pid) > 0) {
 						unlink(pathname);
 					}
 				} else if (-ESRCH == rc) {
@@ -653,7 +719,7 @@ static int open_inotify(void)
 	}
 
 	rc = inotify_add_watch(daemon_cfg.notify_fd,
-			VMA_AGENT_PATH,
+			daemon_cfg.notify_dir,
 			IN_CLOSE_WRITE | IN_CLOSE_NOWRITE | IN_DELETE);
 	if (rc < 0) {
 		rc = -errno;
@@ -673,21 +739,43 @@ static int proc_inotify(void *buffer, int nbyte)
 
 	while ((uintptr_t)data < ((uintptr_t)buffer + nbyte)) {
 		pid_t pid;
-		char buf[PATH_MAX];
-
-		memset(buf, 0, sizeof(buf));
 
 		/* Monitor only events from files */
 		if ((data->len > 0) &&
 				!(data->mask & IN_ISDIR ) &&
-				(0 < sscanf(data->name, VMA_AGENT_BASE_NAME ".%d.pid", &pid))) {
+				(1 == sscanf(data->name, VMA_AGENT_BASE_NAME ".%d.pid", &pid)) &&
+				hash_get(daemon_cfg.ht, pid)) {
+
+			char buf[PATH_MAX];
+			char pathname[PATH_MAX];
+
+			memset(buf, 0, sizeof(buf));
+			memset(pathname, 0, sizeof(pathname));
+
+			rc = snprintf(pathname, sizeof(pathname) - 1, "%s/%s",
+					daemon_cfg.notify_dir, data->name);
+			if ((rc < 0 ) || (rc == (sizeof(pathname) - 1) )) {
+				rc = -ENOMEM;
+				log_error("failed allocate pid file errno %d (%s)\n", errno,
+					strerror(errno));
+				goto err;
+			}
 
 			log_debug("getting event ([0x%x] pid: %d name: %s)\n",
-					data->mask, pid, data->name);
+					data->mask, pid, pathname);
+
+			rc = snprintf(buf, sizeof(buf) - 1, "%s/%s.%d.pid",
+					daemon_cfg.notify_dir, VMA_AGENT_BASE_NAME, pid);
+			if ((rc < 0 ) || (rc == (sizeof(buf) - 1) )) {
+				rc = -ENOMEM;
+				log_error("failed allocate pid file errno %d (%s)\n", errno,
+					strerror(errno));
+				goto err;
+			}
 
 			/* Process event related pid file only */
 			rc = 0;
-			if (hash_get(daemon_cfg.ht, pid)) {
+			if (!strncmp(buf, pathname, strlen(buf))) {
 				log_debug("[%d] check the event\n", pid);
 
 				/* Check if termination is unexpected and send RST to peers
@@ -695,13 +783,13 @@ static int proc_inotify(void *buffer, int nbyte)
 				 * nonzero in case we decide that processes exited accurately
 				 * or some internal error happens during RST send
 				 */
-				rc = send_peer_notification(pid);
+				rc = clean_process(pid);
 				if (0 == rc) {
 					/* Cleanup unexpected termination */
 					log_debug("[%d] cleanup after unexpected termination\n", pid);
 					unlink(buf);
 					if (snprintf(buf, sizeof(buf) - 1, "%s/%s.%d.sock",
-							VMA_AGENT_PATH, VMA_AGENT_BASE_NAME, pid) > 0) {
+							daemon_cfg.notify_dir, VMA_AGENT_BASE_NAME, pid) > 0) {
 						unlink(buf);
 					}
 				} else if (-ESRCH == rc) {
@@ -718,6 +806,7 @@ static int proc_inotify(void *buffer, int nbyte)
 		data =  (struct inotify_event *)((uintptr_t)data + sizeof(*data) + data->len);
 	}
 
+err:
 	return rc;
 }
 #endif

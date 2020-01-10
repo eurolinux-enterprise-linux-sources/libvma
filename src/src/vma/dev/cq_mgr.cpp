@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2001-2017 Mellanox Technologies, Ltd. All rights reserved.
+ * Copyright (c) 2001-2018 Mellanox Technologies, Ltd. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -91,7 +91,7 @@ cq_mgr::cq_mgr(ring_simple* p_ring, ib_ctx_handler* p_ib_ctx_handler, int cq_siz
 	,m_n_sysvar_rx_prefetch_bytes_before_poll(safe_mce_sys().rx_prefetch_bytes_before_poll)
 	,m_n_sysvar_rx_prefetch_bytes(safe_mce_sys().rx_prefetch_bytes)
 	,m_sz_transport_header(0)
-#ifdef DEFINED_VMAPOLL
+#ifdef DEFINED_SOCKETXTREME
 	,m_rx_hot_buff(NULL)
 	,m_qp(NULL)
 	,m_mlx5_cq(NULL)
@@ -102,7 +102,6 @@ cq_mgr::cq_mgr(ring_simple* p_ring, ib_ctx_handler* p_ib_ctx_handler, int cq_siz
 #endif
 	,m_p_ib_ctx_handler(p_ib_ctx_handler)
 	,m_n_sysvar_rx_num_wr_to_post_recv(safe_mce_sys().rx_num_wr_to_post_recv)
-	,m_b_sysvar_is_rx_sw_csum_on(safe_mce_sys().rx_sw_csum)
 	,m_comp_event_channel(p_comp_event_channel)
 	,m_b_notification_armed(false)
 	,m_n_sysvar_qp_compensation_level(safe_mce_sys().qp_compensation_level)
@@ -157,7 +156,7 @@ void cq_mgr::configure(int cq_size)
 		vma_stats_instance_create_cq_block(m_p_cq_stat);
 	}
 	
-#ifdef DEFINED_VMAPOLL
+#ifdef DEFINED_SOCKETXTREME
 	struct ibv_cq *ibcq = m_p_ibv_cq; // ibcp is used in next macro: _to_mxxx
 	m_mlx5_cq = _to_mxxx(cq, cq);
 	m_cq_db = m_mlx5_cq->dbrec;
@@ -181,7 +180,7 @@ void cq_mgr::prep_ibv_cq(vma_ibv_cq_init_attr& attr) const
 
 uint32_t cq_mgr::clean_cq()
 {
-#ifdef DEFINED_VMAPOLL
+#ifdef DEFINED_SOCKETXTREME
 	return 0;
 #else
 	uint32_t ret_total = 0;
@@ -223,14 +222,11 @@ cq_mgr::~cq_mgr()
 		m_p_cq_stat->n_buffer_pool_len = m_rx_pool.size();
 	}
 
-	if (!m_p_ib_ctx_handler->is_removed()) {
-		cq_logfunc("destroying ibv_cq");
-
-		IF_VERBS_FAILURE(ibv_destroy_cq(m_p_ibv_cq)) {
-			cq_logerr("destroy cq failed (errno=%d %m)", errno);
-		} ENDIF_VERBS_FAILURE;
-		VALGRIND_MAKE_MEM_UNDEFINED(m_p_ibv_cq, sizeof(ibv_cq));
-	}
+	cq_logfunc("destroying ibv_cq");
+	IF_VERBS_FAILURE_EX(ibv_destroy_cq(m_p_ibv_cq), EIO) {
+		cq_logerr("destroy cq failed (errno=%d %m)", errno);
+	} ENDIF_VERBS_FAILURE;
+	VALGRIND_MAKE_MEM_UNDEFINED(m_p_ibv_cq, sizeof(ibv_cq));
 	
 	statistics_print();
 	if (m_b_is_rx)
@@ -261,7 +257,8 @@ int cq_mgr::get_channel_fd()
 void cq_mgr::add_qp_rx(qp_mgr* qp)
 {
 	cq_logdbg("qp_mgr=%p", qp);
-	mem_buf_desc_t *p_temp_desc_list, *p_temp_desc_next;
+	descq_t temp_desc_list;
+	temp_desc_list.set_id("cq_mgr (%p) : temp_desc_list", this);
 
 	m_p_cq_stat->n_rx_drained_at_once_max = 0;
 
@@ -274,24 +271,17 @@ void cq_mgr::add_qp_rx(qp_mgr* qp)
 		uint32_t n_num_mem_bufs = m_n_sysvar_rx_num_wr_to_post_recv;
 		if (n_num_mem_bufs > qp_rx_wr_num)
 			n_num_mem_bufs = qp_rx_wr_num;
-		p_temp_desc_list = g_buffer_pool_rx->get_buffers_thread_safe(n_num_mem_bufs, m_rx_lkey);
-		if (p_temp_desc_list == NULL) {
-			static vlog_levels_t log_severity = VLOG_WARNING; // WARNING severity will be used only once - at the 1st time
-			VLOG_PRINTF_INFO(log_severity, "WARNING Out of mem_buf_desc from Rx buffer pool for qp_mgr qp_mgr initialization (qp=%p)", qp);
-			VLOG_PRINTF_INFO(log_severity, "WARNING This might happen due to wrong setting of VMA_RX_BUFS and VMA_RX_WRE. Please refer to README.txt for more info");
-			log_severity = VLOG_DEBUG; // for all times but the 1st one
+		bool res = g_buffer_pool_rx->get_buffers_thread_safe(temp_desc_list, m_p_ring, n_num_mem_bufs, m_rx_lkey);
+		if (!res) {
+			VLOG_PRINTF_INFO_ONCE_THEN_ALWAYS(VLOG_WARNING, VLOG_DEBUG, "WARNING Out of mem_buf_desc from Rx buffer pool for qp_mgr qp_mgr initialization (qp=%p),\n"
+					"\tThis might happen due to wrong setting of VMA_RX_BUFS and VMA_RX_WRE. Please refer to README.txt for more info", qp);
 			break;
 		}
 
-		p_temp_desc_next = p_temp_desc_list;
-		while (p_temp_desc_next) {
-			p_temp_desc_next->p_desc_owner = m_p_ring;
-			p_temp_desc_next = p_temp_desc_next->p_next_desc;
-		}
-
-		if (qp->post_recv(p_temp_desc_list) != 0) {
+		qp->post_recv_buffers(&temp_desc_list, temp_desc_list.size());
+		if (!temp_desc_list.empty()) {
 			cq_logdbg("qp post recv is already full (push=%d, planned=%d)", qp->get_rx_max_wr_num()-qp_rx_wr_num, qp->get_rx_max_wr_num());
-			g_buffer_pool_rx->put_buffers_thread_safe(p_temp_desc_list);
+			g_buffer_pool_rx->put_buffers_thread_safe(&temp_desc_list, temp_desc_list.size());
 			break;
 		}
 		qp_rx_wr_num -= n_num_mem_bufs;
@@ -299,11 +289,11 @@ void cq_mgr::add_qp_rx(qp_mgr* qp)
 	cq_logdbg("Successfully post_recv qp with %d new Rx buffers (planned=%d)", qp->get_rx_max_wr_num()-qp_rx_wr_num, qp->get_rx_max_wr_num());
 
 	// Add qp_mgr to map
-#ifdef DEFINED_VMAPOLL
+#ifdef DEFINED_SOCKETXTREME
 	m_qp = qp;
-#endif // DEFINED_VMAPOLL
+#endif // DEFINED_SOCKETXTREME
 	m_qp_rec.qp = qp;
-	m_qp_rec.debth = 0;
+	m_qp_rec.debt = 0;
 }
 
 void cq_mgr::del_qp_rx(qp_mgr *qp)
@@ -323,34 +313,24 @@ void cq_mgr::add_qp_tx(qp_mgr* qp)
 {
 	//Assume locked!
 	cq_logdbg("qp_mgr=%p", qp);
-#ifdef DEFINED_VMAPOLL
+#ifdef DEFINED_SOCKETXTREME
 	m_qp = qp;
-#endif // DEFINED_VMAPOLL
+#endif // DEFINED_SOCKETXTREME
 	m_qp_rec.qp = qp;
-	m_qp_rec.debth = 0;
+	m_qp_rec.debt = 0;
 }
 
 bool cq_mgr::request_more_buffers()
 {
-	mem_buf_desc_t *p_temp_desc_list, *p_temp_buff;
-
 	cq_logfuncall("Allocating additional %d buffers for internal use", m_n_sysvar_qp_compensation_level);
 
 	// Assume locked!
 	// Add an additional free buffer descs to RX cq mgr
-	p_temp_desc_list = g_buffer_pool_rx->get_buffers_thread_safe(m_n_sysvar_qp_compensation_level, m_rx_lkey);
-	if (p_temp_desc_list == NULL) {
+	bool res = g_buffer_pool_rx->get_buffers_thread_safe(m_rx_pool, m_p_ring, m_n_sysvar_qp_compensation_level, m_rx_lkey);
+	if (!res) {
 		cq_logfunc("Out of mem_buf_desc from RX free pool for internal object pool");
 		return false;
-	}
-
-	while (p_temp_desc_list) {
-		p_temp_buff = p_temp_desc_list;
-		p_temp_desc_list = p_temp_buff->p_next_desc;
-		p_temp_buff->p_desc_owner = m_p_ring;
-		p_temp_buff->p_next_desc = NULL;
-		m_rx_pool.push_back(p_temp_buff);
-	}
+	};
 
 	m_p_cq_stat->n_buffer_pool_len = m_rx_pool.size();
 	return true;
@@ -417,7 +397,7 @@ int cq_mgr::poll(vma_ibv_wc* p_wce, int num_entries, uint64_t* p_cq_poll_sn)
 	TAKE_POLL_CQ_IN;
 #endif
 
-#ifdef DEFINED_VMAPOLL
+#ifdef DEFINED_SOCKETXTREME
 #else
 	if (unlikely(g_vlogger_level >= VLOG_FUNC_ALL)) {
 		for (int i = 0; i < ret; i++) {
@@ -511,15 +491,6 @@ mem_buf_desc_t* cq_mgr::process_cq_element_rx(vma_ibv_wc* p_wce)
 	mem_buf_desc_t* p_mem_buf_desc = (mem_buf_desc_t*)(uintptr_t)p_wce->wr_id;
 
 	bool bad_wce = p_wce->status != IBV_WC_SUCCESS;
-	bool is_rx_sw_csum_need;
-
-	if  (m_b_sysvar_is_rx_sw_csum_on) {
-		// no changes in bad_wce
-		is_rx_sw_csum_need = !(m_b_is_rx_hw_csum_on && vma_wc_rx_hw_csum_ok(*p_wce));
-	} else {
-		bad_wce =  bad_wce || (m_b_is_rx_hw_csum_on && !vma_wc_rx_hw_csum_ok(*p_wce));
-		is_rx_sw_csum_need = false;
-	}
 
 	if (unlikely(bad_wce || p_mem_buf_desc == NULL)) {
 		if (p_mem_buf_desc == NULL) {
@@ -555,7 +526,7 @@ mem_buf_desc_t* cq_mgr::process_cq_element_rx(vma_ibv_wc* p_wce)
 		p_mem_buf_desc->p_prev_desc = NULL;
 	}
 
-	p_mem_buf_desc->rx.is_sw_csum_need = is_rx_sw_csum_need;
+	p_mem_buf_desc->rx.is_sw_csum_need = !(m_b_is_rx_hw_csum_on && vma_wc_rx_hw_csum_ok(*p_wce));
 
 	if (likely(vma_wc_opcode(*p_wce) & VMA_IBV_WC_RECV)) {
 		// Save recevied total bytes
@@ -563,12 +534,12 @@ mem_buf_desc_t* cq_mgr::process_cq_element_rx(vma_ibv_wc* p_wce)
 
 		//we use context to verify that on reclaim rx buffer path we return the buffer to the right CQ
 		p_mem_buf_desc->rx.is_vma_thr = false;
-#ifdef DEFINED_VMAPOLL
+#ifdef DEFINED_SOCKETXTREME
 		p_mem_buf_desc->rx.context = NULL;
-		p_mem_buf_desc->rx.vma_polled = false;
 #else
 		p_mem_buf_desc->rx.context = this;
-#endif // DEFINED_VMAPOLL
+#endif // DEFINED_SOCKETXTREME
+		p_mem_buf_desc->rx.socketxtreme_polled = false;
 
 		//this is not a deadcode if timestamping is defined in verbs API
 		// coverity[dead_error_condition]
@@ -579,7 +550,7 @@ mem_buf_desc_t* cq_mgr::process_cq_element_rx(vma_ibv_wc* p_wce)
 		VALGRIND_MAKE_MEM_DEFINED(p_mem_buf_desc->p_buffer, p_mem_buf_desc->sz_data);
 
 		prefetch_range((uint8_t*)p_mem_buf_desc->p_buffer + m_sz_transport_header, 
-				min(p_mem_buf_desc->sz_data - m_sz_transport_header, (size_t)m_n_sysvar_rx_prefetch_bytes));
+				std::min(p_mem_buf_desc->sz_data - m_sz_transport_header, (size_t)m_n_sysvar_rx_prefetch_bytes));
 		//prefetch((uint8_t*)p_mem_buf_desc->p_buffer + m_sz_transport_header);
 	}
 
@@ -590,26 +561,25 @@ bool cq_mgr::compensate_qp_poll_success(mem_buf_desc_t* buff_cur)
 {
 	// Assume locked!!!
 	// Compensate QP for all completions that we found
-	if (IS_VMAPOLL || likely(m_qp_rec.qp)) {
-#ifndef DEFINED_VMAPOLL // not defined
-		++m_qp_rec.debth;
-		if (likely(m_qp_rec.debth < (int)m_n_sysvar_rx_num_wr_to_post_recv)) {
+	if (IS_SOCKETXTREME || likely(m_qp_rec.qp)) {
+#ifndef DEFINED_SOCKETXTREME // not defined
+		++m_qp_rec.debt;
+		if (likely(m_qp_rec.debt < (int)m_n_sysvar_rx_num_wr_to_post_recv)) {
 			return false;
 		}
-#endif // DEFINED_VMAPOLL
+#endif // DEFINED_SOCKETXTREME
 		
 		if (m_rx_pool.size() || request_more_buffers()) {
-			do {
-				mem_buf_desc_t *buff_new = m_rx_pool.get_and_pop_front();
-				m_qp_rec.qp->post_recv(buff_new);
-			} while (--m_qp_rec.debth > 0 && m_rx_pool.size());
+			size_t buffers = std::min<size_t>(m_qp_rec.debt, m_rx_pool.size());
+			m_qp_rec.qp->post_recv_buffers(&m_rx_pool, buffers);
+			m_qp_rec.debt -= buffers;
 			m_p_cq_stat->n_buffer_pool_len = m_rx_pool.size();
 		}
 		else if (m_b_sysvar_cq_keep_qp_full ||
-				m_qp_rec.debth + MCE_MAX_CQ_POLL_BATCH > (int)m_qp_rec.qp->get_rx_max_wr_num()) {
+				m_qp_rec.debt + MCE_MAX_CQ_POLL_BATCH > (int)m_qp_rec.qp->m_rx_num_wr) {
 			m_p_cq_stat->n_rx_pkt_drop++;
-			m_qp_rec.qp->post_recv(buff_cur);
-			--m_qp_rec.debth;
+			m_qp_rec.qp->post_recv_buffer(buff_cur);
+			--m_qp_rec.debt;
 			return true;
 		}
 	}
@@ -622,11 +592,11 @@ void cq_mgr::reclaim_recv_buffer_helper(mem_buf_desc_t* buff)
 	// Assume locked!!!
 	if (buff->dec_ref_count() <= 1 && (buff->lwip_pbuf.pbuf.ref-- <= 1)) {
 		//we need to verify that the buffer is returned to the right CQ (in case of HA ring's active CQ can change)
-#ifdef DEFINED_VMAPOLL
+#ifdef DEFINED_SOCKETXTREME
 		if (likely(buff->p_desc_owner == m_p_ring)) {
 #else
 		if (likely(buff->rx.context == this)) {
-#endif // DEFINED_VMAPOLL
+#endif // DEFINED_SOCKETXTREME
 			mem_buf_desc_t* temp = NULL;
 			while (buff) {
 				VLIST_DEBUG_CQ_MGR_PRINT_ERROR_IS_MEMBER;
@@ -637,9 +607,7 @@ void cq_mgr::reclaim_recv_buffer_helper(mem_buf_desc_t* buff)
 				temp->reset_ref_count();
 				temp->rx.tcp.gro = 0;
 				temp->rx.is_vma_thr = false;
-#ifdef DEFINED_VMAPOLL
-				temp->rx.vma_polled = false;
-#endif // DEFINED_VMAPOLL
+				temp->rx.socketxtreme_polled = false;
 				temp->rx.flow_tag_id = 0;
 				temp->rx.tcp.p_ip_h = NULL;
 				temp->rx.tcp.p_tcp_h = NULL;
@@ -660,8 +628,8 @@ void cq_mgr::reclaim_recv_buffer_helper(mem_buf_desc_t* buff)
 	}
 }
 
-#ifdef DEFINED_VMAPOLL
-void cq_mgr::vma_poll_reclaim_recv_buffer_helper(mem_buf_desc_t* buff)
+#ifdef DEFINED_SOCKETXTREME
+void cq_mgr::socketxtreme_reclaim_recv_buffer_helper(mem_buf_desc_t* buff)
 {
 	if (buff->dec_ref_count() <= 1) {
 		mem_buf_desc_t* temp = NULL;
@@ -675,7 +643,7 @@ void cq_mgr::vma_poll_reclaim_recv_buffer_helper(mem_buf_desc_t* buff)
 				temp->reset_ref_count();
 				temp->rx.tcp.gro = 0;
 				temp->rx.is_vma_thr = false;
-				temp->rx.vma_polled = false;
+				temp->rx.socketxtreme_polled = false;
 				temp->rx.flow_tag_id = 0;
 				temp->rx.tcp.p_ip_h = NULL;
 				temp->rx.tcp.p_tcp_h = NULL;
@@ -696,35 +664,7 @@ void cq_mgr::vma_poll_reclaim_recv_buffer_helper(mem_buf_desc_t* buff)
 		m_p_cq_stat->n_buffer_pool_len = m_rx_pool.size();
 	}
 }
-
-int cq_mgr::vma_poll_reclaim_single_recv_buffer_helper(mem_buf_desc_t* buff)
-{
-	int ref_cnt = buff->lwip_pbuf_dec_ref_count();
-	if (ref_cnt <= 0) {
-		VLIST_DEBUG_CQ_MGR_PRINT_ERROR_IS_MEMBER
-		//TBD: add check: buff->get_ref_count() <= 0 otherwise return with error
-		//(since that mean free_packet wasn't called)
-		buff->p_next_desc = NULL;
-		buff->p_prev_desc = NULL;
-		buff->reset_ref_count();
-		buff->rx.tcp.gro = 0;
-		buff->rx.is_vma_thr = false;
-		buff->rx.vma_polled = false;
-		buff->rx.flow_tag_id = 0;
-		buff->rx.tcp.p_ip_h = NULL;
-		buff->rx.tcp.p_tcp_h = NULL;
-		buff->rx.udp.sw_timestamp.tv_nsec = 0;
-		buff->rx.udp.sw_timestamp.tv_sec = 0;
-		buff->rx.udp.hw_timestamp.tv_nsec = 0;
-		buff->rx.udp.hw_timestamp.tv_sec = 0;
-		buff->rx.hw_raw_timestamp = 0;
-		free_lwip_pbuf(&buff->lwip_pbuf);
-		m_rx_pool.push_back(buff);
-		m_p_cq_stat->n_buffer_pool_len = m_rx_pool.size();
-	}
-	return ref_cnt;
-}
-#endif // DEFINED_VMAPOLL
+#endif // DEFINED_SOCKETXTREME
 
 void cq_mgr::process_tx_buffer_list(mem_buf_desc_t* p_mem_buf_desc)
 {
@@ -759,8 +699,8 @@ void cq_mgr::mem_buf_desc_return_to_owner(mem_buf_desc_t* p_mem_buf_desc, void* 
 	reclaim_recv_buffer_helper(p_mem_buf_desc);
 }
 
-#ifdef DEFINED_VMAPOLL
-int cq_mgr::vma_poll_and_process_element_rx(mem_buf_desc_t **p_desc_lst)
+#ifdef DEFINED_SOCKETXTREME
+int cq_mgr::socketxtreme_and_process_element_rx(mem_buf_desc_t **p_desc_lst)
 {
 	int packets_num = 0;
 
@@ -789,9 +729,16 @@ int cq_mgr::vma_poll_and_process_element_rx(mem_buf_desc_t **p_desc_lst)
 		++m_n_wce_counter;
 		++m_qp->m_mlx5_hw_qp->rq.tail;
 		m_rx_hot_buff->sz_data = ntohl(cqe->byte_cnt);
+		m_rx_hot_buff->rx.hw_raw_timestamp = ntohll(cqe->timestamp);
 		m_rx_hot_buff->rx.flow_tag_id = vma_get_flow_tag(cqe);
 
-		if (unlikely(++m_qp_rec.debth >= (int)m_n_sysvar_rx_num_wr_to_post_recv)) {
+#ifdef DEFINED_MLX5_HW_ETH_WQE_HEADER
+		m_rx_hot_buff->rx.is_sw_csum_need = !(m_b_is_rx_hw_csum_on && (cqe->hds_ip_ext & MLX5_CQE_L4_OK) && (cqe->hds_ip_ext & MLX5_CQE_L3_OK));
+#else
+		m_rx_hot_buff->rx.is_sw_csum_need = !m_b_is_rx_hw_csum_on; /* we assume that the checksum is ok */
+#endif
+
+		if (unlikely(++m_qp_rec.debt >= (int)m_n_sysvar_rx_num_wr_to_post_recv)) {
 			compensate_qp_poll_success(m_rx_hot_buff);
 		}
 		++packets_num;
@@ -823,14 +770,14 @@ int cq_mgr::vma_poll_and_process_element_rx(mem_buf_desc_t **p_desc_lst)
 	return packets_num;
 
 }
-#endif // DEFINED_VMAPOLL
+#endif // DEFINED_SOCKETXTREME
 
 int cq_mgr::poll_and_process_element_rx(uint64_t* p_cq_poll_sn, void* pv_fd_ready_array)
 {
 	// Assume locked!!!
 	cq_logfuncall("");
 
-#ifdef DEFINED_VMAPOLL
+#ifdef DEFINED_SOCKETXTREME
 	NOT_IN_USE(p_cq_poll_sn);
 	
 	/* coverity[stack_use_local_overflow] */
@@ -849,7 +796,7 @@ int cq_mgr::poll_and_process_element_rx(uint64_t* p_cq_poll_sn, void* pv_fd_read
 		m_rx_hot_buff = (mem_buf_desc_t*)(uintptr_t)m_qp->m_rq_wqe_idx_to_wrid[index];
 		m_rx_hot_buff->rx.context = NULL;
 		m_rx_hot_buff->rx.is_vma_thr = false;
-		m_rx_hot_buff->rx.vma_polled = false;
+		m_rx_hot_buff->rx.socketxtreme_polled = false;
 	}
 	else {
 		volatile mlx5_cqe64 *cqe_err = NULL;
@@ -861,7 +808,13 @@ int cq_mgr::poll_and_process_element_rx(uint64_t* p_cq_poll_sn, void* pv_fd_read
 			m_rx_hot_buff->sz_data = ntohl(cqe->byte_cnt);
 			m_rx_hot_buff->rx.flow_tag_id = vma_get_flow_tag(cqe);
 
-			if (unlikely(++m_qp_rec.debth >= (int)m_n_sysvar_rx_num_wr_to_post_recv)) {
+	#ifdef DEFINED_MLX5_HW_ETH_WQE_HEADER
+			m_rx_hot_buff->rx.is_sw_csum_need = !(m_b_is_rx_hw_csum_on && (cqe->hds_ip_ext & MLX5_CQE_L4_OK) && (cqe->hds_ip_ext & MLX5_CQE_L3_OK));
+	#else
+			m_rx_hot_buff->rx.is_sw_csum_need = !m_b_is_rx_hw_csum_on; /* we assume that the checksum is ok */
+	#endif
+
+			if (unlikely(++m_qp_rec.debt >= (int)m_n_sysvar_rx_num_wr_to_post_recv)) {
 				compensate_qp_poll_success(m_rx_hot_buff);
 			}
 			process_recv_buffer(m_rx_hot_buff, pv_fd_ready_array);
@@ -916,7 +869,7 @@ int cq_mgr::poll_and_process_element_rx(uint64_t* p_cq_poll_sn, void* pv_fd_read
 	}
 	
 	return ret_rx_processed;
-#endif // DEFINED_VMAPOLL
+#endif // DEFINED_SOCKETXTREME
 }
 
 int cq_mgr::poll_and_process_element_tx(uint64_t* p_cq_poll_sn)
@@ -943,7 +896,7 @@ int cq_mgr::poll_and_process_element_tx(uint64_t* p_cq_poll_sn)
 	return ret;
 }
 
-#ifdef DEFINED_VMAPOLL
+#ifdef DEFINED_SOCKETXTREME
 int cq_mgr::mlx5_poll_and_process_error_element_rx(volatile struct mlx5_cqe64 *cqe, void* pv_fd_ready_array)
 {
 	vma_ibv_wc wce;
@@ -958,7 +911,7 @@ int cq_mgr::mlx5_poll_and_process_error_element_rx(volatile struct mlx5_cqe64 *c
 	m_rx_hot_buff = process_cq_element_rx(&wce);
 	if (m_rx_hot_buff) {
 		if (vma_wc_opcode(wce) & VMA_IBV_WC_RECV) {
-			if ((++m_qp_rec.debth < (int)m_n_sysvar_rx_num_wr_to_post_recv) ||
+			if ((++m_qp_rec.debt < (int)m_n_sysvar_rx_num_wr_to_post_recv) ||
 				!compensate_qp_poll_success(m_rx_hot_buff)) {
 					process_recv_buffer(m_rx_hot_buff, pv_fd_ready_array);
 			}
@@ -1065,11 +1018,7 @@ inline volatile struct mlx5_cqe64 *cq_mgr::mlx5_get_cqe64(volatile struct mlx5_c
 
 	return cqe;
 }
-#endif // DEFINED_VMAPOLL
-
-#if _BullseyeCoverage
-    #pragma BullseyeCoverage off
-#endif
+#endif // DEFINED_SOCKETXTREME
 
 bool cq_mgr::reclaim_recv_buffers(mem_buf_desc_t *rx_reuse_lst)
 {
@@ -1078,23 +1027,6 @@ bool cq_mgr::reclaim_recv_buffers(mem_buf_desc_t *rx_reuse_lst)
 		return true;
 	}
 	return false;
-}
-
-#if _BullseyeCoverage
-    #pragma BullseyeCoverage on
-#endif
-
-bool cq_mgr::reclaim_recv_buffers_no_lock(descq_t *rx_reuse)
-{
-	//Assume locked
-	cq_logfuncall("");
-	while (!rx_reuse->empty()) {
-		mem_buf_desc_t* buff = rx_reuse->get_and_pop_front();
-		reclaim_recv_buffer_helper(buff);
-	}
-	//return_extra_buffers();
-
-	return true;
 }
 
 bool cq_mgr::reclaim_recv_buffers(descq_t *rx_reuse)
@@ -1118,16 +1050,16 @@ bool cq_mgr::reclaim_recv_buffers(descq_t *rx_reuse)
 
 int cq_mgr::drain_and_proccess(uintptr_t* p_recycle_buffers_last_wr_id /*=NULL*/)
 {
-#ifdef DEFINED_VMAPOLL
+#ifdef DEFINED_SOCKETXTREME
 	cq_logfuncall("cq was %s drained. %d processed wce since last check. %d wce in m_rx_queue", (m_b_was_drained?"":"not "), m_n_wce_counter, m_rx_queue.size());
 
 #if 0 /* TODO: see explanation */
 	/* This function should be called during destructor only.
-	 * Intrenal thread does not launch draining RX logic for vma_poll mode 
+	 * Intrenal thread does not launch draining RX logic for socketxtreme mode 
 	 * See: net_device_table_mgr::handle_timer_expired(RING_PROGRESS_ENGINE_TIMER)
 	 */
 
-	/* Check if we are in vma_poll() usage mode */
+	/* Check if we are in socketxtreme_poll() usage mode */
 	if (true == m_p_ring->get_vma_active()) {
 		return 0;
 	}
@@ -1212,7 +1144,7 @@ int cq_mgr::drain_and_proccess(uintptr_t* p_recycle_buffers_last_wr_id /*=NULL*/
 					// We process immediately all non udp/ip traffic..
 					if (procces_now) {
 						m_rx_hot_buff->rx.is_vma_thr = true;
-						if ((++m_qp_rec.debth < (int)m_n_sysvar_rx_num_wr_to_post_recv) ||
+						if ((++m_qp_rec.debt < (int)m_n_sysvar_rx_num_wr_to_post_recv) ||
 							!compensate_qp_poll_success(m_rx_hot_buff)) {
 							process_recv_buffer(m_rx_hot_buff, NULL);
 						}
@@ -1220,7 +1152,7 @@ int cq_mgr::drain_and_proccess(uintptr_t* p_recycle_buffers_last_wr_id /*=NULL*/
 					else { //udp/ip traffic we just put in the cq's rx queue
 						m_rx_queue.push_back(m_rx_hot_buff);
 						mem_buf_desc_t* buff_cur = m_rx_queue.get_and_pop_front();
-						if ((++m_qp_rec.debth < (int)m_n_sysvar_rx_num_wr_to_post_recv) ||
+						if ((++m_qp_rec.debt < (int)m_n_sysvar_rx_num_wr_to_post_recv) ||
 							!compensate_qp_poll_success(buff_cur)) {
 							m_rx_queue.push_front(buff_cur);
 						}
@@ -1238,7 +1170,7 @@ int cq_mgr::drain_and_proccess(uintptr_t* p_recycle_buffers_last_wr_id /*=NULL*/
 
 	// Update cq statistics
 	m_p_cq_stat->n_rx_sw_queue_len = m_rx_queue.size();
-	m_p_cq_stat->n_rx_drained_at_once_max = max(ret_total, m_p_cq_stat->n_rx_drained_at_once_max);
+	m_p_cq_stat->n_rx_drained_at_once_max = std::max(ret_total, m_p_cq_stat->n_rx_drained_at_once_max);
 
 	return ret_total;
 #else
@@ -1310,10 +1242,10 @@ int cq_mgr::drain_and_proccess(uintptr_t* p_recycle_buffers_last_wr_id /*=NULL*/
 
 	// Update cq statistics
 	m_p_cq_stat->n_rx_sw_queue_len = m_rx_queue.size();
-	m_p_cq_stat->n_rx_drained_at_once_max = max(ret_total, m_p_cq_stat->n_rx_drained_at_once_max);
+	m_p_cq_stat->n_rx_drained_at_once_max = std::max(ret_total, m_p_cq_stat->n_rx_drained_at_once_max);
 
 	return ret_total;
-#endif // DEFINED_VMAPOLL
+#endif // DEFINED_SOCKETXTREME
 }
 
 
@@ -1424,25 +1356,12 @@ void cq_mgr::modify_cq_moderation(uint32_t period, uint32_t count)
 
 	cq_logfunc("modify cq moderation, period=%d, count=%d", period, count);
 
-	if (!m_p_ib_ctx_handler->is_removed()) {
-		IF_VERBS_FAILURE(ibv_exp_modify_cq(m_p_ibv_cq, &cq_attr, IBV_EXP_CQ_MODERATION)) {
-			cq_logdbg("Failure modifying cq moderation (errno=%d %m)", errno);
-		} ENDIF_VERBS_FAILURE;
-	}
+	IF_VERBS_FAILURE_EX(ibv_exp_modify_cq(m_p_ibv_cq, &cq_attr, IBV_EXP_CQ_MODERATION), EIO) {
+		cq_logdbg("Failure modifying cq moderation (errno=%d %m)", errno);
+	} ENDIF_VERBS_FAILURE;
 
 #else
 	NOT_IN_USE(count);
 	NOT_IN_USE(period);
 #endif
 }
-
-#ifdef DEFINED_VMAPOLL
-void cq_mgr::mlx5_init_cq()
-{
-	struct ibv_cq *ibcq = m_p_ibv_cq; // ibcp is used in next macro: _to_mxxx
-	m_mlx5_cq = _to_mxxx(cq, cq);
-	m_cq_db = m_mlx5_cq->dbrec;
-	m_mlx5_cqes = (volatile struct mlx5_cqe64 (*)[])(uintptr_t)m_mlx5_cq->active_buf->buf;
-}
-#endif // DEFINED_VMAPOLL
-

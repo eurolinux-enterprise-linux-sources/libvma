@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2001-2017 Mellanox Technologies, Ltd. All rights reserved.
+ * Copyright (c) 2001-2018 Mellanox Technologies, Ltd. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -89,6 +89,14 @@ typedef std::map<tcp_pcb*, int>		ready_pcb_map_t;
 typedef std::map<flow_tuple, tcp_pcb*>	syn_received_map_t;
 typedef std::map<peer_key, vma_desc_list_t> peer_map_t;
 
+/* taken from inet_ecn.h in kernel */
+enum inet_ecns {
+	INET_ECN_NOT_ECT = 0,
+	INET_ECN_ECT_1 = 1,
+	INET_ECN_ECT_0 = 2,
+	INET_ECN_CE = 3,
+	INET_ECN_MASK = 3,
+};
 
 class sockinfo_tcp : public sockinfo, public timer_handler
 {
@@ -130,11 +138,13 @@ public:
 	virtual int getpeername(sockaddr *__name, socklen_t *__namelen);
 
 	virtual	int	free_packets(struct vma_packet_t *pkts, size_t count);
-#ifdef DEFINED_VMAPOLL	
-	virtual	int	free_buffs(uint16_t len);
-#else
+
+	/* This function is used for socketxtreme mode */
+	virtual int free_buffs(uint16_t len);
+
+#ifndef DEFINED_SOCKETXTREME // if not defined
 	virtual void statistics_print(vlog_levels_t log_level = VLOG_DEBUG);	
-#endif // DEFINED_VMAPOLL	
+#endif // DEFINED_SOCKETXTREME	
 
 	//Returns the connected pcb, with 5 tuple which matches the input arguments,
 	//in state "SYN Received" or NULL if pcb wasn't found
@@ -205,8 +215,6 @@ public:
 	{
 		return FD_TYPE_SOCKET;
 	}
-
-	virtual bool addr_in_reuse(void) { return false; }
 
 #if _BullseyeCoverage
     #pragma BullseyeCoverage off
@@ -311,10 +319,10 @@ private:
 	//Builds rfs key
 	static void create_flow_tuple_key_from_pcb(flow_tuple &key, struct tcp_pcb *pcb);
 
-#ifdef DEFINED_VMAPOLL
+#ifdef DEFINED_SOCKETXTREME
 	//auto accept function
 	static void auto_accept_connection(sockinfo_tcp *parent, sockinfo_tcp *child);
-#endif // DEFINED_VMAPOLL	
+#endif // DEFINED_SOCKETXTREME	
 
 	// accept cb func
 	static err_t accept_lwip_cb(void *arg, struct tcp_pcb *child_pcb, err_t err);

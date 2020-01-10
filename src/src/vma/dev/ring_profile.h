@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2001-2017 Mellanox Technologies, Ltd. All rights reserved.
+ * Copyright (c) 2001-2018 Mellanox Technologies, Ltd. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -52,9 +52,10 @@ class ring_profile
 {
 public:
 	ring_profile();
-	ring_profile(struct vma_ring_type_attr *ring_desc);
+	ring_profile(const vma_ring_type_attr *ring_desc);
 	vma_ring_type get_ring_type() {return m_ring_desc.ring_type;}
 	struct vma_ring_type_attr* get_desc(){return &m_ring_desc;}
+	bool operator==(const vma_ring_type_attr &p2);
 	const char* to_str(){ return m_str.c_str();}
 	const char* get_vma_ring_type_str();
 private:

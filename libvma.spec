@@ -1,5 +1,5 @@
 Name: libvma
-Version: 8.4.10
+Version: 8.6.10
 Release: 1%{?dist}
 Summary: A library for boosting TCP and UDP traffic (over RDMA hardware)
 
@@ -57,6 +57,9 @@ make %{?_smp_mflags} V=1
 %install
 %make_install mydoc_DATA=
 rm -f $RPM_BUILD_ROOT%{_libdir}/*.la
+# hack to move service file where we want it
+mkdir -p $RPM_BUILD_ROOT%{_unitdir}
+mv $RPM_BUILD_ROOT%{_sysconfdir}/systemd/system/vma.service $RPM_BUILD_ROOT%{_unitdir}/
 
 %post -p /sbin/ldconfig
 %postun -p /sbin/ldconfig
@@ -68,6 +71,7 @@ rm -f $RPM_BUILD_ROOT%{_libdir}/*.la
 %{_libdir}/%{name}.so
 %{_sysconfdir}/init.d/vma
 %{_sbindir}/vmad
+%{_unitdir}/vma.service
 %license COPYING LICENSE
 %doc README.txt journal.txt VMA_VERSION
 %config(noreplace) %{_sysconfdir}/libvma.conf
@@ -80,6 +84,14 @@ rm -f $RPM_BUILD_ROOT%{_libdir}/*.la
 %{_bindir}/vma_stats
 
 %changelog
+* Mon Aug 20 2018 Jarod Wilson <jarod@redhat.com> - 8.6.10-1
+- Rebase to upstream v8.6.10 release
+- Resolves: rhbz#1613018
+
+* Thu Jun 14 2018 Jarod Wilson <jarod@redhat.com> - 8.5.7-1
+- Rebase to upstream v8.5.7 release
+- Resolves: rhbz#1541753
+
 * Tue Dec 05 2017 Jarod Wilson <jarod@redhat.com> - 8.4.10-1
 - Rebase to upstream v8.4.10 release
 - Resolves: rhbz#1456519

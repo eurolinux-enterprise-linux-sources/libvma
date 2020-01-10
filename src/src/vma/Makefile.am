@@ -42,7 +42,6 @@ install-exec-hook:
 	rm -f $(DESTDIR)$(libdir)/libvma.a
 	rm -f $(DESTDIR)$(bindir)/state_machine_test
 	rm -f $(DESTDIR)$(bindir)/vlogger_test
-	if [[ `id -u` -eq 0 ]];then /sbin/ldconfig || true;fi
 
 uninstall-hook:
 	rm -f $(DESTDIR)$(libdir)/libvma.so*
@@ -59,7 +58,7 @@ libvma_la_LDFLAGS := -no-undefined -version-number @VMA_LIBRARY_MAJOR@:@VMA_LIBR
 endif
 
 libvma_la_LIBADD = \
-	-lrt -ldl -lpthread $(VERBS_FLAGS) $(LIBNL_LIBS) \
+	-lrt -ldl -lpthread $(LIBNL_LIBS) $(VERBS_LIBS) \
 	$(top_builddir)/src/utils/libutils.la \
 	$(top_builddir)/src/vlogger/libvlogger.la \
 	$(top_builddir)/src/state_machine/libstate_machine.la \
@@ -75,11 +74,12 @@ libvma_la_SOURCES := \
 	dev/cq_mgr.cpp \
 	dev/cq_mgr_mlx5.cpp \
 	dev/cq_mgr_mp.cpp \
+	dev/dm_mgr.cpp \
 	dev/qp_mgr.cpp \
 	dev/qp_mgr_eth_mlx5.cpp \
+	dev/qp_mgr_eth_direct.cpp \
 	dev/qp_mgr_mp.cpp \
 	dev/gro_mgr.cpp \
-	dev/ring_allocation_logic.cpp \
 	dev/rfs.cpp \
 	dev/rfs_uc.cpp \
 	dev/rfs_uc_tcp_gro.cpp \
@@ -95,10 +95,14 @@ libvma_la_SOURCES := \
 	dev/wqe_send_handler.cpp \
 	dev/wqe_send_ib_handler.cpp \
 	dev/ring.cpp \
-	dev/ring_simple.cpp \
-	dev/ring_eth_cb.cpp \
 	dev/ring_bond.cpp \
+	dev/ring_slave.cpp \
+	dev/ring_simple.cpp \
+	dev/ring_tap.cpp \
+	dev/ring_eth_cb.cpp \
+	dev/ring_eth_direct.cpp \
 	dev/ring_profile.cpp \
+	dev/ring_allocation_logic.cpp \
 	\
 	event/delta_timer.cpp \
 	event/event_handler_manager.cpp \
@@ -119,6 +123,7 @@ libvma_la_SOURCES := \
 	lwip/cc.c \
 	lwip/cc_lwip.c \
 	lwip/cc_cubic.c \
+	lwip/cc_none.c \
 	lwip/init.c \
 	\
 	proto/ip_frag.cpp \
@@ -158,7 +163,6 @@ libvma_la_SOURCES := \
 	util/instrumentation.cpp \
 	util/sys_vars.cpp \
 	util/agent.cpp \
-	util/dm_context.cpp \
 	\
 	libvma.c \
 	main.cpp \
@@ -169,6 +173,7 @@ libvma_la_SOURCES := \
 	dev/cq_mgr.h \
 	dev/cq_mgr_mlx5.h \
 	dev/cq_mgr_mp.h \
+	dev/dm_mgr.h \
 	dev/gro_mgr.h \
 	dev/ib_ctx_handler_collection.h \
 	dev/ib_ctx_handler.h \
@@ -180,17 +185,21 @@ libvma_la_SOURCES := \
 	dev/net_device_val.h \
 	dev/qp_mgr.h \
 	dev/qp_mgr_eth_mlx5.h \
+	dev/qp_mgr_eth_direct.h \
 	dev/qp_mgr_mp.h \
 	dev/rfs.h \
 	dev/rfs_mc.h \
 	dev/rfs_uc.h \
 	dev/rfs_uc_tcp_gro.h \
-	dev/ring_allocation_logic.h \
-	dev/ring_bond.h \
 	dev/ring.h \
+	dev/ring_bond.h \
+	dev/ring_slave.h \
 	dev/ring_simple.h \
+	dev/ring_tap.h \
 	dev/ring_eth_cb.h \
+	dev/ring_eth_direct.h \
 	dev/ring_profile.h \
+	dev/ring_allocation_logic.h \
 	dev/wqe_send_handler.h \
 	dev/wqe_send_ib_handler.h \
 	\
@@ -282,7 +291,6 @@ libvma_la_SOURCES := \
 	util/linked_unordered_map.h \
 	util/list.h \
 	util/sg_array.h \
-	util/dm_context.h \
 	util/sock_addr.h \
 	util/sysctl_reader.h \
 	util/sys_vars.h \

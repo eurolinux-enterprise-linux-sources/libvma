@@ -14,9 +14,11 @@ vmad_SOURCES = \
 	loop.c \
 	hash.c \
 	store.c \
+	flow.c \
 	message.c \
 	notify.c
 
 noinst_HEADERS = \
 	daemon.h \
-	hash.h
+	hash.h \
+	bitmap.h

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2001-2017 Mellanox Technologies, Ltd. All rights reserved.
+ * Copyright (c) 2001-2018 Mellanox Technologies, Ltd. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -59,7 +59,7 @@ public:
 	void		set(address_t const address, addrlen_t const len);
 
 	addrlen_t	get_addrlen() const { return m_len; };
-	address_t	get_address() const { return (const address_t)m_p_raw_address; };
+	address_t	get_address() const { return (address_t)m_p_raw_address; };
 
 	virtual bool 	compare(L2_address const& other) const;
 

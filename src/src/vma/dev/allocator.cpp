@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2001-2017 Mellanox Technologies, Ltd. All rights reserved.
+ * Copyright (c) 2001-2018 Mellanox Technologies, Ltd. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -36,34 +36,70 @@
 
 #define MODULE_NAME	"allocator"
 
-vma_allocator::vma_allocator() :
-		m_mr_list(NULL),
-		m_mr_list_len(0),
-		m_shmid(-1),
-		m_data_block(NULL) {
-	m_non_contig_access_mr = VMA_IBV_ACCESS_LOCAL_WRITE;
-#ifdef VMA_IBV_ACCESS_ALLOCATE_MR
-	m_is_contig_alloc = true;
-	m_contig_access_mr = VMA_IBV_ACCESS_LOCAL_WRITE |
-			     VMA_IBV_ACCESS_ALLOCATE_MR;
-#else
-	m_is_contig_alloc = false;
-	m_contig_access_mr = 0;
-#endif
+vma_allocator::vma_allocator()
+{
+	__log_info_dbg("");
 
+	m_shmid = -1;
+	m_length = 0;
+	m_data_block = NULL;
+	m_mem_alloc_type = safe_mce_sys().mem_alloc_type;
+
+	__log_info_dbg("Done");
+}
+
+vma_allocator::~vma_allocator()
+{
+	__log_info_dbg("");
+
+	// Unregister memory
+	deregister_memory();
+	if (!m_data_block) {
+		__log_info_dbg("m_data_block is null");
+		return;
+	}
+	switch (m_mem_alloc_type) {
+		case ALLOC_TYPE_CONTIG:
+			// freed as part of deregister_memory
+			break;
+		case ALLOC_TYPE_HUGEPAGES:
+			if (m_shmid > 0) {
+				if (shmdt(m_data_block) != 0) {
+					__log_info_err("shmem detach failure %m");
+				}
+			} else { // used mmap
+				if (munmap(m_data_block, m_length)) {
+					__log_info_err("failed freeing memory "
+							"with munmap errno "
+							"%d", errno);
+				}
+			}
+			break;
+		case ALLOC_TYPE_ANON:
+			free(m_data_block);
+			break;
+		default:
+			__log_info_err("Unknown memory allocation type %d",
+					m_mem_alloc_type);
+			break;
+	}
+	__log_info_dbg("Done");
 }
 
 void* vma_allocator::alloc_and_reg_mr(size_t size, ib_ctx_handler *p_ib_ctx_h)
 {
-	switch (safe_mce_sys().mem_alloc_type) {
+	uint64_t access = VMA_IBV_ACCESS_LOCAL_WRITE;
+
+	switch (m_mem_alloc_type) {
 	case ALLOC_TYPE_HUGEPAGES:
 		if (!hugetlb_alloc(size)) {
 			__log_info_dbg("Failed allocating huge pages, "
-				       "falling back to contiguous pages");
+				       "falling back to another memory allocation method");
 		}
 		else {
 			__log_info_dbg("Huge pages allocation passed successfully");
-			if (!register_memory(size, p_ib_ctx_h, m_non_contig_access_mr)) {
+			m_mem_alloc_type = ALLOC_TYPE_HUGEPAGES;
+			if (!register_memory(size, p_ib_ctx_h, access)) {
 				__log_info_dbg("failed registering huge pages data memory block");
 				throw_vma_exception("failed registering huge pages data memory"
 						" block");
@@ -72,79 +108,116 @@ void* vma_allocator::alloc_and_reg_mr(size_t size, ib_ctx_handler *p_ib_ctx_h)
 		}
 	// fallthrough
 	case ALLOC_TYPE_CONTIG:
-		if (m_is_contig_alloc) {
-			if (!register_memory(size, p_ib_ctx_h, m_contig_access_mr)) {
+#ifdef VMA_IBV_ACCESS_ALLOCATE_MR
+		if (mce_sys_var::HYPER_MSHV != safe_mce_sys().hypervisor) {
+			if (!register_memory(size, p_ib_ctx_h, (access | VMA_IBV_ACCESS_ALLOCATE_MR))) {
 				__log_info_dbg("Failed allocating contiguous pages");
 			}
 			else {
 				__log_info_dbg("Contiguous pages allocation passed successfully");
+				m_mem_alloc_type = ALLOC_TYPE_CONTIG;
 				break;
 			}
 		}
+#endif
 	// fallthrough
 	case ALLOC_TYPE_ANON:
 	default:
 		__log_info_dbg("allocating memory using malloc()");
-		m_is_contig_alloc = false;
-		m_data_block = malloc(size);
-		BULLSEYE_EXCLUDE_BLOCK_START
-		if (m_data_block == NULL) {
-			__log_info_dbg("failed allocating data memory block "
-					"(size=%d Kbytes) (errno=%d %m)", size/1024, errno);
-			throw_vma_exception("failed allocating data memory block");
-		}
-		BULLSEYE_EXCLUDE_BLOCK_END
-		if (!register_memory(size, p_ib_ctx_h, m_non_contig_access_mr)) {
+		align_simple_malloc(size); // if fail will raise exception
+		m_mem_alloc_type = ALLOC_TYPE_ANON;
+		if (!register_memory(size, p_ib_ctx_h, access)) {
 			__log_info_dbg("failed registering data memory block");
 			throw_vma_exception("failed registering data memory block");
 		}
 		break;
 	}
-	__log_info_dbg("allocated memory at %p, size %zd", m_data_block, size);
+	__log_info_dbg("allocated memory using type: %d at %p, size %zd",
+			m_mem_alloc_type, m_data_block, size);
+
 	return m_data_block;
+}
+
+ibv_mr* vma_allocator::find_ibv_mr_by_ib_ctx(ib_ctx_handler *p_ib_ctx_h) const
+{
+	lkey_map_ib_ctx_map_t::const_iterator iter = m_lkey_map_ib_ctx.find(p_ib_ctx_h);
+	if (iter != m_lkey_map_ib_ctx.end()) {
+		return p_ib_ctx_h->get_mem_reg(iter->second);
+	}
+
+	return NULL;
 }
 
 uint32_t vma_allocator::find_lkey_by_ib_ctx(ib_ctx_handler *p_ib_ctx_h) const
 {
-	ibv_device* dev = p_ib_ctx_h->get_ibv_device();
-	for (size_t i = 0; i < m_mr_list_len; ++i) {
-		if (dev == m_mr_list[i]->context->device) {
-			return m_mr_list[i]->lkey;
-		}
+	lkey_map_ib_ctx_map_t::const_iterator iter = m_lkey_map_ib_ctx.find(p_ib_ctx_h);
+	if (iter != m_lkey_map_ib_ctx.end()) {
+		return iter->second;
 	}
-	return 0;
+
+	return (uint32_t)(-1);
 }
 
 bool vma_allocator::hugetlb_alloc(size_t sz_bytes)
 {
-	size_t hugepagemask = 4 * 1024 * 1024 - 1;
-	sz_bytes = (sz_bytes + hugepagemask) & (~hugepagemask);
+	const size_t hugepagemask = 4 * 1024 * 1024 - 1;
 
-	__log_info_dbg("Allocating %zd bytes in huge tlb", sz_bytes);
+	m_length = (sz_bytes + hugepagemask) & (~hugepagemask);
+
+	if (hugetlb_mmap_alloc()) {
+		return true;
+	}
+	if (hugetlb_sysv_alloc()) {
+		return true;
+	}
+
+	VLOG_PRINTF_ONCE_THEN_DEBUG(VLOG_WARNING, "**************************************************************\n");
+	VLOG_PRINTF_ONCE_THEN_DEBUG(VLOG_WARNING, "* NO IMMEDIATE ACTION NEEDED!                                 \n");
+	VLOG_PRINTF_ONCE_THEN_DEBUG(VLOG_WARNING, "* Not enough hugepage resources for VMA memory allocation.    \n");
+	VLOG_PRINTF_ONCE_THEN_DEBUG(VLOG_WARNING, "* VMA will continue working with regular memory allocation.   \n");
+	VLOG_PRINTF_ONCE_THEN_DEBUG(VLOG_INFO, "   * Optional:                                                   \n");
+	VLOG_PRINTF_ONCE_THEN_DEBUG(VLOG_INFO, "   *   1. Switch to a different memory allocation type           \n");
+	VLOG_PRINTF_ONCE_THEN_DEBUG(VLOG_INFO, "   *      (%s!= %d)                                              \n",
+			SYS_VAR_MEM_ALLOC_TYPE, ALLOC_TYPE_HUGEPAGES);
+	VLOG_PRINTF_ONCE_THEN_DEBUG(VLOG_INFO, "   *   2. Restart process after increasing the number of         \n");
+	VLOG_PRINTF_ONCE_THEN_DEBUG(VLOG_INFO, "   *      hugepages resources in the system:                     \n");
+	VLOG_PRINTF_ONCE_THEN_DEBUG(VLOG_INFO, "   *      \"echo 1000000000 > /proc/sys/kernel/shmmax\"          \n");
+	VLOG_PRINTF_ONCE_THEN_DEBUG(VLOG_INFO, "   *      \"echo 800 > /proc/sys/vm/nr_hugepages\"               \n");
+	VLOG_PRINTF_ONCE_THEN_DEBUG(VLOG_WARNING, "* Please refer to the memory allocation section in the VMA's  \n");
+	VLOG_PRINTF_ONCE_THEN_DEBUG(VLOG_WARNING, "* User Manual for more information                            \n");
+	VLOG_PRINTF_ONCE_THEN_DEBUG(VLOG_WARNING, "**************************************************************\n");
+	return false;
+}
+
+bool vma_allocator::hugetlb_mmap_alloc()
+{
+#ifdef MAP_HUGETLB
+	__log_info_dbg("Allocating %zd bytes in huge tlb using mmap", m_length);
+
+	m_data_block = mmap(NULL, m_length,
+			PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS |
+			MAP_POPULATE | MAP_HUGETLB, -1, 0);
+	if (m_data_block == MAP_FAILED) {
+		__log_info_dbg("failed allocating %zd using mmap %d", m_length,
+				errno);
+		m_data_block = NULL;
+		return false;
+	}
+	return true;
+#else
+	return false;
+#endif
+}
+
+
+bool vma_allocator::hugetlb_sysv_alloc()
+{
+	__log_info_dbg("Allocating %zd bytes in huge tlb with shmget", m_length);
 
 	// allocate memory
-	m_shmid = shmget(IPC_PRIVATE, sz_bytes,
+	m_shmid = shmget(IPC_PRIVATE, m_length,
 			SHM_HUGETLB | IPC_CREAT | SHM_R | SHM_W);
 	if (m_shmid < 0) {
-
-		// Stop trying to use HugePage if failed even once
-		safe_mce_sys().mem_alloc_type = ALLOC_TYPE_CONTIG;
-
-		vlog_printf(VLOG_WARNING, "**************************************************************\n");
-		vlog_printf(VLOG_WARNING, "* NO IMMEDIATE ACTION NEEDED!                                 \n");
-		vlog_printf(VLOG_WARNING, "* Not enough hugepage resources for VMA memory allocation.    \n");
-		vlog_printf(VLOG_WARNING, "* VMA will continue working with regular memory allocation.   \n");
-		vlog_printf(VLOG_INFO, "   * Optional:                                                   \n");
-		vlog_printf(VLOG_INFO, "   *   1. Switch to a different memory allocation type           \n");
-		vlog_printf(VLOG_INFO, "   *      (%s!= %d)                                              \n",
-				SYS_VAR_MEM_ALLOC_TYPE, ALLOC_TYPE_HUGEPAGES);
-		vlog_printf(VLOG_INFO, "   *   2. Restart process after increasing the number of         \n");
-		vlog_printf(VLOG_INFO, "   *      hugepages resources in the system:                     \n");
-		vlog_printf(VLOG_INFO, "   *      \"echo 1000000000 > /proc/sys/kernel/shmmax\"          \n");
-		vlog_printf(VLOG_INFO, "   *      \"echo 800 > /proc/sys/vm/nr_hugepages\"               \n");
-		vlog_printf(VLOG_WARNING, "* Please refer to the memory allocation section in the VMA's  \n");
-		vlog_printf(VLOG_WARNING, "* User Manual for more information                            \n");
-		vlog_printf(VLOG_WARNING, "***************************************************************\n");
 		return false;
 	}
 
@@ -167,7 +240,7 @@ bool vma_allocator::hugetlb_alloc(size_t sz_bytes)
 
 	// We want to determine now that we can lock it. Note: it was claimed
 	// that without actual mlock, linux might be buggy on this with huge-pages
-	int rc = mlock(m_data_block, sz_bytes);
+	int rc = mlock(m_data_block, m_length);
 	if (rc!=0) {
 		__log_info_warn("mlock of shared memory failure (errno=%d %m)", errno);
 		if (shmdt(m_data_block) != 0) {
@@ -181,76 +254,122 @@ bool vma_allocator::hugetlb_alloc(size_t sz_bytes)
 	return true;
 }
 
+void vma_allocator::align_simple_malloc(size_t sz_bytes)
+{
+	int ret = 0;
+	long page_size = sysconf(_SC_PAGESIZE);
+
+	if (page_size > 0) {
+		m_length = (sz_bytes + page_size - 1) & (~page_size - 1);
+		ret = posix_memalign(&m_data_block, page_size, m_length);
+		if (!ret) {
+			__log_info_dbg("allocated %zd aligned memory at %p",
+					m_length, m_data_block);
+			return;
+		}
+	}
+	__log_info_dbg("failed allocating memory with posix_memalign size %zd "
+			"returned %d (errno=%d %m) ", m_length, ret, errno);
+
+	m_length = sz_bytes;
+	m_data_block = malloc(sz_bytes);
+
+	if (m_data_block == NULL) {
+		__log_info_dbg("failed allocating data memory block "
+				"(size=%d bytes) (errno=%d %m)", sz_bytes, errno);
+		throw_vma_exception("failed allocating data memory block");
+	}
+	__log_info_dbg("allocated memory using malloc()");
+}
+
 bool vma_allocator::register_memory(size_t size, ib_ctx_handler *p_ib_ctx_h,
 				    uint64_t access)
 {
+	ib_context_map_t *ib_ctx_map = NULL;
+	ib_ctx_handler *p_ib_ctx_h_ref = p_ib_ctx_h;
+	uint32_t lkey = (uint32_t)(-1);
 	bool failed = false;
-	if (p_ib_ctx_h) {
-		m_mr_list = new ibv_mr*[1];
-		m_mr_list[0] = p_ib_ctx_h->mem_reg(m_data_block, size, access);
-		BULLSEYE_EXCLUDE_BLOCK_START
-		if (m_mr_list[0] == NULL) {
-			failed = true;
-		} else {
-			m_mr_list_len = 1;
-		}
-		BULLSEYE_EXCLUDE_BLOCK_END
-	} else {
-		size_t dev_num = g_p_ib_ctx_handler_collection->get_num_devices();
-		m_mr_list = new ibv_mr*[dev_num];
 
-		BULLSEYE_EXCLUDE_BLOCK_START
-		if ((m_mr_list_len = g_p_ib_ctx_handler_collection->mem_reg_on_all_devices(m_data_block,
-				size, m_mr_list, dev_num, access)) != dev_num) {
-			failed = true;
+	ib_ctx_map = g_p_ib_ctx_handler_collection->get_ib_cxt_list();
+	if (ib_ctx_map) {
+		ib_context_map_t::iterator iter;
+
+		for (iter = ib_ctx_map->begin(); iter != ib_ctx_map->end(); iter++) {
+			p_ib_ctx_h = iter->second;
+			if (p_ib_ctx_h_ref && p_ib_ctx_h != p_ib_ctx_h_ref) {
+				continue;
+			}
+			lkey = p_ib_ctx_h->mem_reg(m_data_block, size, access);
+			if (lkey == (uint32_t)(-1)) {
+				__log_info_warn("Failure during memory registration on dev: %s addr=%p length=%d",
+						p_ib_ctx_h->get_ibname(), m_data_block, size);
+				failed = true;
+				break;
+			} else {
+				m_lkey_map_ib_ctx[p_ib_ctx_h] = lkey;
+				if (NULL == m_data_block) {
+					m_data_block = p_ib_ctx_h->get_mem_reg(lkey)->addr;
+				}
+				errno = 0; //ibv_reg_mr() set errno=12 despite successful returning
+#ifdef VMA_IBV_ACCESS_ALLOCATE_MR
+				if ((access & VMA_IBV_ACCESS_ALLOCATE_MR) != 0) { // contig pages mode
+					// When using 'IBV_ACCESS_ALLOCATE_MR', ibv_reg_mr will return a pointer that its 'addr' field will hold the address of the allocated memory.
+					// Second registration and above is done using 'IBV_ACCESS_LOCAL_WRITE' and the 'addr' we received from the first registration.
+					access &= ~VMA_IBV_ACCESS_ALLOCATE_MR;
+				}
+#endif
+				__log_info_dbg("Registered memory on dev: %s addr=%p length=%d",
+						p_ib_ctx_h->get_ibname(), m_data_block, size);
+			}
+			if (p_ib_ctx_h == p_ib_ctx_h_ref) {
+				break;
+			}
 		}
-		BULLSEYE_EXCLUDE_BLOCK_END
 	}
+
+	/* Possible cases:
+	 * 1. no IB device: it is not possible to register memory
+	 *  - return w/o error
+	 * 2. p_ib_ctx_h is null: try to register on all IB devices
+	 *  - fatal return if at least one IB device can not register memory
+	 *  - return w/o error in case no issue is observed
+	 * 3. p_ib_ctx is defined: try to register on specific device
+	 *  - fatal return if device is found and registration fails
+	 *  - return w/o error in case no issue is observed or device is not found
+	 */
 	if (failed) {
+		__log_info_warn("Failed registering memory, This might happen "
+				"due to low MTT entries. Please refer to README.txt "
+				"for more info");
 		if (m_data_block) {
-			__log_info_warn("Failed registering memory, This might happen "
-					"due to low MTT entries. Please refer to README.txt "
-					"for more info");
 			__log_info_dbg("Failed registering memory block with device "
 					"(ptr=%p size=%ld%s) (errno=%d %m)",
 					m_data_block, size, errno);
-			throw_vma_exception("Failed registering memory");
 		}
-		__log_info_warn("Failed allocating or registering memory in "
-				"contiguous mode. Please refer to README.txt for more "
-				"info");
-		return false;
+		throw_vma_exception("Failed registering memory");
 	}
-	if (!m_data_block) { // contig pages mode
-		m_data_block = m_mr_list[0]->addr;
-		if (!m_data_block) {
-			__log_info_dbg("Failed registering memory, check that OFED is "
-					"loaded successfully");
-			throw_vma_exception("Failed registering memory");
-		}
-	}
+
 	return true;
 }
 
-vma_allocator::~vma_allocator() {
-	// Unregister memory
-	for (size_t i = 0; i < m_mr_list_len; ++i) {
-		ib_ctx_handler* p_ib_ctx_handler =
-				g_p_ib_ctx_handler_collection->get_ib_ctx(m_mr_list[i]->context);
-		p_ib_ctx_handler->mem_dereg(m_mr_list[i]);
-	}
-	delete[] m_mr_list;
-	// Release memory
-	if (m_shmid >= 0) { // Huge pages mode
-		BULLSEYE_EXCLUDE_BLOCK_START
-		if (m_data_block && (shmdt(m_data_block) != 0)) {
-			__log_info_err("shmem detach failure %m");
-		}
-		BULLSEYE_EXCLUDE_BLOCK_END
-	// in contig mode 'ibv_dereg_mr' will free all allocates resources
-	} else if (!m_is_contig_alloc) {
-		if (m_data_block)
-			free(m_data_block);
-	}
-}
+void vma_allocator::deregister_memory()
+{
+	ib_ctx_handler *p_ib_ctx_h = NULL;
+	ib_context_map_t *ib_ctx_map = NULL;
+	uint32_t lkey = (uint32_t)(-1);
 
+	ib_ctx_map = g_p_ib_ctx_handler_collection->get_ib_cxt_list();
+	if (ib_ctx_map) {
+		ib_context_map_t::iterator iter;
+
+		for (iter = ib_ctx_map->begin(); iter != ib_ctx_map->end(); iter++) {
+			p_ib_ctx_h = iter->second;
+			lkey = find_lkey_by_ib_ctx(p_ib_ctx_h);
+			if (lkey != (uint32_t)(-1)) {
+				p_ib_ctx_h->mem_dereg(lkey);
+				m_lkey_map_ib_ctx.erase(p_ib_ctx_h);
+			}
+		}
+	}
+	m_lkey_map_ib_ctx.clear();
+}

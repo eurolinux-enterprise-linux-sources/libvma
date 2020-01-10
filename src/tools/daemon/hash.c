@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2001-2017 Mellanox Technologies, Ltd. All rights reserved.
+ * Copyright (c) 2001-2018 Mellanox Technologies, Ltd. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -61,7 +61,7 @@ struct hash_object {
 	hash_freefunc_t free;            /**< free function */
 };
 
-static struct hash_element* hash_find(hash_t ht, hash_key_t key);
+static struct hash_element* hash_find(hash_t ht, hash_key_t key, int flag);
 static int check_prime(int value);
 
 
@@ -135,7 +135,7 @@ void *hash_get(hash_t ht, hash_key_t key)
 	if (ht) {
 		struct hash_element *entry = NULL;
 
-		entry = hash_find(ht, key);
+		entry = hash_find(ht, key, 0);
 		if (entry) {
 			return entry->value;
 		}
@@ -160,14 +160,21 @@ void *hash_enum(hash_t ht, size_t index)
 
 void *hash_put(hash_t ht, hash_key_t key, void *value)
 {
-	if (ht) {
+	if (ht && (ht->count < ht->size)) {
 		struct hash_element *entry = NULL;
 
-		entry = hash_find(ht, key);
+		entry = hash_find(ht, key, 0);
+		if (NULL == entry) {
+			entry = hash_find(ht, key, 1);
+		}
 		if (entry) {
 			if (ht->free && entry->value) {
 				ht->free(entry->value);
 			}
+			if (entry->key == HASH_KEY_INVALID) {
+				ht->count++;
+			}
+			entry->key = key;
 			entry->value = value;
 			return value;
 		}
@@ -181,37 +188,47 @@ void hash_del(hash_t ht, hash_key_t key)
 	if (ht) {
 		struct hash_element *entry = NULL;
 
-		entry = hash_find(ht, key);
+		entry = hash_find(ht, key, 0);
 		if (entry) {
 			if (ht->free && entry->value) {
 				ht->free(entry->value);
 			}
+			if (entry->key != HASH_KEY_INVALID) {
+				ht->count--;
+			}
 			entry->key = HASH_KEY_INVALID;
 			entry->value = NULL;
-			ht->count--;
 		}
 	}
 }
 
-static struct hash_element* hash_find(hash_t ht, hash_key_t key)
+/* hash_find():
+ *
+ * Find a place (hash element) in the hash related key or
+ * new element.
+ * @param ht - point to hash object
+ * @param key - key identified data
+ * @param flag - 1 - add new, 0 - find existing
+ * @return hash element or NULL in case there is no place.
+ */
+static struct hash_element* hash_find(hash_t ht, hash_key_t key, int flag)
 {
 	struct hash_element *entry = NULL;
 	int attempts = 0;
 	int idx = 0;
+	hash_key_t expect_key;
 
 	if (ht->last && ht->last->key == key)
 		return ht->last;
+
+	expect_key = (flag ? HASH_KEY_INVALID : key);
 
 	idx = key % ht->size;
 
 	do {
 		entry = &(ht->hash_table[idx]);
 
-		if ((ht->count < ht->size) &&
-			(entry->key == HASH_KEY_INVALID)) {
-			entry->key = key;
-			entry->value = NULL;
-			ht->count++;
+		if (entry->key == expect_key) {
 			break;
 		} else {
 			if (attempts >= (ht->size - 1)) {
@@ -221,7 +238,7 @@ static struct hash_element* hash_find(hash_t ht, hash_key_t key)
 			attempts++;
 			idx = (idx + 1) % ht->size;
 		}
-	} while (entry->key != key);
+	} while (1);
 
 	ht->last = (entry ? entry : ht->last);
 

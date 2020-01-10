@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2001-2017 Mellanox Technologies, Ltd. All rights reserved.
+ * Copyright (c) 2001-2018 Mellanox Technologies, Ltd. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -32,7 +32,7 @@
 
 #include "config.h"
 #include "instrumentation.h"
-#ifdef DEFINED_VMAPOLL
+#ifdef DEFINED_SOCKETXTREME
 #include <string.h>
 
 #ifdef RDTSC_MEASURE
@@ -91,7 +91,7 @@ void print_rdtsc_summary()
 
 
 #endif //RDTSC_MEASURE
-#endif // DEFINED_VMAPOLL
+#endif // DEFINED_SOCKETXTREME
 
 #ifdef VMA_TIME_MEASURE
 

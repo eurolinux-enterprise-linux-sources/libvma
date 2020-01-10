@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2001-2017 Mellanox Technologies, Ltd. All rights reserved.
+ * Copyright (c) 2001-2018 Mellanox Technologies, Ltd. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -193,9 +193,8 @@ public:
 	
 	virtual int free_packets(struct vma_packet_t *pkts, size_t count);
 
-#ifdef DEFINED_VMAPOLL
+	/* This function is used for socketxtreme mode */
 	virtual	int free_buffs(uint16_t len);
-#endif // DEFINED_VMAPOLL	
 
 	virtual int get_fd( ) const { return m_fd; };
 
@@ -250,7 +249,8 @@ public:
 	virtual int get_rings_num() {return 0;}
 	virtual bool check_rings() {return false;}
 	virtual int* get_rings_fds(int& res_length) { res_length=0; return NULL;}
-
+	virtual int get_socket_network_ptr(void *ptr, uint16_t &len) { NOT_IN_USE(ptr);NOT_IN_USE(len);errno=ENOSYS;return -1;};
+	virtual int get_socket_tx_ring_fd(struct sockaddr *to, socklen_t tolen) { ;NOT_IN_USE(to);NOT_IN_USE(tolen);errno=ENOSYS; return -1; }
 protected:
 	void notify_epoll_context(uint32_t events);
 	void notify_epoll_context_add_ring(ring* ring);

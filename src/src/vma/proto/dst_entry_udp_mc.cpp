@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2001-2017 Mellanox Technologies, Ltd. All rights reserved.
+ * Copyright (c) 2001-2018 Mellanox Technologies, Ltd. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -47,8 +47,8 @@
 dst_entry_udp_mc::dst_entry_udp_mc(in_addr_t dst_ip, uint16_t dst_port,
 				   uint16_t src_port, in_addr_t tx_if_ip,
 				   bool mc_b_loopback, uint8_t mc_ttl,
-				   int owner_fd, resource_allocation_key &ring_alloc_logic):
-					dst_entry_udp(dst_ip, dst_port, src_port, owner_fd, ring_alloc_logic),
+				   socket_data &sock_data, resource_allocation_key &ring_alloc_logic):
+					dst_entry_udp(dst_ip, dst_port, src_port, sock_data, ring_alloc_logic),
 					m_mc_tx_if_ip(tx_if_ip), m_b_mc_loopback_enabled(mc_b_loopback)
 {
 	m_ttl = mc_ttl;
@@ -115,7 +115,7 @@ bool dst_entry_udp_mc::resolve_net_dev(bool is_connect)
 		}
 		if (m_p_net_dev_entry) {
 			m_p_net_dev_entry->get_val(m_p_net_dev_val);
-			if (m_p_net_dev_val && m_p_net_dev_val->is_valid()) {
+			if (m_p_net_dev_val) {
 				ret_val = alloc_transport_dep_res();
 			}
 			else {

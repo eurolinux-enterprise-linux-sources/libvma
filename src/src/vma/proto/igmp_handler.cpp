@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2001-2017 Mellanox Technologies, Ltd. All rights reserved.
+ * Copyright (c) 2001-2018 Mellanox Technologies, Ltd. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -215,7 +215,7 @@ bool igmp_handler::tx_igmp_report()
 	m_p_send_igmp_wqe.wr_id = (uintptr_t)p_mem_buf_desc;
 
 	igmp_hdlr_logdbg("Sending igmp report");
-	m_p_ring->send_ring_buffer(m_id, &m_p_send_igmp_wqe, VMA_TX_PACKET_L3_CSUM);
+	m_p_ring->send_ring_buffer(m_id, &m_p_send_igmp_wqe, (vma_wr_tx_packet_attr)0);
 	return true;
 }
 

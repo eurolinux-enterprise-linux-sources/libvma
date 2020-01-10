@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2001-2017 Mellanox Technologies, Ltd. All rights reserved.
+ * Copyright (c) 2001-2018 Mellanox Technologies, Ltd. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -49,6 +49,9 @@
 #include "vma/sock/fd_collection.h"
 #include "vma/event/event_handler_manager.h"
 #include "vma/dev/buffer_pool.h"
+#include "vma/dev/ring.h"
+#include "vma/dev/ring_slave.h"
+#include "vma/dev/ring_bond.h"
 #include "vma/dev/ring_simple.h"
 #include "vma/dev/ring_profile.h"
 #include "vma/proto/route_table_mgr.h"
@@ -84,6 +87,10 @@ enum {
 
 #ifndef SO_TIMESTAMPING
 #define SO_TIMESTAMPING		37
+#endif
+
+#ifndef SO_REUSEPORT
+#define SO_REUSEPORT		15
 #endif
 
 /* useful debugging macros */
@@ -299,7 +306,7 @@ inline int sockinfo_udp::rx_wait(bool blocking)
 				if (p_cq_ch_info) {
 					ring* p_ring = p_cq_ch_info->get_ring();
 					if (p_ring) {
-						p_ring->wait_for_notification_and_process_element(CQT_RX, fd, &poll_sn);
+						p_ring->wait_for_notification_and_process_element(fd, &poll_sn);
 					}
 				}
 			}
@@ -336,6 +343,7 @@ const char * setsockopt_so_opt_to_str(int opt)
 {
 	switch (opt) {
 	case SO_REUSEADDR: 		return "SO_REUSEADDR";
+	case SO_REUSEPORT: 		return "SO_REUSEPORT";
 	case SO_BROADCAST:	 	return "SO_BROADCAST";
 	case SO_RCVBUF:			return "SO_RCVBUF";
 	case SO_SNDBUF:			return "SO_SNDBUF";
@@ -387,12 +395,14 @@ sockinfo_udp::sockinfo_udp(int fd):
 	,m_b_rcvtstamp(false)
 	,m_b_rcvtstampns(false)
 	,m_n_tsing_flags(0)
+	,m_tos(0)
 	,m_n_sysvar_rx_poll_yield_loops(safe_mce_sys().rx_poll_yield_loops)
 	,m_n_sysvar_rx_udp_poll_os_ratio(safe_mce_sys().rx_udp_poll_os_ratio)
 	,m_n_sysvar_rx_ready_byte_min_limit(safe_mce_sys().rx_ready_byte_min_limit)
 	,m_n_sysvar_rx_cq_drain_rate_nsec(safe_mce_sys().rx_cq_drain_rate_nsec)
 	,m_n_sysvar_rx_delta_tsc_between_cq_polls(safe_mce_sys().rx_delta_tsc_between_cq_polls)
 	,m_reuseaddr(false)
+	,m_reuseport(false)
 	,m_sockopt_mapped(false)
 	,m_is_connected(false)
 	,m_multicast(false)
@@ -541,6 +551,7 @@ int sockinfo_udp::connect(const struct sockaddr *__to, socklen_t __tolen)
 	// Dissolve the current connection setting if it's not AF_INET
 	// (this also support the default dissolve by AF_UNSPEC)
 	if (connect_to.get_sa_family() == AF_INET) {
+		m_connected.set_sa_family(AF_INET);
 		m_connected.set_in_addr(INADDR_ANY);
 		m_p_socket_stats->connected_ip = m_connected.get_in_addr();
 
@@ -607,17 +618,18 @@ int sockinfo_udp::connect(const struct sockaddr *__to, socklen_t __tolen)
 			setPassthrough();
 			return 0;
 		}
-
+		socket_data data = { m_fd, m_tos, m_pcp};
 		// Create the new dst_entry
 		if (IN_MULTICAST_N(dst_ip)) {
 			m_p_connected_dst_entry = new dst_entry_udp_mc(dst_ip, dst_port, src_port,
 					m_mc_tx_if ? m_mc_tx_if : m_bound.get_in_addr(),
-							m_b_mc_tx_loop, m_n_mc_ttl, m_fd, m_ring_alloc_log_tx);
+							m_b_mc_tx_loop, m_n_mc_ttl, data, m_ring_alloc_log_tx);
 		}
 		else {
 			m_p_connected_dst_entry = new dst_entry_udp(dst_ip, dst_port,
-					src_port, m_fd, m_ring_alloc_log_tx);
+					src_port, data, m_ring_alloc_log_tx);
 		}
+
 		BULLSEYE_EXCLUDE_BLOCK_START
 		if (!m_p_connected_dst_entry) {
 			si_udp_logerr("Failed to create dst_entry(dst_ip:%s, dst_port:%d, src_port:%d)", NIPQUAD(dst_ip), ntohs(dst_port), ntohs(src_port));
@@ -635,7 +647,7 @@ int sockinfo_udp::connect(const struct sockaddr *__to, socklen_t __tolen)
 		if (m_so_bindtodevice_ip) {
 			m_p_connected_dst_entry->set_so_bindtodevice_addr(m_so_bindtodevice_ip);
 		}
-
+		m_p_connected_dst_entry->prepare_to_send(m_so_ratelimit, false, true);
 		return 0;
 	}
 	return 0;
@@ -764,14 +776,9 @@ int sockinfo_udp::setsockopt(int __level, int __optname, __const void *__optval,
 	if (unlikely(m_b_closed) || unlikely(g_b_exit))
 		return orig_os_api.setsockopt(m_fd, __level, __optname, __optval, __optlen);
 
-#ifdef DEFINED_VMAPOLL
-	/* Process VMA specific options only at the moment
-	 * VMA option does not require additional processing after return
-	 */
 	if (0 == sockinfo::setsockopt(__level, __optname, __optval, __optlen)) {
 		return 0;
 	}
-#endif // DEFINED_VMAPOLL
 
 	auto_unlocker lock_tx(m_lock_snd);
 	auto_unlocker lock_rx(m_lock_rcv);
@@ -784,6 +791,11 @@ int sockinfo_udp::setsockopt(int __level, int __optname, __const void *__optval,
 			switch (__optname) {
 
 			case SO_REUSEADDR:
+				set_reuseaddr(*(bool*)__optval);
+				si_udp_logdbg("SOL_SOCKET, %s=%s", setsockopt_so_opt_to_str(__optname), (*(bool*)__optval ? "true" : "false"));
+				break;
+
+			case SO_REUSEPORT:
 				set_reuseaddr(*(bool*)__optval);
 				si_udp_logdbg("SOL_SOCKET, %s=%s", setsockopt_so_opt_to_str(__optname), (*(bool*)__optval ? "true" : "false"));
 				break;
@@ -917,9 +929,23 @@ int sockinfo_udp::setsockopt(int __level, int __optname, __const void *__optval,
 				break;
 			case SO_MAX_PACING_RATE:
 				if (__optval) {
-					uint32_t val = *(uint32_t *)__optval; // value is in bytes per second
+					struct vma_rate_limit_t val;
+
+					if (sizeof(struct vma_rate_limit_t) == __optlen) {
+						val = *(struct vma_rate_limit_t*)__optval; // value is in Kbits per second
+					} else if (sizeof(uint32_t) == __optlen) {
+						// value is in bytes per second
+						val.rate = BYTE_TO_KB(*(uint32_t*)__optval); // value is in bytes per second
+						val.max_burst_sz = 0;
+						val.typical_pkt_sz = 0;
+					} else {
+						si_udp_logdbg("SOL_SOCKET, %s=\"???\" - bad length got %d",
+							      setsockopt_so_opt_to_str(__optname), __optlen);
+						return -1;
+					}
+
 					if (modify_ratelimit(m_p_connected_dst_entry, val) < 0) {
-						si_udp_logdbg("error setting setsockopt SO_MAX_PACING_RATE for connected dst_entry %p: %d bytes/second ", m_p_connected_dst_entry, val);
+						si_udp_logdbg("error setting setsockopt SO_MAX_PACING_RATE for connected dst_entry %p: %d bytes/second ", m_p_connected_dst_entry, val.rate);
 
 						// Do not fall back to kernel in this case.
 						// The kernel's support for packet pacing is of no consequence
@@ -936,7 +962,7 @@ int sockinfo_udp::setsockopt(int __level, int __optname, __const void *__optval,
 						if (modify_ratelimit(p_dst_entry, val) < 0) {
 							si_udp_logdbg("error setting setsockopt SO_MAX_PACING_RATE "
 								      "for dst_entry %p: %d bytes/second ",
-								      p_dst_entry, val);
+								      p_dst_entry, val.rate);
 							dst_entries_not_modified++;
 						}
 					}
@@ -953,6 +979,9 @@ int sockinfo_udp::setsockopt(int __level, int __optname, __const void *__optval,
 					si_udp_logdbg("SOL_SOCKET, %s=\"???\" - NOT HANDLED, optval == NULL", setsockopt_so_opt_to_str(__optname));
 				}
 				break;
+			case SO_PRIORITY:
+				set_sockopt_prio(__optval, __optlen);
+			break;
 			default:
 				si_udp_logdbg("SOL_SOCKET, optname=%s (%d)", setsockopt_so_opt_to_str(__optname), __optname);
 				supported = false;
@@ -967,28 +996,26 @@ int sockinfo_udp::setsockopt(int __level, int __optname, __const void *__optval,
 
 			case IP_MULTICAST_IF:
 				{
-					//XXX -check udp tx vma/os
+					struct ip_mreqn mreqn;
+					memset(&mreqn, 0, sizeof(mreqn));
+
 					if (!__optval || __optlen < sizeof(struct in_addr)) {
 						si_udp_loginfo("IPPROTO_IP, %s=\"???\", optlen:%d", setsockopt_ip_opt_to_str(__optname), (int)__optlen);
 						break;
 					}
 
-					struct ip_mreqn mreqn;
-
 					if (__optlen >= sizeof(struct ip_mreqn)) {
-						mreqn = *(struct ip_mreqn*)__optval;
+						memcpy(&mreqn, __optval, sizeof(struct ip_mreqn));
+					} else if (__optlen >= sizeof(struct ip_mreq)) {
+						memcpy(&mreqn, __optval, sizeof(struct ip_mreq));
 					} else {
-						memset(&mreqn, 0, sizeof(mreqn));
-						if (__optlen >= sizeof(struct in_addr)) {
-							mreqn.imr_address = *(struct in_addr*)__optval;
-						}
+						memcpy(&mreqn.imr_address, __optval, sizeof(struct in_addr));
 					}
 
 					if (mreqn.imr_ifindex) {
-						net_dev_lst_t* p_ndv_val_lst = g_p_net_device_table_mgr->get_net_device_val_lst_from_index(mreqn.imr_ifindex);
-						net_device_val* p_ndev = NULL;
-						if (p_ndv_val_lst && (p_ndev = dynamic_cast <net_device_val *>(*(p_ndv_val_lst->begin())))) {
-							mreqn.imr_address.s_addr = p_ndev->get_local_addr();
+						local_ip_list_t lip_offloaded_list = g_p_net_device_table_mgr->get_ip_list(mreqn.imr_ifindex);
+						if (!lip_offloaded_list.empty()) {
+							mreqn.imr_address.s_addr = lip_offloaded_list.front().local_addr;
 						} else {
 							struct sockaddr_in src_addr;
 							if (get_ipv4_from_ifindex(mreqn.imr_ifindex, &src_addr) == 0) {
@@ -1085,10 +1112,9 @@ int sockinfo_udp::setsockopt(int __level, int __optname, __const void *__optval,
 						if (__optlen >= sizeof(struct ip_mreqn)) {
 							struct ip_mreqn* p_mreqn = (struct ip_mreqn*)__optval;
 							if (p_mreqn->imr_ifindex) {
-								net_dev_lst_t* p_ndv_val_lst = g_p_net_device_table_mgr->get_net_device_val_lst_from_index(p_mreqn->imr_ifindex);
-								net_device_val* p_ndev = NULL;
-								if (p_ndv_val_lst && (p_ndev = dynamic_cast <net_device_val *>(*(p_ndv_val_lst->begin())))) {
-									mreqprm.imr_interface.s_addr = p_ndev->get_local_addr();
+								local_ip_list_t lip_offloaded_list = g_p_net_device_table_mgr->get_ip_list(p_mreqn->imr_ifindex);
+								if (!lip_offloaded_list.empty()) {
+									mreqprm.imr_interface.s_addr = lip_offloaded_list.front().local_addr;
 								} else {
 									struct sockaddr_in src_addr;
 									if (get_ipv4_from_ifindex(p_mreqn->imr_ifindex, &src_addr) == 0) {
@@ -1120,7 +1146,6 @@ int sockinfo_udp::setsockopt(int __level, int __optname, __const void *__optval,
 					if (INADDR_ANY == mc_if) {
 						in_addr_t dst_ip	= mc_grp;
 						in_addr_t src_ip	= 0;
-						uint8_t tos		= 0;
 
 						if ((!m_bound.is_anyaddr()) && (!m_bound.is_mc())) {
 							src_ip = m_bound.get_in_addr();
@@ -1128,8 +1153,8 @@ int sockinfo_udp::setsockopt(int __level, int __optname, __const void *__optval,
 							src_ip = m_so_bindtodevice_ip;
 						}
 						// Find local if for this MC ADD/DROP
-						struct route_result res;
-						g_p_route_table_mgr->route_resolve(route_rule_table_key(dst_ip, src_ip, tos), res);
+						route_result res;
+						g_p_route_table_mgr->route_resolve(route_rule_table_key(dst_ip, src_ip, m_tos), res);
 						mc_if = res.p_src;
 						si_udp_logdbg("IPPROTO_IP, %s=%d.%d.%d.%d, mc_if:INADDR_ANY (resolved to: %d.%d.%d.%d)", setsockopt_ip_opt_to_str(__optname), NIPQUAD(mc_grp), NIPQUAD(mc_if));
 					}
@@ -1186,6 +1211,11 @@ int sockinfo_udp::setsockopt(int __level, int __optname, __const void *__optval,
 						m_b_pktinfo = true;
 					else
 						m_b_pktinfo = false;
+				}
+				break;
+			case IP_TOS:
+				if (__optlen <= sizeof(int)) {
+					m_tos =(uint8_t) *(int *)__optval;
 				}
 				break;
 			default:
@@ -1255,23 +1285,7 @@ int sockinfo_udp::setsockopt(int __level, int __optname, __const void *__optval,
 		}
 		break;
 	}
-
-	if (! supported) {
-		char buf[256];
-		snprintf(buf, sizeof(buf), "unimplemented setsockopt __level=%#x, __optname=%#x, [__optlen (%d) bytes of __optval=%.*s]", (unsigned)__level, (unsigned)__optname, __optlen, __optlen, (char*)__optval);
-		buf[ sizeof(buf)-1 ] = '\0';
-
-		VLOG_PRINTF_INFO(safe_mce_sys().exception_handling.get_log_severity(), "%s", buf);
-		int rc = handle_exception_flow();
-		switch (rc) {
-		case -1:
-			return rc;
-		case -2:
-			vma_throw_object_with_msg(vma_unsupported_api, buf);
-		}
-	}
-
-	return orig_os_api.setsockopt(m_fd, __level, __optname, __optval, __optlen);
+	return setsockopt_kernel(__level, __optname, __optval, __optlen, supported, false);
 }
 
 int sockinfo_udp::getsockopt(int __level, int __optname, void *__optval, socklen_t *__optlen)
@@ -1283,21 +1297,15 @@ int sockinfo_udp::getsockopt(int __level, int __optname, void *__optval, socklen
 	if (unlikely(m_b_closed) || unlikely(g_b_exit))
 		return ret;
 
-#ifdef DEFINED_VMAPOLL
-	/* Process VMA specific options only at the moment
-	 * VMA option does not require additional processing after return
-	 */
 	if (0 == sockinfo::getsockopt(__level, __optname, __optval, __optlen)) {
 		return 0;
 	}
-#endif // DEFINED_VMAPOLL	
 
 	auto_unlocker lock_tx(m_lock_snd);
 	auto_unlocker lock_rx(m_lock_rcv);
 
 	bool supported = true;
 	switch (__level) {
-
 	case SOL_SOCKET:
 		{
 			switch (__optname) {
@@ -1748,7 +1756,7 @@ int sockinfo_udp::rx_request_notification(uint64_t poll_sn)
 ssize_t sockinfo_udp::tx(const tx_call_t call_type, const iovec* p_iov, const ssize_t sz_iov,
 		     const int __flags /*=0*/, const struct sockaddr *__dst /*=NULL*/, const socklen_t __dstlen /*=0*/)
 {
-	int ret;
+	int ret = 0;
 	bool is_dummy = IS_DUMMY_PACKET(__flags);
 	dst_entry* p_dst_entry = m_p_connected_dst_entry; // Default for connected() socket but we'll update it on a specific sendTO(__to) call
 
@@ -1825,7 +1833,7 @@ ssize_t sockinfo_udp::tx(const tx_call_t call_type, const iovec* p_iov, const ss
 					}
 				}
 				in_port_t src_port = m_bound.get_in_port();
-
+				socket_data data = { m_fd, m_tos, m_pcp};
 				// Create the new dst_entry
 				if (dst.is_mc()) {
 					p_dst_entry = new dst_entry_udp_mc(
@@ -1835,7 +1843,7 @@ ssize_t sockinfo_udp::tx(const tx_call_t call_type, const iovec* p_iov, const ss
 							m_mc_tx_if ? m_mc_tx_if : m_bound.get_in_addr(),
 							m_b_mc_tx_loop,
 							m_n_mc_ttl,
-							m_fd,
+							data,
 							m_ring_alloc_log_tx);
 				}
 				else {
@@ -1843,7 +1851,7 @@ ssize_t sockinfo_udp::tx(const tx_call_t call_type, const iovec* p_iov, const ss
 							dst.get_in_addr(),
 							dst.get_in_port(),
 							src_port,
-							m_fd,
+							data,
 							m_ring_alloc_log_tx);
 				}
 				BULLSEYE_EXCLUDE_BLOCK_START
@@ -2118,25 +2126,30 @@ inline vma_recv_callback_retval_t sockinfo_udp::inspect_by_user_cb(mem_buf_desc_
 	return m_rx_callback(m_fd, nr_frags, iov, &pkt_info, m_rx_callback_context);
 }
 
-#ifdef DEFINED_VMAPOLL
+#ifdef DEFINED_SOCKETXTREME
 /* Update vma_completion with
- * VMA_POLL_PACKET related data
+ * VMA_SOCKETXTREME_PACKET related data
  */
 inline void sockinfo_udp::fill_completion(mem_buf_desc_t* p_desc)
 {
 	struct vma_completion_t *completion;
 
-	/* Try to process vma_poll() completion directly */
-	m_vma_poll_completion = m_p_rx_ring->get_comp();
+	/* Try to process socketxtreme_poll() completion directly */
+	m_socketxtreme_completion = m_p_rx_ring->get_comp();
 
-	if (m_vma_poll_completion) {
-		completion = m_vma_poll_completion;
+	if (m_socketxtreme_completion) {
+		completion = m_socketxtreme_completion;
 	} else {
 		completion = &m_ec.completion;
 	}
 
 	completion->packet.num_bufs = p_desc->rx.n_frags;
 	completion->packet.total_len = 0;
+	completion->src = p_desc->rx.src;
+
+	if (m_n_tsing_flags & SOF_TIMESTAMPING_RAW_HARDWARE) {
+		completion->packet.hw_timestamp = p_desc->rx.udp.hw_timestamp;
+	}
 
 	for(mem_buf_desc_t *tmp_p=p_desc; tmp_p; tmp_p=tmp_p->p_next_desc) {
 		completion->packet.total_len        += tmp_p->rx.sz_payload;
@@ -2145,16 +2158,17 @@ inline void sockinfo_udp::fill_completion(mem_buf_desc_t* p_desc)
 		completion->packet.buff_lst->payload = p_desc->rx.frag.iov_base;
 		completion->packet.buff_lst->len     = p_desc->rx.frag.iov_len;
 	}
-	completion->src = p_desc->rx.src;
-	NOTIFY_ON_EVENTS(this, VMA_POLL_PACKET);
 
-	m_vma_poll_completion = NULL;
-	m_vma_poll_last_buff_lst = NULL;
+	NOTIFY_ON_EVENTS(this, VMA_SOCKETXTREME_PACKET);
+
+	save_stats_rx_offload(completion->packet.total_len);
+	m_socketxtreme_completion = NULL;
+	m_socketxtreme_last_buff_lst = NULL;
 }
-#endif //DEFINED_VMAPOLL
+#endif //DEFINED_SOCKETXTREME
 
 /**
- *	Performs packet processing for NON-VMAPOLL cases and store packet
+ *	Performs packet processing for NON-SOCKETXTREME cases and store packet
  *	in ready queue.
  */
 inline void sockinfo_udp::update_ready(mem_buf_desc_t* p_desc, void* pv_fd_ready_array, vma_recv_callback_retval_t cb_ret)
@@ -2182,7 +2196,7 @@ inline void sockinfo_udp::update_ready(mem_buf_desc_t* p_desc, void* pv_fd_ready
 
 	// Add this fd to the ready fd list
 	/*
-	 * Note: No issue is expected in case vma_poll() usage because 'pv_fd_ready_array' is null
+	 * Note: No issue is expected in case socketxtreme_poll() usage because 'pv_fd_ready_array' is null
 	 * in such case and as a result update_fd_array() call means nothing
 	 */
 	io_mux_call::update_fd_array((fd_array_t*)pv_fd_ready_array, m_fd);
@@ -2242,10 +2256,10 @@ inline bool sockinfo_udp::rx_process_udp_packet_full(mem_buf_desc_t* p_desc, voi
 	//  to prevent race condition with the 'if( (--ref_count) <= 0)' in ib_comm_mgr
 	p_desc->inc_ref_count();
 
-#ifdef DEFINED_VMAPOLL
-	if (p_desc->rx.vma_polled) {
+#ifdef DEFINED_SOCKETXTREME
+	if (p_desc->rx.socketxtreme_polled) {
 		fill_completion(p_desc);
-		p_desc->rx.vma_polled = false;
+		p_desc->rx.socketxtreme_polled = false;
 	} else
 #endif
 	{
@@ -2275,10 +2289,10 @@ inline bool sockinfo_udp::rx_process_udp_packet_partial(mem_buf_desc_t* p_desc, 
 	//  to prevent race condition with the 'if( (--ref_count) <= 0)' in ib_comm_mgr
 	p_desc->inc_ref_count();
 
-#ifdef DEFINED_VMAPOLL
-	if (p_desc->rx.vma_polled) {
+#ifdef DEFINED_SOCKETXTREME
+	if (p_desc->rx.socketxtreme_polled) {
 		fill_completion(p_desc);
-		p_desc->rx.vma_polled = false;
+		p_desc->rx.socketxtreme_polled = false;
 	} else
 #endif
 	{
@@ -2500,7 +2514,6 @@ int sockinfo_udp::mc_change_membership(const mc_pending_pram *p_mc_pram)
 	if (mc_if == INADDR_ANY) {
 		in_addr_t dst_ip	= mc_grp;
 		in_addr_t src_ip	= 0;
-		uint8_t tos		= 0;
 		
 		if (!m_bound.is_anyaddr() && !m_bound.is_mc()) {
 			src_ip = m_bound.get_in_addr();
@@ -2509,7 +2522,7 @@ int sockinfo_udp::mc_change_membership(const mc_pending_pram *p_mc_pram)
 		}
 		// Find local if for this MC ADD/DROP
 		route_result res;
-		g_p_route_table_mgr->route_resolve(route_rule_table_key(dst_ip, src_ip, tos), res);
+		g_p_route_table_mgr->route_resolve(route_rule_table_key(dst_ip, src_ip, m_tos), res);
 		mc_if = res.p_src;
 	}
 
@@ -2634,26 +2647,6 @@ void sockinfo_udp::save_stats_threadid_tx()
 		m_p_socket_stats->threadid_last_tx = gettid();
 }
 
-#if _BullseyeCoverage
-    #pragma BullseyeCoverage off
-#endif
-void sockinfo_udp::save_stats_rx_offload(int bytes)
-{
-	if (bytes >= 0) {
-		m_p_socket_stats->counters.n_rx_bytes += bytes;
-		m_p_socket_stats->counters.n_rx_packets++;
-	}
-	else if (errno == EAGAIN) {
-		m_p_socket_stats->counters.n_rx_eagain++;
-	}
-	else {
-		m_p_socket_stats->counters.n_rx_errors++;
-	}
-}
-#if _BullseyeCoverage
-    #pragma BullseyeCoverage on
-#endif
-
 void sockinfo_udp::save_stats_tx_offload(int bytes, bool is_dummy)
 {
 	if (unlikely(is_dummy)) {
@@ -2758,6 +2751,39 @@ size_t sockinfo_udp::handle_msg_trunc(size_t total_rx, size_t payload_size, int 
 	} 
 
 	return total_rx;
+}
+
+int sockinfo_udp::get_socket_tx_ring_fd(struct sockaddr *to, socklen_t tolen)
+{
+	NOT_IN_USE(tolen);
+	si_udp_logfunc("get_socket_tx_ring_fd fd %d to %p tolen %d", m_fd, to ,tolen);
+
+	if (!to) {
+		si_udp_logdbg("got invalid to addr null for fd %d", m_fd);
+		errno = EINVAL;
+		return -1;
+	}
+	sock_addr dst(to);
+	ring *ring = NULL;
+
+	if (m_p_connected_dst_entry && m_connected == dst) {
+		ring = m_p_connected_dst_entry->get_ring();
+	} else {
+		dst_entry_map_t::iterator it = m_dst_entry_map.find(dst);
+		if (it != m_dst_entry_map.end()) {
+			ring = it->second->get_ring();
+		}
+	}
+	if (!ring) {
+		si_udp_logdbg("could not find TX ring for fd %d addr %s",
+				m_fd, dst.to_str());
+		errno = ENODATA;
+		return -1;
+	}
+	int res = ring->get_tx_channel_fd();
+	si_udp_logdbg("Returning TX ring fd %d for sock fd %d adrr %s",
+			res, m_fd, dst.to_str());
+	return res;
 }
 
 mem_buf_desc_t* sockinfo_udp::get_front_m_rx_pkt_ready_list(){
