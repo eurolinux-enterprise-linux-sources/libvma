@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2001-2016 Mellanox Technologies, Ltd. All rights reserved.
+ * Copyright (c) 2001-2017 Mellanox Technologies, Ltd. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -114,10 +114,10 @@ struct os_api {
 	int (*connect) (int __fd, const struct sockaddr *__to, socklen_t __tolen);
 	int (*listen) (int __fd, int __backlog);
 
-	int (*setsockopt) (int __fd, int __level, int __optname, __const void *__optval, socklen_t __optlen) throw (vma_error);
-	int (*getsockopt) (int __fd, int __level, int __optname, void *__optval, socklen_t *__optlen) throw (vma_error);
-	int (*fcntl) (int __fd, int __cmd, ...) throw (vma_error);
-	int (*ioctl) (int __fd, unsigned long int __request, ...) throw (vma_error);
+	int (*setsockopt) (int __fd, int __level, int __optname, __const void *__optval, socklen_t __optlen);
+	int (*getsockopt) (int __fd, int __level, int __optname, void *__optval, socklen_t *__optlen);
+	int (*fcntl) (int __fd, int __cmd, ...);
+	int (*ioctl) (int __fd, unsigned long int __request, ...);
 	int (*getsockname) (int __fd, struct sockaddr *__name,socklen_t *__namelen);
 	int (*getpeername) (int __fd, struct sockaddr *__name,socklen_t *__namelen);
 
@@ -172,7 +172,7 @@ extern iomux_stats_t* g_p_select_stats;
 extern iomux_stats_t* g_p_poll_stats;
 extern iomux_stats_t* g_p_epoll_stats;
 
-void do_global_ctors();
+int do_global_ctors();
 void reset_globals();
 void handle_close(int fd, bool cleanup = false, bool passthrough = false);
 

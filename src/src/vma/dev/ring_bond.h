@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2001-2016 Mellanox Technologies, Ltd. All rights reserved.
+ * Copyright (c) 2001-2017 Mellanox Technologies, Ltd. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -57,15 +57,21 @@ public:
 	virtual void		restart(ring_resource_creation_info_t* p_ring_info);
 	virtual mem_buf_desc_t* mem_buf_tx_get(ring_user_id_t id, bool b_block, int n_num_mem_bufs = 1);
 	virtual int		mem_buf_tx_release(mem_buf_desc_t* p_mem_buf_desc_list, bool b_accounting, bool trylock = false);
-	virtual void		inc_ring_stats(ring_user_id_t id);
-	virtual void		send_ring_buffer(ring_user_id_t id, vma_ibv_send_wr* p_send_wqe, bool b_block);
+	virtual void		inc_tx_retransmissions(ring_user_id_t id);
+	virtual void		send_ring_buffer(ring_user_id_t id, vma_ibv_send_wr* p_send_wqe, vma_wr_tx_packet_attr attr);
 	virtual void		send_lwip_buffer(ring_user_id_t id, vma_ibv_send_wr* p_send_wqe, bool b_block);
 	virtual void		mem_buf_desc_return_single_to_owner_tx(mem_buf_desc_t* p_mem_buf_desc);
 	virtual bool		is_member(mem_buf_desc_owner* rng);
 	virtual bool		is_active_member(mem_buf_desc_owner* rng, ring_user_id_t id);
 	virtual ring_user_id_t	generate_id();
 	virtual ring_user_id_t	generate_id(const address_t src_mac, const address_t dst_mac, uint16_t eth_proto, uint16_t encap_proto, uint32_t src_ip, uint32_t dst_ip, uint16_t src_port, uint16_t dst_port);
-
+	virtual bool 		get_hw_dummy_send_support(ring_user_id_t id, vma_ibv_send_wr* p_send_wqe);
+	virtual int 		modify_ratelimit(const uint32_t ratelimit_kbps);
+	virtual bool		is_ratelimit_supported(uint32_t rate);
+#ifdef DEFINED_VMAPOLL		
+	virtual int		fast_poll_and_process_element_rx(vma_packets_t *vma_pkts);
+	int 			vma_poll(struct vma_completion_t *vma_completions, unsigned int ncompletions, int flags);
+#endif // DEFINED_VMAPOLL		
 protected:
 	virtual void		create_slave_list(in_addr_t local_if, ring_resource_creation_info_t* p_ring_info, bool active_slaves[], uint16_t partition) = 0;
 	void			update_rx_channel_fds();
@@ -83,29 +89,28 @@ private:
 	net_device_val::bond_xmit_hash_policy m_xmit_hash_policy;
 	lock_mutex_recursive	m_lock_ring_rx;
 	lock_mutex_recursive	m_lock_ring_tx;
-	descq_t*		m_buffer_per_ring;
 };
 
 class ring_bond_eth : public ring_bond
 {
 public:
-	ring_bond_eth(in_addr_t local_if, ring_resource_creation_info_t* p_ring_info, int count, bool active_slaves[], uint16_t vlan, net_device_val::bond_type type, net_device_val::bond_xmit_hash_policy bond_xmit_hash_policy, uint32_t mtu) throw (vma_error):
+	ring_bond_eth(in_addr_t local_if, ring_resource_creation_info_t* p_ring_info, int count, bool active_slaves[], uint16_t vlan, net_device_val::bond_type type, net_device_val::bond_xmit_hash_policy bond_xmit_hash_policy, uint32_t mtu):
 		ring_bond(count, type, bond_xmit_hash_policy, mtu){
 		create_slave_list(local_if, p_ring_info, active_slaves, vlan);
 		update_rx_channel_fds();
 	};
 protected:
-	virtual void create_slave_list(in_addr_t local_if, ring_resource_creation_info_t* p_ring_info, bool active_slaves[], uint16_t partition) throw (vma_error);
+	virtual void create_slave_list(in_addr_t local_if, ring_resource_creation_info_t* p_ring_info, bool active_slaves[], uint16_t partition);
 };
 
 class ring_bond_ib : public ring_bond
 {
 public:
-	ring_bond_ib(in_addr_t local_if, ring_resource_creation_info_t* p_ring_info, int count, bool active_slaves[], uint16_t pkey, net_device_val::bond_type type, net_device_val::bond_xmit_hash_policy bond_xmit_hash_policy, uint32_t mtu) throw (vma_error):
+	ring_bond_ib(in_addr_t local_if, ring_resource_creation_info_t* p_ring_info, int count, bool active_slaves[], uint16_t pkey, net_device_val::bond_type type, net_device_val::bond_xmit_hash_policy bond_xmit_hash_policy, uint32_t mtu):
 		ring_bond(count, type, bond_xmit_hash_policy, mtu){
 		create_slave_list(local_if, p_ring_info, active_slaves, pkey);
 		update_rx_channel_fds();
 	};
 protected:
-	virtual void create_slave_list(in_addr_t local_if, ring_resource_creation_info_t* p_ring_info, bool active_slaves[], uint16_t partition) throw (vma_error);
+	virtual void create_slave_list(in_addr_t local_if, ring_resource_creation_info_t* p_ring_info, bool active_slaves[], uint16_t partition);
 };

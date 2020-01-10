@@ -662,12 +662,12 @@ tcp_connect(struct tcp_pcb *pcb, ip_addr_t *ipaddr, u16_t port,
    * If LWIP_TCP_MSS>0 use it as MSS 
    * If LWIP_TCP_MSS==0 set advertized MSS value to default 536
    */
-  pcb->advtsd_mss = (LWIP_TCP_MSS > 0) ? tcp_eff_send_mss(LWIP_TCP_MSS, ipaddr) : tcp_mss_follow_mtu_with_default(536, ipaddr); 
+  pcb->advtsd_mss = (LWIP_TCP_MSS > 0) ? tcp_eff_send_mss(LWIP_TCP_MSS, pcb) : tcp_mss_follow_mtu_with_default(536, pcb);
   /* 
    * For effective MSS with MTU knowledge - get the minimum between pcb->mss and the MSS derived from the 
    * MTU towards the remote IP address 
    * */
-  u16_t eff_mss = tcp_eff_send_mss(pcb->mss, ipaddr); 
+  u16_t eff_mss = tcp_eff_send_mss(pcb->mss, pcb);
   UPDATE_PCB_BY_MSS(pcb, eff_mss);
 #endif /* TCP_CALCULATE_EFF_SEND_MSS */
   pcb->cwnd = 1;
@@ -728,7 +728,7 @@ tcp_slowtmr(struct tcp_pcb* pcb)
 	  LWIP_DEBUGF(TCP_DEBUG, ("tcp_slowtmr: max DATA retries reached\n"));
 	} else {
 	  if (pcb->persist_backoff > 0) {
-		/* If snd_wnd is zero, use persist timer to send 1 byte probes
+		/* If snd_wnd is zero and pcb->unacked is NULL , use persist timer to send 1 byte probes
 		 * instead of using the standard retransmission mechanism. */
 		pcb->persist_cnt++;
 		if (pcb->persist_cnt >= tcp_persist_backoff[pcb->persist_backoff-1]) {
@@ -1133,23 +1133,53 @@ void tcp_pcb_init (struct tcp_pcb* pcb, u8_t prio)
 #endif /* LWIP_TCP_KEEPALIVE */
 
 	pcb->keep_cnt_sent = 0;
+	pcb->quickack = 0;
 	pcb->enable_ts_opt = enable_ts_option;
+	pcb->seg_alloc = NULL;
+	pcb->pbuf_alloc = NULL;
 }
 
 struct pbuf *
 tcp_tx_pbuf_alloc(struct tcp_pcb * pcb, u16_t length, pbuf_type type)
 {
-	struct pbuf * p = external_tcp_tx_pbuf_alloc(pcb);
-	if (!p) return NULL;
+	struct pbuf * p;
+
+	if (!pcb->pbuf_alloc) {
+
+		// pbuf_alloc is not valid, we should allocate a new pbuf.
+		p = external_tcp_tx_pbuf_alloc(pcb);
+		if (!p) return NULL;
+
+		p->next = NULL;
+		p->type = type;
+		/* set reference count */
+		p->ref = 1;
+		/* set flags */
+		p->flags = 0;
+	} else {
+		// pbuf_alloc is valid, we dont need to allocate a new pbuf element.
+		p = pcb->pbuf_alloc;
+		pcb->pbuf_alloc = NULL;
+	}
+
 	/* Set up internal structure of the pbuf. */
 	p->len = p->tot_len = length;
-	p->next = NULL;
-	p->type = type;
-	/* set reference count */
-	p->ref = 1;
-	/* set flags */
-	p->flags = 0;
+
 	return p;
+}
+
+// Release preallocated buffers
+void tcp_tx_preallocted_buffers_free(struct tcp_pcb * pcb)
+{
+	if (pcb->seg_alloc) {
+		tcp_tx_seg_free(pcb, pcb->seg_alloc);
+		pcb->seg_alloc = NULL;
+	}
+
+	if (pcb->pbuf_alloc) {
+		tcp_tx_pbuf_free(pcb, pcb->pbuf_alloc);
+		pcb->pbuf_alloc = NULL;
+	}
 }
 
 void
@@ -1418,11 +1448,11 @@ tcp_next_iss(void)
  * calculating the minimum of TCP_MSS and that netif's mtu (if set).
  */
 u16_t
-tcp_eff_send_mss(u16_t sendmss, ip_addr_t *addr)
+tcp_eff_send_mss(u16_t sendmss, struct tcp_pcb *pcb)
 {
   u16_t mtu;
 
-  mtu = external_ip_route_mtu(addr);
+  mtu = external_ip_route_mtu(pcb);
   if (mtu != 0) {
     sendmss = LWIP_MIN(sendmss, mtu - IP_HLEN - TCP_HLEN);
   }
@@ -1435,11 +1465,11 @@ tcp_eff_send_mss(u16_t sendmss, ip_addr_t *addr)
  * In case MTU is unkonw - return the default MSS 
  */
 u16_t
-tcp_mss_follow_mtu_with_default(u16_t defsendmss, ip_addr_t *addr)
+tcp_mss_follow_mtu_with_default(u16_t defsendmss, struct tcp_pcb *pcb)
 {
   u16_t mtu;
 
-  mtu = external_ip_route_mtu(addr);
+  mtu = external_ip_route_mtu(pcb);
   if (mtu != 0) {
     defsendmss = mtu - IP_HLEN - TCP_HLEN;
     defsendmss = LWIP_MAX(defsendmss, 1); /* MSS must be a positive number */

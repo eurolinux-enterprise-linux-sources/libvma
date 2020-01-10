@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2001-2016 Mellanox Technologies, Ltd. All rights reserved.
+ * Copyright (c) 2001-2017 Mellanox Technologies, Ltd. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -57,6 +57,7 @@
 #include "vma/dev/buffer_pool.h"
 #include "vma/dev/ib_ctx_handler_collection.h"
 #include "vma/dev/net_device_table_mgr.h"
+#include "vma/dev/ring_profile.h"
 #include "vma/proto/ip_frag.h"
 #include "vma/proto/vma_lwip.h"
 #include "vma/proto/route_table_mgr.h"
@@ -74,6 +75,7 @@
 #include "vma/iomux/io_mux_call.h"
 
 #include "vma/util/instrumentation.h"
+#include "vma/util/agent.h"
 
 void check_netperf_flags();
 
@@ -81,7 +83,11 @@ void check_netperf_flags();
 // Start of vma_version_str - used in "$ strings libvma.so | grep VMA_VERSION"
 #define STR_EXPAND(x) #x
 #define STR(x) STR_EXPAND(x)
+#ifdef DEFINED_VMAPOLL
+const char *vma_version_str = "VMA_VERSION: " PACKAGE_VERSION "-" STR(VMA_LIBRARY_RELEASE) " (vmapoll)"
+#else
 const char *vma_version_str = "VMA_VERSION: " PACKAGE_VERSION "-" STR(VMA_LIBRARY_RELEASE)
+#endif // DEFINED_VMAPOLL
 
 #if _BullseyeCoverage
 			      " Bullseye"
@@ -105,15 +111,12 @@ const char *vma_version_str = "VMA_VERSION: " PACKAGE_VERSION "-" STR(VMA_LIBRAR
 			      ;	// End of vma_version_str - used in "$ strings libvma.so | grep VMA_VERSION"
 
 
-bool g_handle_iperf = false;
 bool g_b_exit = false;
 bool g_init_ibv_fork_done = false;
 bool g_is_forked_child = false;
 bool g_init_global_ctors_done = true;
-
-#define MAX_BACKTRACE		25
+static command_netlink *s_cmd_nl = NULL;
 #define MAX_VERSION_STR_LEN	128
-#define MAX_CMD_LINE		2048
 
 static int free_libvma_resources()
 {
@@ -208,6 +211,9 @@ static int free_libvma_resources()
 	if (g_buffer_pool_rx) delete g_buffer_pool_rx;
 	g_buffer_pool_rx = NULL;
 
+	if (s_cmd_nl) delete s_cmd_nl;
+	s_cmd_nl = NULL;
+
 	if (g_p_netlink_handler) delete g_p_netlink_handler;
 	g_p_netlink_handler = NULL;
 
@@ -219,6 +225,15 @@ static int free_libvma_resources()
 	
 	if (g_p_event_handler_manager) delete g_p_event_handler_manager;
 	g_p_event_handler_manager = NULL;
+
+	if (g_p_agent) delete g_p_agent;
+	g_p_agent = NULL;
+
+	if (g_p_ring_profile) delete g_p_ring_profile;
+	g_p_ring_profile = NULL;
+
+	if (safe_mce_sys().app_name) free(safe_mce_sys().app_name);
+	safe_mce_sys().app_name = NULL;
 
 	vlog_printf(VLOG_DEBUG, "Stopping logger module\n");
 
@@ -373,7 +388,7 @@ const char* buffer_batching_mode_str(buffer_batching_mode_t buffer_batching_mode
 
 int get_ofed_version_info(char* ofed_version_str, int len)
 {
-	return run_and_retreive_system_command("ofed_info -s 2>/dev/null | grep OFED | head -1 | tr -d '\n'", ofed_version_str, len);
+	return run_and_retreive_system_command("ofed_info -s 2>/dev/null | head -1 | tr -d '\n'", ofed_version_str, len);
 }
 
 void print_vma_global_settings()
@@ -384,6 +399,9 @@ void print_vma_global_settings()
 	
 	vlog_printf(VLOG_INFO,"---------------------------------------------------------------------------\n");
 	vlog_printf(VLOG_INFO,"%s\n", vma_version_str);
+	if (VMA_GIT_VERSION[0]) {
+		vlog_printf(VLOG_INFO,"%s\n", "Git: " VMA_GIT_VERSION);
+	}
 	vlog_printf(VLOG_INFO,"Cmd Line: %s\n", safe_mce_sys().app_name);
 
 	// Use DEBUG level logging with more details in RPM release builds
@@ -407,39 +425,17 @@ void print_vma_global_settings()
 		vlog_printf(log_level,"Node: %s\n", sys_info.nodename);
 	}
 
-	vlog_printf(log_level,"---------------------------------------------------------------------------\n");
+	vlog_printf(VLOG_INFO,"---------------------------------------------------------------------------\n");
 
-	switch (safe_mce_sys().mce_spec) {
-	case MCE_SPEC_SOCKPERF_LL_10:
-		vlog_printf(VLOG_INFO, " Sockperf ping-pong Low Latency Profile Spec\n");
-		break;
-	case MCE_SPEC_29WEST_LBM_29:
-		vlog_printf(VLOG_INFO, " 29West LBM Logic Spec\n");
-		break;
-	case MCE_SPEC_WOMBAT_FH_LBM_554:
-		vlog_printf(VLOG_INFO, " Wombat FH LBM Logic Spec\n");
-		break;
-	case MCE_SPEC_RTI_784:
-		vlog_printf(VLOG_INFO, " RTI Logic Spec\n");
-		break;
-	case MCE_SPEC_MCD_623:
-		vlog_printf(VLOG_INFO, " Memcached Logic Spec\n");
-		break;
-	case MCE_SPEC_MCD_IRQ_624:
-		vlog_printf(VLOG_INFO, " Memcached Interrupt Mode Logic Spec\n");
-		break;
-	default:
-		break;
-	}
-	if (safe_mce_sys().mce_spec != 0) {
-		vlog_printf(VLOG_INFO, FORMAT_NUMBER, "Spec", safe_mce_sys().mce_spec, SYS_VAR_SPEC);
+	if (safe_mce_sys().mce_spec != MCE_SPEC_NONE) {
+		vlog_printf(VLOG_INFO, FORMAT_STRING, "VMA Spec", vma_spec::to_str((vma_spec_t)safe_mce_sys().mce_spec), SYS_VAR_SPEC);
 
 		if (safe_mce_sys().mce_spec == MCE_SPEC_29WEST_LBM_29 || safe_mce_sys().mce_spec == MCE_SPEC_WOMBAT_FH_LBM_554) {
 			vlog_printf(VLOG_INFO, FORMAT_NUMBER, "Param 1:", safe_mce_sys().mce_spec_param1, SYS_VAR_SPEC_PARAM1);
 			vlog_printf(VLOG_INFO, FORMAT_NUMBER, "Param 2:", safe_mce_sys().mce_spec_param2, SYS_VAR_SPEC_PARAM2);
 		}
-		vlog_printf(VLOG_INFO,"---------------------------------------------------------------------------\n");
 	}
+
 	VLOG_STR_PARAM_STRING("Log Level", log_level::to_str(safe_mce_sys().log_level), "", SYS_VAR_LOG_LEVEL, log_level::to_str(safe_mce_sys().log_level));
 	VLOG_PARAM_NUMBER("Log Details", safe_mce_sys().log_details, MCE_DEFAULT_LOG_DETAILS, SYS_VAR_LOG_DETAILS);
 	VLOG_PARAM_STRING("Log Colors", safe_mce_sys().log_colors, MCE_DEFAULT_LOG_COLORS, SYS_VAR_LOG_COLORS, safe_mce_sys().log_colors ? "Enabled " : "Disabled");
@@ -456,6 +452,17 @@ void print_vma_global_settings()
 
 	VLOG_PARAM_NUMSTR("Ring allocation logic TX", safe_mce_sys().ring_allocation_logic_tx, MCE_DEFAULT_RING_ALLOCATION_LOGIC_TX, SYS_VAR_RING_ALLOCATION_LOGIC_TX, ring_logic_str(safe_mce_sys().ring_allocation_logic_tx));
 	VLOG_PARAM_NUMSTR("Ring allocation logic RX", safe_mce_sys().ring_allocation_logic_rx, MCE_DEFAULT_RING_ALLOCATION_LOGIC_RX, SYS_VAR_RING_ALLOCATION_LOGIC_RX, ring_logic_str(safe_mce_sys().ring_allocation_logic_rx));
+	if (safe_mce_sys().ring_allocation_logic_rx == RING_LOGIC_PER_USER_ID) {
+		vlog_printf(VLOG_WARNING,"user_id is not supported using "
+			    "environment variable , use etra_api, using default\n");
+		safe_mce_sys().ring_allocation_logic_rx = MCE_DEFAULT_RING_ALLOCATION_LOGIC_RX;
+	}
+
+	if (safe_mce_sys().ring_allocation_logic_tx == RING_LOGIC_PER_USER_ID) {
+		vlog_printf(VLOG_WARNING,"user_id is not supported using "
+			    "environment variable , use etra_api, using default\n");
+		safe_mce_sys().ring_allocation_logic_tx = MCE_DEFAULT_RING_ALLOCATION_LOGIC_TX;
+	}
 
 	VLOG_PARAM_NUMBER("Ring migration ratio TX", safe_mce_sys().ring_migration_ratio_tx, MCE_DEFAULT_RING_MIGRATION_RATIO_TX, SYS_VAR_RING_MIGRATION_RATIO_TX);
 	VLOG_PARAM_NUMBER("Ring migration ratio RX", safe_mce_sys().ring_migration_ratio_rx, MCE_DEFAULT_RING_MIGRATION_RATIO_RX, SYS_VAR_RING_MIGRATION_RATIO_RX);
@@ -465,6 +472,8 @@ void print_vma_global_settings()
 	} else {
 		VLOG_PARAM_NUMSTR("Ring limit per interface", safe_mce_sys().ring_limit_per_interface, MCE_DEFAULT_RING_LIMIT_PER_INTERFACE, SYS_VAR_RING_LIMIT_PER_INTERFACE, "(no limit)");
 	}
+
+	VLOG_PARAM_NUMBER("Ring On Device Memory TX", safe_mce_sys().ring_dev_mem_tx, MCE_DEFAULT_RING_DEV_MEM_TX, SYS_VAR_RING_DEV_MEM_TX);
 
 	if (safe_mce_sys().tcp_max_syn_rate) {
 		VLOG_PARAM_NUMSTR("TCP max syn rate", safe_mce_sys().tcp_max_syn_rate, MCE_DEFAULT_TCP_MAX_SYN_RATE, SYS_VAR_TCP_MAX_SYN_RATE, "(per sec)");
@@ -493,7 +502,7 @@ void print_vma_global_settings()
 		VLOG_PARAM_STRING("Rx UDP Poll OS Ratio", safe_mce_sys().rx_udp_poll_os_ratio, MCE_DEFAULT_RX_UDP_POLL_OS_RATIO, SYS_VAR_RX_UDP_POLL_OS_RATIO, "Disabled");
 	}
 
-	VLOG_PARAM_NUMBER("Rx UDP HW TS Conversion", safe_mce_sys().rx_udp_hw_ts_conversion, MCE_DEFAULT_RX_UDP_HW_TS_CONVERSION, SYS_VAR_RX_UDP_HW_TS_CONVERSION);
+	VLOG_PARAM_NUMBER("HW TS Conversion", safe_mce_sys().hw_ts_conversion_mode, MCE_DEFAULT_HW_TS_CONVERSION_MODE, SYS_VAR_HW_TS_CONVERSION_MODE);
 	VLOG_PARAM_NUMBER("Rx SW CSUM", safe_mce_sys().rx_sw_csum, MCE_DEFUALT_RX_SW_CSUM, SYS_VAR_RX_SW_CSUM);
 	if (safe_mce_sys().rx_poll_yield_loops) {
 		VLOG_PARAM_NUMBER("Rx Poll Yield", safe_mce_sys().rx_poll_yield_loops, MCE_DEFAULT_RX_POLL_YIELD, SYS_VAR_RX_POLL_YIELD);
@@ -516,6 +525,7 @@ void print_vma_global_settings()
 
 	VLOG_PARAM_STRING("TCP 3T rules", safe_mce_sys().tcp_3t_rules, MCE_DEFAULT_TCP_3T_RULES, SYS_VAR_TCP_3T_RULES, safe_mce_sys().tcp_3t_rules ? "Enabled " : "Disabled");
 	VLOG_PARAM_STRING("ETH MC L2 only rules", safe_mce_sys().eth_mc_l2_only_rules, MCE_DEFAULT_ETH_MC_L2_ONLY_RULES, SYS_VAR_ETH_MC_L2_ONLY_RULES, safe_mce_sys().eth_mc_l2_only_rules ? "Enabled " : "Disabled");
+	VLOG_PARAM_STRING("Force Flowtag for MC", safe_mce_sys().mc_force_flowtag, MCE_DEFAULT_MC_FORCE_FLOWTAG, SYS_VAR_MC_FORCE_FLOWTAG, safe_mce_sys().mc_force_flowtag ? "Enabled " : "Disabled");
 
 	VLOG_PARAM_NUMBER("Select Poll (usec)", safe_mce_sys().select_poll_num, MCE_DEFAULT_SELECT_NUM_POLLS, SYS_VAR_SELECT_NUM_POLLS);
 	VLOG_PARAM_STRING("Select Poll OS Force", safe_mce_sys().select_poll_os_force, MCE_DEFAULT_SELECT_POLL_OS_FORCE, SYS_VAR_SELECT_POLL_OS_FORCE, safe_mce_sys().select_poll_os_force ? "Enabled " : "Disabled");
@@ -562,8 +572,11 @@ void print_vma_global_settings()
 	VLOG_PARAM_NUMBER("TCP Timer Resolution (msec)", safe_mce_sys().tcp_timer_resolution_msec, MCE_DEFAULT_TCP_TIMER_RESOLUTION_MSEC, SYS_VAR_TCP_TIMER_RESOLUTION_MSEC);
 	VLOG_PARAM_NUMSTR("TCP control thread", safe_mce_sys().tcp_ctl_thread, MCE_DEFAULT_TCP_CTL_THREAD, SYS_VAR_TCP_CTL_THREAD, ctl_thread_str(safe_mce_sys().tcp_ctl_thread));
 	VLOG_PARAM_NUMBER("TCP timestamp option", safe_mce_sys().tcp_ts_opt, MCE_DEFAULT_TCP_TIMESTAMP_OPTION, SYS_VAR_TCP_TIMESTAMP_OPTION);
+	VLOG_PARAM_NUMBER("TCP nodelay", safe_mce_sys().tcp_nodelay, MCE_DEFAULT_TCP_NODELAY, SYS_VAR_TCP_NODELAY);
+	VLOG_PARAM_NUMBER("TCP quickack", safe_mce_sys().tcp_quickack, MCE_DEFAULT_TCP_QUICKACK, SYS_VAR_TCP_QUICKACK);
 	VLOG_PARAM_NUMSTR(vma_exception_handling::getName(), (int)safe_mce_sys().exception_handling, vma_exception_handling::MODE_DEFAULT, vma_exception_handling::getSysVar(), safe_mce_sys().exception_handling.to_str());
 	VLOG_PARAM_STRING("Avoid sys-calls on tcp fd", safe_mce_sys().avoid_sys_calls_on_tcp_fd, MCE_DEFAULT_AVOID_SYS_CALLS_ON_TCP_FD, SYS_VAR_AVOID_SYS_CALLS_ON_TCP_FD, safe_mce_sys().avoid_sys_calls_on_tcp_fd ? "Enabled" : "Disabled");
+	VLOG_PARAM_STRING("Allow privileged sock opt", safe_mce_sys().allow_privileged_sock_opt, MCE_DEFAULT_ALLOW_PRIVILEGED_SOCK_OPT, SYS_VAR_ALLOW_PRIVILEGED_SOCK_OPT, safe_mce_sys().allow_privileged_sock_opt ? "Enabled" : "Disabled");
 	VLOG_PARAM_NUMBER("Delay after join (msec)", safe_mce_sys().wait_after_join_msec, MCE_DEFAULT_WAIT_AFTER_JOIN_MSEC, SYS_VAR_WAIT_AFTER_JOIN_MSEC);
 	VLOG_STR_PARAM_STRING("Internal Thread Affinity", safe_mce_sys().internal_thread_affinity_str, MCE_DEFAULT_INTERNAL_THREAD_AFFINITY_STR, SYS_VAR_INTERNAL_THREAD_AFFINITY, safe_mce_sys().internal_thread_affinity_str);
 	VLOG_STR_PARAM_STRING("Internal Thread Cpuset", safe_mce_sys().internal_thread_cpuset, MCE_DEFAULT_INTERNAL_THREAD_CPUSET, SYS_VAR_INTERNAL_THREAD_CPUSET, safe_mce_sys().internal_thread_cpuset);
@@ -602,7 +615,8 @@ void print_vma_global_settings()
 		VLOG_PARAM_NUMBER("MSS", safe_mce_sys().lwip_mss, MCE_DEFAULT_MSS, SYS_VAR_MSS);	break;
 	}
 	VLOG_PARAM_NUMSTR("TCP CC Algorithm", safe_mce_sys().lwip_cc_algo_mod, MCE_DEFAULT_LWIP_CC_ALGO_MOD, SYS_VAR_TCP_CC_ALGO, lwip_cc_algo_str(safe_mce_sys().lwip_cc_algo_mod));
-	VLOG_PARAM_STRING("Suppress IGMP ver. warning", safe_mce_sys().suppress_igmp_warning, MCE_DEFAULT_SUPPRESS_IGMP_WARNING, SYS_VAR_SUPPRESS_IGMP_WARNING, safe_mce_sys().suppress_igmp_warning ? "Enabled " : "Disabled");
+	VLOG_PARAM_STRING("Polling Rx on Tx TCP", safe_mce_sys().rx_poll_on_tx_tcp, MCE_DEFAULT_RX_POLL_ON_TX_TCP, SYS_VAR_VMA_RX_POLL_ON_TX_TCP, safe_mce_sys().rx_poll_on_tx_tcp ? "Enabled " : "Disabled");
+	VLOG_PARAM_STRING("Trig dummy send getsockname()", safe_mce_sys().trigger_dummy_send_getsockname, MCE_DEFAULT_TRIGGER_DUMMY_SEND_GETSOCKNAME, SYS_VAR_VMA_TRIGGER_DUMMY_SEND_GETSOCKNAME, safe_mce_sys().trigger_dummy_send_getsockname ? "Enabled " : "Disabled");
 
 #ifdef VMA_TIME_MEASURE
 	VLOG_PARAM_NUMBER("Time Measure Num Samples", safe_mce_sys().vma_time_measure_num_samples, MCE_DEFAULT_TIME_MEASURE_NUM_SAMPLES, SYS_VAR_VMA_TIME_MEASURE_NUM_SAMPLES);
@@ -653,6 +667,10 @@ extern "C" void sock_redirect_main(void)
 		register_handler_segv();
 	}
 
+#ifdef RDTSC_MEASURE
+	init_rdtsc();
+#endif
+
 #ifdef VMA_TIME_MEASURE
 	init_instrumentation();
 #endif
@@ -660,25 +678,21 @@ extern "C" void sock_redirect_main(void)
 
 extern "C" void sock_redirect_exit(void)
 {
+#ifdef RDTSC_MEASURE
+	print_rdtsc_summary();
+#endif
 #ifdef VMA_TIME_MEASURE
 	finit_instrumentation(safe_mce_sys().vma_time_measure_filename);
 #endif
 	vlog_printf(VLOG_DEBUG, "%s()\n", __FUNCTION__);
+#ifndef DEFINED_VMAPOLL // if not defined	
 	vma_shmem_stats_close();
+#endif // DEFINED_VMAPOLL
 }
 
 #if _BullseyeCoverage
     #pragma BullseyeCoverage off
 #endif
-
-void vma_mcheck_abort_cb(enum mcheck_status status)
-{
-	printf("mcheck abort! Got %d\n", status);
-	printf("Press ENTER to continue...\n");
-	if (getchar() < 0)
-		printf("error reading char, errno %d %m!\n", errno);
-	handle_segfault(0);
-}
 
 #if _BullseyeCoverage
     #pragma BullseyeCoverage on
@@ -787,6 +801,11 @@ static void do_global_ctors_helper()
 	if (g_is_forked_child == true)
 		g_is_forked_child = false;
 
+	/* Open communication with daemon */
+	NEW_CTOR(g_p_agent, agent());
+	vlog_printf(VLOG_DEBUG,"Agent setup state: g_p_agent=%p active=%d\n",
+			g_p_agent, (g_p_agent ? g_p_agent->state() : -1));
+
 	// Create all global managment objects
 	NEW_CTOR(g_p_event_handler_manager, event_handler_manager());
 
@@ -852,32 +871,25 @@ static void do_global_ctors_helper()
 		}
 
 		// Register netlink fd to the event_manager
-		command_netlink * cmd_nl = NULL;
-		cmd_nl = new command_netlink(g_p_netlink_handler);
-		if (cmd_nl == NULL) {
+		s_cmd_nl = new command_netlink(g_p_netlink_handler);
+		if (s_cmd_nl == NULL) {
 			throw_vma_exception("Failed allocating command_netlink\n");
 		}
 		BULLSEYE_EXCLUDE_BLOCK_END
-		g_p_event_handler_manager->register_command_event(fd, cmd_nl);
+		g_p_event_handler_manager->register_command_event(fd, s_cmd_nl);
 		g_p_event_handler_manager->register_timer_event(
 				safe_mce_sys().timer_netlink_update_msec,
-				cmd_nl,
+				s_cmd_nl,
 				PERIODIC_TIMER,
 				NULL);
 	}
 
-	g_n_os_igmp_max_membership = get_igmp_max_membership();
-	BULLSEYE_EXCLUDE_BLOCK_START
-	if (g_n_os_igmp_max_membership < 0) {
-		vlog_printf(VLOG_WARNING,"failed to read igmp_max_membership value");
-	}
-	BULLSEYE_EXCLUDE_BLOCK_END
-
 // 	neigh_test();
 //	igmp_test();
+	NEW_CTOR(g_p_ring_profile, ring_profiles_collection());
 }
 
-void do_global_ctors()
+int do_global_ctors()
 {
 	try {
 		do_global_ctors_helper();
@@ -885,11 +897,14 @@ void do_global_ctors()
 	catch (const vma_exception& error) {
 		vlog_printf(VLOG_DETAILS, "Error: %s", error.what());
 		free_libvma_resources();
+		return -1;
 	}
 	catch (const std::exception& error ) {
 		vlog_printf(VLOG_ERROR, "%s", error.what());
 		free_libvma_resources();
+		return -1;
 	}
+	return 0;
 }
 
 void reset_globals()
@@ -911,6 +926,8 @@ void reset_globals()
 	g_p_lwip = NULL;
 	g_p_netlink_handler = NULL;
 	g_p_ib_ctx_handler_collection = NULL;
+	g_p_ring_profile = NULL;
+	s_cmd_nl = NULL;
 	g_cpu_manager.reset();
 }
 
@@ -970,7 +987,7 @@ extern "C" int main_init(void)
 	// Force GCC's malloc() to check the consistency of dynamic memory in development build (Non Release)
 	//mcheck(vma_mcheck_abort_cb);
 #endif
-
+	get_orig_funcs();
 	safe_mce_sys();
 
 	g_init_global_ctors_done = false;
@@ -978,7 +995,6 @@ extern "C" int main_init(void)
 	vlog_start("VMA", safe_mce_sys().log_level, safe_mce_sys().log_filename, safe_mce_sys().log_details, safe_mce_sys().log_colors);
 
 	print_vma_global_settings();
-	get_orig_funcs();
 
 	check_debug();
 	check_cpu_speed();

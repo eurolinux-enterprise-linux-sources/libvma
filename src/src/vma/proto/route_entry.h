@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2001-2016 Mellanox Technologies, Ltd. All rights reserved.
+ * Copyright (c) 2001-2017 Mellanox Technologies, Ltd. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -39,6 +39,7 @@
 
 #include "vma/proto/route_rule_table_key.h"
 #include "vma/infra/cache_subject_observer.h"
+#include "vma/dev/net_device_entry.h"
 #include "route_val.h"
 #include "rule_entry.h"
 

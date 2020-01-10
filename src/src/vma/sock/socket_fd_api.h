@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2001-2016 Mellanox Technologies, Ltd. All rights reserved.
+ * Copyright (c) 2001-2017 Mellanox Technologies, Ltd. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -34,8 +34,10 @@
 #ifndef SOCKET_FD_API_H
 #define SOCKET_FD_API_H
 
+#include "config.h"
 #include <sys/socket.h>
-#include <vma/vma_extra.h>
+#include "vma/vma_extra.h"
+
 #include <vma/dev/cq_mgr.h>
 #include <vma/dev/buffer_pool.h>
 #include <vma/sock/cleanable_obj.h>
@@ -46,11 +48,32 @@
 #ifndef SOCK_CLOEXEC
 #define SOCK_CLOEXEC 02000000
 #endif
+#ifndef SO_MAX_PACING_RATE
+#define SO_MAX_PACING_RATE 47
+#endif
+
+#define IS_DUMMY_PACKET(flags) (flags & VMA_SND_FLAGS_DUMMY)
 
 class cq_mgr;
 class epfd_info;
-
 class mem_buf_desc_t;
+
+struct epoll_fd_rec
+{
+	uint32_t    events;
+	epoll_data  epdata;
+	int         offloaded_index; // offloaded fd index + 1
+
+	epoll_fd_rec() {
+		reset();
+	}
+
+	void reset() {
+		this->events = 0;
+		memset(&this->epdata, 0, sizeof(this->epdata));
+		this->offloaded_index = 0;
+	}
+};
 
 typedef enum {
 	TX_WRITE = 13, TX_WRITEV, TX_SEND, TX_SENDTO, TX_SENDMSG, TX_UNDEF
@@ -119,13 +142,13 @@ public:
 	virtual int getpeername(sockaddr *__name, socklen_t *__namelen);
 
 	virtual int setsockopt(int __level, int __optname,
-			       __const void *__optval, socklen_t __optlen) throw (vma_error);
+			       __const void *__optval, socklen_t __optlen);
 
 	virtual int getsockopt(int __level, int __optname, void *__optval,
-			       socklen_t *__optlen) throw (vma_error);
-	virtual int fcntl(int __cmd, unsigned long int __arg) throw (vma_error) = 0;
+			       socklen_t *__optlen);
+	virtual int fcntl(int __cmd, unsigned long int __arg) = 0;
 
-	virtual int ioctl(unsigned long int __request, unsigned long int __arg) throw (vma_error) = 0;
+	virtual int ioctl(unsigned long int __request, unsigned long int __arg) = 0;
 
 	virtual ssize_t rx(const rx_call_t call_type, iovec* iov,
 			   const ssize_t iovlen, int* p_flags = 0,
@@ -170,6 +193,10 @@ public:
 	
 	virtual int free_packets(struct vma_packet_t *pkts, size_t count);
 
+#ifdef DEFINED_VMAPOLL
+	virtual	int free_buffs(uint16_t len);
+#endif // DEFINED_VMAPOLL	
+
 	virtual int get_fd( ) const { return m_fd; };
 
 	// true if fd must be skipped from OS select()
@@ -189,8 +216,9 @@ public:
 
 	virtual void consider_rings_migration() {}
 
-	virtual void add_epoll_context(epfd_info *epfd);
+	virtual int add_epoll_context(epfd_info *epfd);
 	virtual void remove_epoll_context(epfd_info *epfd);
+	int get_epoll_context_fd();
 
 #if _BullseyeCoverage
     #pragma BullseyeCoverage off
@@ -213,8 +241,15 @@ public:
 
 	static inline size_t ep_ready_fd_node_offset(void) {return NODE_OFFSET(socket_fd_api, ep_ready_fd_node);}
 	list_node<socket_fd_api, socket_fd_api::ep_ready_fd_node_offset> ep_ready_fd_node;
-
 	uint32_t m_epoll_event_flags;
+
+	static inline size_t ep_info_fd_node_offset(void) {return NODE_OFFSET(socket_fd_api, ep_info_fd_node);}
+	list_node<socket_fd_api, socket_fd_api::ep_info_fd_node_offset> ep_info_fd_node;
+	epoll_fd_rec m_fd_rec;
+
+	virtual int get_rings_num() {return 0;}
+	virtual bool check_rings() {return false;}
+	virtual int* get_rings_fds(int& res_length) { res_length=0; return NULL;}
 
 protected:
 	void notify_epoll_context(uint32_t events);
@@ -222,7 +257,6 @@ protected:
 	void notify_epoll_context_remove_ring(ring* ring);
 	bool notify_epoll_context_verify(epfd_info *epfd);
 	void notify_epoll_context_fd_is_offloaded();
-	int get_epoll_context_fd();
 
 	// identification information <socket fd>
 	int m_fd;
@@ -230,11 +264,10 @@ protected:
 
 	// Calling OS receive
 	ssize_t rx_os(const rx_call_t call_type, iovec* p_iov, ssize_t sz_iov,
-		      int* p_flags, sockaddr *__from, socklen_t *__fromlen, struct msghdr *__msg);
+		      const int flags, sockaddr *__from, socklen_t *__fromlen, struct msghdr *__msg);
 
 
 private:
 	epfd_info *m_econtext;
 };
-
 #endif

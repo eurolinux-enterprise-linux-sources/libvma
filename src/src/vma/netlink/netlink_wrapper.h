@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2001-2016 Mellanox Technologies, Ltd. All rights reserved.
+ * Copyright (c) 2001-2017 Mellanox Technologies, Ltd. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -44,15 +44,6 @@
 #include "netlink_compatibility.h"
 
 #define	subject_map_iter map<e_netlink_event_type, subject*>::iterator
-
-// structure to pass arguments on internal netlink callbacks handling
-typedef struct rcv_msg_arg
-{
-	netlink_wrapper* netlink;
-	nl_socket_handle* socket_handle;
-	map<e_netlink_event_type, subject*>* subjects_map;
-	nlmsghdr* msghdr;
-} rcv_msg_arg_t;
 
 /*
  * the class provide simple API for registering observers to NETLINK ROUTE_FAMILY events from kernel.

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2001-2016 Mellanox Technologies, Ltd. All rights reserved.
+ * Copyright (c) 2001-2017 Mellanox Technologies, Ltd. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -41,9 +41,12 @@ class neigh_table_mgr : public cache_table_mgr<neigh_key, class neigh_val*>, pub
 {
 public:
 				neigh_table_mgr();
-				~neigh_table_mgr(){ stop_garbage_collector();};
+				~neigh_table_mgr();
 	virtual void 		notify_cb(event * event);
 	rdma_event_channel*	m_neigh_cma_event_channel;
+	bool			register_observer(neigh_key,
+					const cache_observer *,
+					cache_entry_subject<neigh_key, class neigh_val*> **);
 
 private:
 	/* This function will retrieve neigh transport type by the following actions:

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2001-2016 Mellanox Technologies, Ltd. All rights reserved.
+ * Copyright (c) 2001-2017 Mellanox Technologies, Ltd. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -38,11 +38,13 @@
  * wakeup class that adds a wakeup functionality to socket (tcp and udp) and epoll using a pipe.
  */
 #include "wakeup.h"
+#include "utils/atomic.h"
 
 class wakeup_pipe : public wakeup
 {
 public:
 	wakeup_pipe(void);
+	~wakeup_pipe();
 	virtual void do_wakeup();
 	virtual inline bool is_wakeup_fd(int fd)
 	{
@@ -52,6 +54,7 @@ public:
 
 private:
 	static int g_wakeup_pipes[2];
+	static atomic_t ref_count;
 };
 
 #endif /* WAKEUP_PIPE_H */

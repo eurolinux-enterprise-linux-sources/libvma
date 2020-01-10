@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2001-2016 Mellanox Technologies, Ltd. All rights reserved.
+ * Copyright (c) 2001-2017 Mellanox Technologies, Ltd. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -43,18 +43,22 @@
 #include "config.h"
 #include "verbs_extra.h"
 #include "vma/util/sysctl_reader.h"
-
+#include "vma/vma_extra.h"
 
 typedef enum {
-	MCE_SPEC_DEFAULT = 0,
-	MCE_SPEC_SOCKPERF_LL_10 = 10,
-	MCE_SPEC_29WEST_LBM_29 = 29,
-	MCE_SPEC_WOMBAT_FH_LBM_554 = 554,
-	MCE_SPEC_RTI_784 = 784,
-	MCE_SPEC_NETEFFECT_63 = 63,
-	MCE_SPEC_MCD_623 = 623,
-	MCE_SPEC_MCD_IRQ_624 = 624
-} mce_spec_t;
+	MCE_SPEC_NONE = 0,
+	MCE_SPEC_SOCKPERF_ULTRA_LATENCY_10,
+	MCE_SPEC_SOCKPERF_LATENCY_15,
+	MCE_SPEC_29WEST_LBM_29,
+	MCE_SPEC_WOMBAT_FH_LBM_554,
+	MCE_SPEC_MCD_623,
+	MCE_SPEC_MCD_IRQ_624,
+	MCE_SPEC_RTI_784,
+	MCE_SPEC_LL_7750,
+	MCE_SPEC_LL_MULTI_RING,
+
+	MCE_VMA__ALL /* last element */
+} vma_spec_t;
 
 typedef enum {
 	ALLOC_TYPE_ANON = 0,
@@ -64,19 +68,11 @@ typedef enum {
 } alloc_mode_t;
 
 typedef enum {
-	RING_LOGIC_PER_INTERFACE = 0,
-	RING_LOGIC_PER_SOCKET = 10,
-	RING_LOGIC_PER_THREAD = 20,
-	RING_LOGIC_PER_CORE = 30,
-	RING_LOGIC_PER_CORE_ATTACH_THREADS = 31,
-	RING_LOGIC_LAST
-} ring_logic_t;
-
-typedef enum {
 	TS_CONVERSION_MODE_DISABLE = 0, // TS_CONVERSION_MODE_DISABLE must be the first enum
 	TS_CONVERSION_MODE_RAW,
 	TS_CONVERSION_MODE_BEST_POSSIBLE,
 	TS_CONVERSION_MODE_SYNC,
+	TS_CONVERSION_MODE_PTP,
 	TS_CONVERSION_MODE_LAST
 } ts_conversion_mode_t;
 
@@ -190,6 +186,16 @@ static inline const char* internal_thread_tcp_timer_handling_str(internal_thread
 	return "unsupported";
 }
 
+namespace vma_spec {
+	// convert str to vVMA_spec_t; upon error - returns the given 'def_value'
+	vma_spec_t from_str(const char* str, vma_spec_t def_value = MCE_SPEC_NONE);
+
+	// convert int to vVMA_spec_t; upon error - returns the given 'def_value'
+	vma_spec_t from_int(const int int_spec, vma_spec_t def_value = MCE_SPEC_NONE);
+
+	const char * to_str(vma_spec_t level);
+}
+
 ////////////////////////////////////////////////////////////////////////////////
 class vma_exception_handling
 {
@@ -204,6 +210,8 @@ public:
 	}
 
 	typedef enum {
+		MODE_FIRST = -3,
+		MODE_EXIT = -2,
 		MODE_DEBUG = -1,
 		MODE_UNOFFLOAD = 0,
 		MODE_LOG_ERROR,
@@ -217,6 +225,7 @@ public:
 	const char* to_str()
 	{
 		switch (m_mode) {
+		case MODE_EXIT:         return "(exit on failed startup)";
 		case MODE_DEBUG:        return "(just log debug message)";
 		case MODE_UNOFFLOAD:    return "(log debug and un-offload)";
 		case MODE_LOG_ERROR:    return "(log error and un-offload)";
@@ -233,6 +242,7 @@ public:
 
 	vlog_levels_t get_log_severity() {
 		switch (m_mode) {
+		case MODE_EXIT:
 		case MODE_DEBUG:
 		case MODE_UNOFFLOAD:
 			return VLOG_DEBUG;
@@ -249,12 +259,12 @@ public:
 	//
 
 	vma_exception_handling(mode _mode = MODE_DEFAULT) : m_mode(_mode) {
-		if (m_mode >= MODE_LAST || m_mode < MODE_DEBUG)
+		if (m_mode >= MODE_LAST || m_mode <= MODE_FIRST)
 			m_mode = MODE_DEFAULT;
 	}
 
 	explicit vma_exception_handling(int _mode) : m_mode((mode)_mode) {
-		if (m_mode >= MODE_LAST || m_mode < MODE_DEBUG)
+		if (m_mode >= MODE_LAST || m_mode <= MODE_FIRST)
 			m_mode = MODE_DEFAULT;
 	}
 
@@ -284,10 +294,10 @@ struct mce_sys_var {
 
 	vlog_levels_t 	log_level;
 	uint32_t	log_details;
-	char 		log_filename[FILENAME_MAX];
-	char		stats_filename[FILENAME_MAX];
-	char		stats_shmem_dirname[FILENAME_MAX];
-	char 		conf_filename[FILENAME_MAX];
+	char 		log_filename[FILE_NAME_MAX_SIZE];
+	char		stats_filename[FILE_NAME_MAX_SIZE];
+	char		stats_shmem_dirname[FILE_NAME_MAX_SIZE];
+	char 		conf_filename[FILE_NAME_MAX_SIZE];
 	bool		log_colors;
 	bool 		handle_sigintr;
 	bool		handle_segfault;
@@ -298,6 +308,7 @@ struct mce_sys_var {
 	int		ring_migration_ratio_tx;
 	int		ring_migration_ratio_rx;
 	int		ring_limit_per_interface;
+	int		ring_dev_mem_tx;
 	int		tcp_max_syn_rate;
 
 	uint32_t 	tx_num_segs_tcp;
@@ -308,7 +319,6 @@ struct mce_sys_var {
 	bool 		tx_mc_loopback_default;
 	bool		tx_nonblocked_eagains;
 	uint32_t	tx_prefetch_bytes;
-	int32_t         tx_backlog_max;
 	uint32_t        tx_bufs_batch_udp;
 	uint32_t        tx_bufs_batch_tcp;
 
@@ -319,10 +329,9 @@ struct mce_sys_var {
 	int32_t		rx_poll_num;
 	int32_t		rx_poll_num_init;
 	uint32_t 	rx_udp_poll_os_ratio;
-	ts_conversion_mode_t	rx_udp_hw_ts_conversion;
+	ts_conversion_mode_t	hw_ts_conversion_mode;
 	bool 		rx_sw_csum;
 	uint32_t 	rx_poll_yield_loops;
-	uint32_t 	rx_skip_os_fd_check;
 	uint32_t 	rx_ready_byte_min_limit;
 	uint32_t 	rx_prefetch_bytes;
 	uint32_t 	rx_prefetch_bytes_before_poll;
@@ -334,12 +343,12 @@ struct mce_sys_var {
 
 	bool		tcp_3t_rules;
 	bool		eth_mc_l2_only_rules;
+	bool		mc_force_flowtag;
 
 	int32_t		select_poll_num;
 	bool		select_poll_os_force;
 	uint32_t	select_poll_os_ratio;
 	uint32_t 	select_skip_os_fd_check;
-	bool		select_arm_cq;
 	bool            select_handle_cpu_usage_stats;
 
 	bool		cq_moderation_enable;
@@ -362,10 +371,12 @@ struct mce_sys_var {
 	uint32_t	tcp_timer_resolution_msec;
 	tcp_ctl_thread_t tcp_ctl_thread;
 	tcp_ts_opt_t	tcp_ts_opt;
+	bool		tcp_nodelay;
+	bool		tcp_quickack;
 	vma_exception_handling exception_handling;
 	bool		avoid_sys_calls_on_tcp_fd;
+	bool		allow_privileged_sock_opt;
 	uint32_t	wait_after_join_msec;
-	in_port_t	block_udp_port;
 	thread_mode_t	thread_mode;
 	buffer_batching_mode_t buffer_batching_mode;
 	alloc_mode_t	mem_alloc_type;
@@ -375,7 +386,7 @@ struct mce_sys_var {
 	uint32_t	lwip_cc_algo_mod;
 	uint32_t 	lwip_mss;
 	char		internal_thread_cpuset[FILENAME_MAX];
-	char		internal_thread_affinity_str[CPU_SETSIZE/4];
+	char		internal_thread_affinity_str[FILENAME_MAX];
 	cpu_set_t	internal_thread_affinity;
 	bool		internal_thread_arm_cq_enabled;
 	internal_thread_tcp_timer_handling_t internal_thread_tcp_timer_handling;	
@@ -389,11 +400,12 @@ struct mce_sys_var {
 	uint32_t	neigh_wait_till_send_arp_msec;
 	uint32_t	neigh_num_err_retries;
 
-	bool 		suppress_igmp_warning;
-
 	uint32_t 	vma_time_measure_num_samples;
 	char 		vma_time_measure_filename[FILENAME_MAX];
 	sysctl_reader_t & sysctl_reader;
+	bool		rx_poll_on_tx_tcp;
+	bool		is_hypervisor;
+	bool		trigger_dummy_send_getsockname;
 
 private:
 	void print_vma_load_failure_msg();
@@ -401,6 +413,7 @@ private:
 	int hex_to_cpuset(char *start, cpu_set_t *cpu_set);
 	int env_to_cpuset(char *orig_start, cpu_set_t *cpu_set);
 	void read_env_variable_with_pid(char* mce_sys_name, size_t mce_sys_max_size, char* env_ptr);
+	bool check_cpuinfo_flag(const char* flag);
 
 	// prevent unautothrized creation of objects
 	mce_sys_var () : sysctl_reader(sysctl_reader_t::instance()){
@@ -432,6 +445,7 @@ extern mce_sys_var & safe_mce_sys();
 #define SYS_VAR_RING_MIGRATION_RATIO_TX                 "VMA_RING_MIGRATION_RATIO_TX"
 #define SYS_VAR_RING_MIGRATION_RATIO_RX                 "VMA_RING_MIGRATION_RATIO_RX"
 #define SYS_VAR_RING_LIMIT_PER_INTERFACE                "VMA_RING_LIMIT_PER_INTERFACE"
+#define SYS_VAR_RING_DEV_MEM_TX                         "VMA_RING_DEV_MEM_TX"
 
 #define SYS_VAR_TX_NUM_SEGS_TCP				"VMA_TX_SEGS_TCP"
 #define SYS_VAR_TX_NUM_BUFS				"VMA_TX_BUFS"
@@ -441,7 +455,6 @@ extern mce_sys_var & safe_mce_sys();
 #define SYS_VAR_TX_MC_LOOPBACK				"VMA_TX_MC_LOOPBACK"
 #define SYS_VAR_TX_NONBLOCKED_EAGAINS			"VMA_TX_NONBLOCKED_EAGAINS"
 #define SYS_VAR_TX_PREFETCH_BYTES			"VMA_TX_PREFETCH_BYTES"
-#define SYS_VAR_TX_BACKLOG_MAX				"VMA_TX_BACKLOG_MAX"
 
 #define SYS_VAR_RX_NUM_BUFS				"VMA_RX_BUFS"
 #define SYS_VAR_RX_NUM_WRE				"VMA_RX_WRE"
@@ -450,7 +463,7 @@ extern mce_sys_var & safe_mce_sys();
 #define SYS_VAR_RX_NUM_POLLS_INIT			"VMA_RX_POLL_INIT"
 #define SYS_VAR_RX_UDP_POLL_OS_RATIO			"VMA_RX_UDP_POLL_OS_RATIO"
 #define SYS_VAR_RX_SW_CSUM				"VMA_RX_SW_CSUM"
-#define SYS_VAR_RX_UDP_HW_TS_CONVERSION			"VMA_RX_UDP_HW_TS_CONVERSION"
+#define SYS_VAR_HW_TS_CONVERSION_MODE			"VMA_HW_TS_CONVERSION"
 // The following 2 params were replaced by VMA_RX_UDP_POLL_OS_RATIO
 #define SYS_VAR_RX_POLL_OS_RATIO			"VMA_RX_POLL_OS_RATIO"
 #define SYS_VAR_RX_SKIP_OS				"VMA_RX_SKIP_OS"
@@ -462,6 +475,7 @@ extern mce_sys_var & safe_mce_sys();
 #define SYS_VAR_GRO_STREAMS_MAX				"VMA_GRO_STREAMS_MAX"
 #define SYS_VAR_TCP_3T_RULES				"VMA_TCP_3T_RULES"
 #define SYS_VAR_ETH_MC_L2_ONLY_RULES			"VMA_ETH_MC_L2_ONLY_RULES"
+#define SYS_VAR_MC_FORCE_FLOWTAG			"VMA_MC_FORCE_FLOWTAG"
 
 #define SYS_VAR_SELECT_CPU_USAGE_STATS			"VMA_CPU_USAGE_STATS"
 #define SYS_VAR_SELECT_NUM_POLLS			"VMA_SELECT_POLL"
@@ -487,8 +501,11 @@ extern mce_sys_var & safe_mce_sys();
 #define SYS_VAR_TCP_TIMER_RESOLUTION_MSEC		"VMA_TCP_TIMER_RESOLUTION_MSEC"
 #define SYS_VAR_TCP_CTL_THREAD				"VMA_TCP_CTL_THREAD"
 #define SYS_VAR_TCP_TIMESTAMP_OPTION			"VMA_TCP_TIMESTAMP_OPTION"
+#define SYS_VAR_TCP_NODELAY				"VMA_TCP_NODELAY"
+#define SYS_VAR_TCP_QUICKACK				"VMA_TCP_QUICKACK"
 #define SYS_VAR_VMA_EXCEPTION_HANDLING			(vma_exception_handling::getSysVar())
 #define SYS_VAR_AVOID_SYS_CALLS_ON_TCP_FD		"VMA_AVOID_SYS_CALLS_ON_TCP_FD"
+#define SYS_VAR_ALLOW_PRIVILEGED_SOCK_OPT		"VMA_ALLOW_PRIVILEGED_SOCK_OPT"
 #define SYS_VAR_WAIT_AFTER_JOIN_MSEC			"VMA_WAIT_AFTER_JOIN_MSEC"
 #define SYS_VAR_THREAD_MODE				"VMA_THREAD_MODE"
 #define SYS_VAR_BUFFER_BATCHING_MODE			"VMA_BUFFER_BATCHING_MODE"
@@ -518,11 +535,10 @@ extern mce_sys_var & safe_mce_sys();
 #define SYS_VAR_NEIGH_UC_ARP_DELAY_MSEC			"VMA_NEIGH_UC_ARP_DELAY_MSEC"
 #define SYS_VAR_NEIGH_NUM_ERR_RETRIES			"VMA_NEIGH_NUM_ERR_RETRIES"
 
-#define SYS_VAR_SUPPRESS_IGMP_WARNING			"VMA_SUPPRESS_IGMP_WARNING"
-
 #define SYS_VAR_VMA_TIME_MEASURE_NUM_SAMPLES		"VMA_TIME_MEASURE_NUM_SAMPLES"
 #define SYS_VAR_VMA_TIME_MEASURE_DUMP_FILE		"VMA_TIME_MEASURE_DUMP_FILE"
-
+#define SYS_VAR_VMA_RX_POLL_ON_TX_TCP			"VMA_RX_POLL_ON_TX_TCP"
+#define SYS_VAR_VMA_TRIGGER_DUMMY_SEND_GETSOCKNAME	"VMA_TRIGGER_DUMMY_SEND_GETSOCKNAME"
 
 #define MCE_DEFAULT_LOG_FILE				("")
 #define MCE_DEFAULT_CONF_FILE				("/etc/libvma.conf")
@@ -539,12 +555,13 @@ extern mce_sys_var & safe_mce_sys();
 #define MCE_DEFAULT_RING_MIGRATION_RATIO_TX             (100)
 #define MCE_DEFAULT_RING_MIGRATION_RATIO_RX             (100)
 #define MCE_DEFAULT_RING_LIMIT_PER_INTERFACE            (0)
+#define MCE_DEFAULT_RING_DEV_MEM_TX                     (0)
 #define MCE_DEFAULT_TCP_MAX_SYN_RATE                	(0)
 #define MCE_DEFAULT_TX_NUM_SEGS_TCP			(1000000)
 #define MCE_DEFAULT_TX_NUM_BUFS				(200000)
-#define MCE_DEFAULT_TX_NUM_WRE				(3000)
+#define MCE_DEFAULT_TX_NUM_WRE				(2048)
 #define MCE_DEFAULT_TX_NUM_WRE_TO_SIGNAL		(64)
-#define MCE_DEFAULT_TX_MAX_INLINE			(220) //224
+#define MCE_DEFAULT_TX_MAX_INLINE			(204) //+18(always inline ETH header) = 222
 #define MCE_DEFAULT_TX_BUILD_IP_CHKSUM			(true)
 #define MCE_DEFAULT_TX_MC_LOOPBACK			(true)
 #define MCE_DEFAULT_TX_NONBLOCKED_EAGAINS		(false)
@@ -554,22 +571,31 @@ extern mce_sys_var & safe_mce_sys();
 #define MCE_DEFAULT_TX_NUM_SGE				(2)
 #define MCE_DEFAULT_RX_NUM_BUFS				(200000)
 #define MCE_DEFAULT_RX_BUFS_BATCH			(64)
+#ifdef DEFINED_VMAPOLL
+#define MCE_DEFAULT_RX_NUM_WRE				(1024)
+#else
 #define MCE_DEFAULT_RX_NUM_WRE				(16000)
+#endif // DEFINED_VMAPOLL
 #define MCE_DEFAULT_RX_NUM_WRE_TO_POST_RECV		(64)
 #define MCE_DEFAULT_RX_NUM_SGE				(1)
 #define MCE_DEFAULT_RX_NUM_POLLS			(100000)
 #define MCE_DEFAULT_RX_NUM_POLLS_INIT			(0)
 #define MCE_DEFAULT_RX_UDP_POLL_OS_RATIO		(100)
-#define MCE_DEFAULT_RX_UDP_HW_TS_CONVERSION		(TS_CONVERSION_MODE_SYNC)
+#define MCE_DEFAULT_HW_TS_CONVERSION_MODE		(TS_CONVERSION_MODE_SYNC)
 #define MCE_DEFUALT_RX_SW_CSUM				(true)
 #define MCE_DEFAULT_RX_POLL_YIELD			(0)
 #define MCE_DEFAULT_RX_BYTE_MIN_LIMIT			(65536)
 #define MCE_DEFAULT_RX_PREFETCH_BYTES			(256)
 #define MCE_DEFAULT_RX_PREFETCH_BYTES_BEFORE_POLL	(0)
 #define MCE_DEFAULT_RX_CQ_DRAIN_RATE			(MCE_RX_CQ_DRAIN_RATE_DISABLED)
+#ifdef DEFINED_VMAPOLL
+#define MCE_DEFAULT_GRO_STREAMS_MAX			(0)
+#else
 #define MCE_DEFAULT_GRO_STREAMS_MAX			(32)
+#endif // DEFINED_VMAPOLL
 #define MCE_DEFAULT_TCP_3T_RULES			(false)
 #define MCE_DEFAULT_ETH_MC_L2_ONLY_RULES		(false)
+#define MCE_DEFAULT_MC_FORCE_FLOWTAG			(false)
 #define MCE_DEFAULT_SELECT_NUM_POLLS			(100000)
 #define MCE_DEFAULT_SELECT_POLL_OS_FORCE		(0)
 #define MCE_DEFAULT_SELECT_POLL_OS_RATIO		(10)
@@ -599,8 +625,11 @@ extern mce_sys_var & safe_mce_sys();
 #define MCE_DEFAULT_TCP_TIMER_RESOLUTION_MSEC		(100)
 #define MCE_DEFAULT_TCP_CTL_THREAD			(CTL_THREAD_DISABLE)
 #define MCE_DEFAULT_TCP_TIMESTAMP_OPTION		(TCP_TS_OPTION_DISABLE)
+#define MCE_DEFAULT_TCP_NODELAY 			(false)
+#define MCE_DEFAULT_TCP_QUICKACK			(false)
 #define MCE_DEFAULT_VMA_EXCEPTION_HANDLING	(vma_exception_handling::MODE_DEFAULT)
 #define MCE_DEFAULT_AVOID_SYS_CALLS_ON_TCP_FD		(false)
+#define MCE_DEFAULT_ALLOW_PRIVILEGED_SOCK_OPT		(true)
 #define MCE_DEFAULT_WAIT_AFTER_JOIN_MSEC		(0)
 #define MCE_DEFAULT_THREAD_MODE				(THREAD_MODE_MULTI)
 #define MCE_DEFAULT_BUFFER_BATCHING_MODE		(BUFFER_BATCHING_WITH_RECLAIM)
@@ -615,8 +644,6 @@ extern mce_sys_var & safe_mce_sys();
 #define MCE_DEFAULT_MTU					(0)
 #define MCE_DEFAULT_MSS					(0)
 #define MCE_DEFAULT_LWIP_CC_ALGO_MOD			(0)
-#define MCE_DEFAULT_QP_LOGIC				(QP_ALLOC_LOGIC__SINGLE_QP_PER_PORT_PER_LOCAL_IP)
-#define MCE_DEFAULT_CQ_LOGIC				(CQ_ALLOC_LOGIC__CQ_PER_HCA)
 #define MCE_DEFAULT_INTERNAL_THREAD_AFFINITY		(-1)
 #define MCE_DEFAULT_INTERNAL_THREAD_AFFINITY_STR	("-1")
 #define MCE_DEFAULT_INTERNAL_THREAD_CPUSET		("")
@@ -624,10 +651,8 @@ extern mce_sys_var & safe_mce_sys();
 #define MCE_DEFAULT_NETLINK_TIMER_MSEC			(10000)
 
 #define MCE_DEFAULT_NEIGH_UC_ARP_QUATA			3
-#define MCE_DEFAULT_NEIGH_UC_ARP_DELAY_MSEC	10000
+#define MCE_DEFAULT_NEIGH_UC_ARP_DELAY_MSEC		10000
 #define MCE_DEFAULT_NEIGH_NUM_ERR_RETRIES		1
-
-#define MCE_DEFAULT_SUPPRESS_IGMP_WARNING		0
 
 #define MCE_DEFAULT_TIME_MEASURE_NUM_SAMPLES		(10000)
 #define MCE_DEFAULT_TIME_MEASURE_DUMP_FILE		"/tmp/VMA_inst.dump"
@@ -644,6 +669,8 @@ extern mce_sys_var & safe_mce_sys();
 #define MCE_MIN_CQ_POLL_BATCH				(1)
 #define MCE_MAX_CQ_POLL_BATCH				(128)
 #define MCE_DEFAULT_IPOIB_FLAG				(1)
+#define MCE_DEFAULT_RX_POLL_ON_TX_TCP			(false)
+#define MCE_DEFAULT_TRIGGER_DUMMY_SEND_GETSOCKNAME	(false)
 
 #define MCE_ALIGNMENT					((unsigned long)63)
 #define RX_BUF_SIZE(mtu)				(mtu + IPOIB_HDR_LEN + GRH_HDR_LEN) // RX buffers are larger in IB
@@ -652,10 +679,7 @@ extern mce_sys_var & safe_mce_sys();
 #define NUM_RX_WRE_TO_POST_RECV_MAX			1024
 #define TCP_MAX_SYN_RATE_TOP_LIMIT			100000
 #define DEFAULT_MC_TTL					64
-#define MAX_FREG_MEM_BUF				(MCE_DEFAULT_RX_NUM_BUFS/100)
-#define IBVERBS_ABI_VER_PARAM_FILE			"/sys/class/infiniband_verbs/abi_version"
 #define IFTYPE_PARAM_FILE				"/sys/class/net/%s/type"
-#define IFADDR_LEN_PARAM_FILE				"/sys/class/net/%s/addr_len"
 #define IFADDR_MTU_PARAM_FILE				"/sys/class/net/%s/mtu"
 #define UMCAST_PARAM_FILE				"/sys/class/net/%s/umcast"
 #define IPOIB_MODE_PARAM_FILE				"/sys/class/net/%s/mode"
@@ -671,33 +695,17 @@ extern mce_sys_var & safe_mce_sys();
 #define BONDING_SLAVE_STATE_PARAM_FILE			"/sys/class/net/%s/bonding_slave/state"
 #define L2_ADDR_FILE_FMT                                "/sys/class/net/%.*s/address"
 #define L2_BR_ADDR_FILE_FMT                                   "/sys/class/net/%.*s/broadcast"
-#define FLAGS_PARAM_FILE				"/sys/class/net/%s/flags"
 #define OPER_STATE_PARAM_FILE				"/sys/class/net/%s/operstate"
-#define IGMP_FORCE_PARAM_FILE				"/proc/sys/net/ipv4/conf/%s/force_igmp_version"
-#define IGMP_MAX_MEMBERSHIP_FILE			"/proc/sys/net/ipv4/igmp_max_memberships"
-#define TCP_SCALING_WINDOW_MAX_RECV_MEM_FILE		"/proc/sys/net/core/rmem_max"
-#define TCP_SCALING_WINDOW_FILE				"/proc/sys/net/ipv4/tcp_window_scaling"
-#define ARP_TABLE_FILE					"/proc/net/arp"
 #define RAW_QP_PRIVLIGES_PARAM_FILE			"/sys/module/ib_uverbs/parameters/disable_raw_qp_enforcement"
-#define FLOW_STEERING_PARAM_FILE			"/sys/module/mlx4_core/parameters/flow_steering"
-#define FLOW_STEERING_HASH_PARAM_FILE			"/sys/module/mlx4_core/parameters/flow_steering_hash"
 #define FLOW_STEERING_MGM_ENTRY_SIZE_PARAM_FILE		"/sys/module/mlx4_core/parameters/log_num_mgm_entry_size"
 #define VIRTUAL_DEVICE_FOLDER			"/sys/devices/virtual/net/%s/"
 #define BOND_DEVICE_FILE				"/proc/net/bonding/%s"
-#define MLX4_DRIVER_PATH				"/sys/class/net/%s/device/driver/module/drivers/pci:mlx4_core"
-#define PROC_STATUS_FILE				"/proc/%d/status"
 
 #define MAX_STATS_FD_NUM				1024
-#define UNSENT_QUEUEU_SIZE				1024
 #define MAX_WINDOW_SCALING				14
 
-/**
- * Macros for single/multi thread support
- */
-#define MULTI_THREAD_ONLY(x) 	{ if (safe_mce_sys().thread_mode > THREAD_MODE_SINGLE) x; }
+#define VIRTUALIZATION_FLAG				"hypervisor"
 
-
-extern struct mce_sys_var & mce_sys;
 extern bool g_b_exit;
 extern bool g_is_forked_child;
 extern bool g_init_global_ctors_done;

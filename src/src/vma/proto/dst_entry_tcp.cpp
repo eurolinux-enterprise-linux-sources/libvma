@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2001-2016 Mellanox Technologies, Ltd. All rights reserved.
+ * Copyright (c) 2001-2017 Mellanox Technologies, Ltd. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -47,8 +47,10 @@
 #define dst_tcp_logfuncall         __log_info_finer
 
 
-dst_entry_tcp::dst_entry_tcp(in_addr_t dst_ip, uint16_t dst_port, uint16_t src_port, int owner_fd):
-			       dst_entry(dst_ip, dst_port, src_port, owner_fd), m_n_sysvar_tx_bufs_batch_tcp(safe_mce_sys().tx_bufs_batch_tcp)
+dst_entry_tcp::dst_entry_tcp(in_addr_t dst_ip, uint16_t dst_port, uint16_t src_port,
+			     int owner_fd, resource_allocation_key &ring_alloc_logic):
+			     dst_entry(dst_ip, dst_port, src_port, owner_fd, ring_alloc_logic),
+			     m_n_sysvar_tx_bufs_batch_tcp(safe_mce_sys().tx_bufs_batch_tcp)
 {
 
 }
@@ -64,8 +66,9 @@ transport_t dst_entry_tcp::get_transport(sockaddr_in to)
 	return TRANS_VMA;
 }
 
-ssize_t dst_entry_tcp::fast_send(const struct iovec* p_iov, const ssize_t sz_iov, bool b_blocked /*= true*/, bool is_rexmit /*= false*/, bool dont_inline /*= false*/)
+ssize_t dst_entry_tcp::fast_send(const iovec* p_iov, const ssize_t sz_iov, bool is_dummy, bool b_blocked /*= true*/, bool is_rexmit /*= false*/)
 {
+	int ret = 0;
 	tx_packet_template_t* p_pkt;
 	mem_buf_desc_t *p_mem_buf_desc;
 	size_t total_packet_len = 0;
@@ -85,9 +88,6 @@ ssize_t dst_entry_tcp::fast_send(const struct iovec* p_iov, const ssize_t sz_iov
 		no_copy = false;
 	}
 
-	if (unlikely(is_rexmit))
-		m_p_ring->inc_ring_stats(m_id);
-
 	if (likely(no_copy)) {
 		p_pkt = (tx_packet_template_t*)((uint8_t*)p_tcp_iov[0].iovec.iov_base - m_header.m_aligned_l2_l3_len);
 		total_packet_len = p_tcp_iov[0].iovec.iov_len + m_header.m_total_hdr_len;
@@ -100,18 +100,8 @@ ssize_t dst_entry_tcp::fast_send(const struct iovec* p_iov, const ssize_t sz_iov
 		m_sge[0].addr = (uintptr_t)((uint8_t*)p_pkt + hdr_alignment_diff);
 		m_sge[0].length = total_packet_len;
 
-		/* for DEBUG */
-		if ((uint8_t*)m_sge[0].addr < p_tcp_iov[0].p_desc->p_buffer || (uint8_t*)p_pkt < p_tcp_iov[0].p_desc->p_buffer) {
-			dst_tcp_logerr("p_buffer - addr=%d, m_total_hdr_len=%zd, p_buffer=%p, type=%d, len=%d, tot_len=%d, payload=%p, hdr_alignment_diff=%zd\n",
-					(int)(p_tcp_iov[0].p_desc->p_buffer - (uint8_t*)m_sge[0].addr), m_header.m_total_hdr_len,
-					p_tcp_iov[0].p_desc->p_buffer, p_tcp_iov[0].p_desc->lwip_pbuf.pbuf.type,
-					p_tcp_iov[0].p_desc->lwip_pbuf.pbuf.len, p_tcp_iov[0].p_desc->lwip_pbuf.pbuf.tot_len,
-					p_tcp_iov[0].p_desc->lwip_pbuf.pbuf.payload, hdr_alignment_diff);
-		}
-
-		if (!dont_inline && (total_packet_len < m_max_inline)) { // inline send
+		if (total_packet_len < m_max_inline) { // inline send
 			m_p_send_wqe = &m_inline_send_wqe;
-
 		} else {
 			m_p_send_wqe = &m_not_inline_send_wqe;
 		}
@@ -126,12 +116,22 @@ ssize_t dst_entry_tcp::fast_send(const struct iovec* p_iov, const ssize_t sz_iov
 		p_tcphdr->check = compute_tcp_checksum(&p_pkt->hdr.m_ip_hdr, (const uint16_t *)p_tcphdr);
 		dst_tcp_logfine("using SW checksum calculation: p_pkt->hdr.m_ip_hdr.check=%d, p_tcphdr->check=%d", (int)p_pkt->hdr.m_ip_hdr.check, (int)p_tcphdr->check);
 #endif
-		m_p_ring->send_lwip_buffer(m_id, m_p_send_wqe, b_blocked);
+		send_lwip_buffer(m_id, m_p_send_wqe, b_blocked, is_dummy);
+
+		/* for DEBUG */
+		if ((uint8_t*)m_sge[0].addr < p_tcp_iov[0].p_desc->p_buffer || (uint8_t*)p_pkt < p_tcp_iov[0].p_desc->p_buffer) {
+			dst_tcp_logerr("p_buffer - addr=%d, m_total_hdr_len=%zd, p_buffer=%p, type=%d, len=%d, tot_len=%d, payload=%p, hdr_alignment_diff=%zd\n",
+					(int)(p_tcp_iov[0].p_desc->p_buffer - (uint8_t*)m_sge[0].addr), m_header.m_total_hdr_len,
+					p_tcp_iov[0].p_desc->p_buffer, p_tcp_iov[0].p_desc->lwip_pbuf.pbuf.type,
+					p_tcp_iov[0].p_desc->lwip_pbuf.pbuf.len, p_tcp_iov[0].p_desc->lwip_pbuf.pbuf.tot_len,
+					p_tcp_iov[0].p_desc->lwip_pbuf.pbuf.payload, hdr_alignment_diff);
+		}
 	}
 	else { // We don'nt support inline in this case, since we believe that this a very rare case
 		p_mem_buf_desc = get_buffer(b_blocked);
 		if (p_mem_buf_desc == NULL) {
-			return -1;
+			ret = -1;
+			goto out;
 		}
 
 		m_header.copy_l2_ip_hdr((tx_packet_template_t*)p_mem_buf_desc->p_buffer);
@@ -148,15 +148,6 @@ ssize_t dst_entry_tcp::fast_send(const struct iovec* p_iov, const ssize_t sz_iov
 		m_sge[0].length = total_packet_len - hdr_alignment_diff;
 		// LKey will be updated in ring->send() // m_sge[0].lkey = p_mem_buf_desc->lkey; 
 
-		/* for DEBUG */
-		if ((uint8_t*)m_sge[0].addr < p_mem_buf_desc->p_buffer) {
-			dst_tcp_logerr("p_buffer - addr=%d, m_total_hdr_len=%zd, p_buffer=%p, type=%d, len=%d, tot_len=%d, payload=%p, hdr_alignment_diff=%zd\n",
-					(int)(p_mem_buf_desc->p_buffer - (uint8_t*)m_sge[0].addr), m_header.m_total_hdr_len,
-					p_mem_buf_desc->p_buffer, p_mem_buf_desc->lwip_pbuf.pbuf.type,
-					p_mem_buf_desc->lwip_pbuf.pbuf.len, p_mem_buf_desc->lwip_pbuf.pbuf.tot_len,
-					p_mem_buf_desc->lwip_pbuf.pbuf.payload, hdr_alignment_diff);
-		}
-
 		p_pkt = (tx_packet_template_t*)((uint8_t*)p_mem_buf_desc->p_buffer);
 		p_pkt->hdr.m_ip_hdr.tot_len = (htons)(m_sge[0].length - m_header.m_transport_header_len);
 #ifdef VMA_NO_HW_CSUM
@@ -169,30 +160,37 @@ ssize_t dst_entry_tcp::fast_send(const struct iovec* p_iov, const ssize_t sz_iov
 #endif
 		m_p_send_wqe = &m_not_inline_send_wqe;
 		m_p_send_wqe->wr_id = (uintptr_t)p_mem_buf_desc;
-		m_p_ring->send_ring_buffer(m_id, m_p_send_wqe, b_blocked);
-	}
+		vma_wr_tx_packet_attr attr = (vma_wr_tx_packet_attr)((VMA_TX_PACKET_BLOCK*b_blocked) | 
+								     (VMA_TX_PACKET_DUMMY*is_dummy)  |
+								      VMA_TX_PACKET_L3_CSUM          |
+								      VMA_TX_PACKET_L4_CSUM);
+		send_ring_buffer(m_id, m_p_send_wqe, attr);
 
-#ifndef __COVERITY__
-        struct tcphdr* p_tcp_h = (struct tcphdr*)(((uint8_t*)(&(p_pkt->hdr.m_ip_hdr))+sizeof(p_pkt->hdr.m_ip_hdr)));
-        NOT_IN_USE(p_tcp_h); /* to supress warning in case VMA_OPTIMIZE_LOG */
-        dst_tcp_logfunc("Tx TCP segment info: src_port=%d, dst_port=%d, flags='%s%s%s%s%s%s' seq=%u, ack=%u, win=%u, payload_sz=%u",
-                        ntohs(p_tcp_h->source), ntohs(p_tcp_h->dest),
-                        p_tcp_h->urg?"U":"", p_tcp_h->ack?"A":"", p_tcp_h->psh?"P":"",
-                        p_tcp_h->rst?"R":"", p_tcp_h->syn?"S":"", p_tcp_h->fin?"F":"",
-                        ntohl(p_tcp_h->seq), ntohl(p_tcp_h->ack_seq), ntohs(p_tcp_h->window),
-                        total_packet_len- p_tcp_h->doff*4 -34);
-#endif
+		/* for DEBUG */
+		if ((uint8_t*)m_sge[0].addr < p_mem_buf_desc->p_buffer) {
+			dst_tcp_logerr("p_buffer - addr=%d, m_total_hdr_len=%zd, p_buffer=%p, type=%d, len=%d, tot_len=%d, payload=%p, hdr_alignment_diff=%zd\n",
+					(int)(p_mem_buf_desc->p_buffer - (uint8_t*)m_sge[0].addr), m_header.m_total_hdr_len,
+					p_mem_buf_desc->p_buffer, p_mem_buf_desc->lwip_pbuf.pbuf.type,
+					p_mem_buf_desc->lwip_pbuf.pbuf.len, p_mem_buf_desc->lwip_pbuf.pbuf.tot_len,
+					p_mem_buf_desc->lwip_pbuf.pbuf.payload, hdr_alignment_diff);
+		}
+	}
 
 	if (unlikely(m_p_tx_mem_buf_desc_list == NULL)) {
 		m_p_tx_mem_buf_desc_list = m_p_ring->mem_buf_tx_get(m_id, b_blocked, m_n_sysvar_tx_bufs_batch_tcp);
 	}
 
-	return 0;
+out:
+	if (unlikely(is_rexmit)) {
+		m_p_ring->inc_tx_retransmissions(m_id);
+	}
+
+	return ret;
 }
 
 
 
-ssize_t dst_entry_tcp::slow_send(const iovec* p_iov, size_t sz_iov, bool b_blocked /*= true*/, bool is_rexmit /*= false*/, int flags /*= 0*/, socket_fd_api* sock /*= 0*/, tx_call_t call_type /*= 0*/)
+ssize_t dst_entry_tcp::slow_send(const iovec* p_iov, size_t sz_iov, bool is_dummy, const int ratelimit_kbps, bool b_blocked /*= true*/, bool is_rexmit /*= false*/, int flags /*= 0*/, socket_fd_api* sock /*= 0*/, tx_call_t call_type /*= 0*/)
 {
 	ssize_t ret_val = -1;
 
@@ -202,7 +200,7 @@ ssize_t dst_entry_tcp::slow_send(const iovec* p_iov, size_t sz_iov, bool b_block
 
 	m_slow_path_lock.lock();
 
-	prepare_to_send(true);
+	prepare_to_send(ratelimit_kbps, true);
 
 	if (m_b_is_offloaded) {
 		if (!is_valid()) { // That means that the neigh is not resolved yet
@@ -210,7 +208,7 @@ ssize_t dst_entry_tcp::slow_send(const iovec* p_iov, size_t sz_iov, bool b_block
 			ret_val = pass_buff_to_neigh(p_iov, sz_iov);
 		}
 		else {
-			ret_val = fast_send(p_iov, sz_iov, b_blocked, is_rexmit);
+			ret_val = fast_send(p_iov, sz_iov, is_dummy, b_blocked, is_rexmit);
 		}
 	}
 	else {
@@ -220,13 +218,13 @@ ssize_t dst_entry_tcp::slow_send(const iovec* p_iov, size_t sz_iov, bool b_block
 	return ret_val;
 }
 
-ssize_t dst_entry_tcp::slow_send_neigh(const iovec* p_iov, size_t sz_iov)
+ssize_t dst_entry_tcp::slow_send_neigh( const iovec* p_iov, size_t sz_iov, const int ratelimit_kbps)
 {
 	ssize_t ret_val = -1;
 
 	m_slow_path_lock.lock();
 
-	prepare_to_send(true);
+	prepare_to_send(ratelimit_kbps, true);
 
 	if (m_b_is_offloaded) {
 		ret_val = pass_buff_to_neigh(p_iov, sz_iov);
@@ -244,14 +242,6 @@ void dst_entry_tcp::configure_headers()
 {
 	m_header.init();
 	dst_entry::configure_headers();
-}
-
-bool dst_entry_tcp::conf_hdrs_and_snd_wqe()
-{
-	bool ret_val = dst_entry::conf_hdrs_and_snd_wqe();
-	m_p_send_wqe_handler->enable_hw_csum(m_not_inline_send_wqe);
-
-	return ret_val;
 }
 
 ssize_t dst_entry_tcp::pass_buff_to_neigh(const iovec * p_iov, size_t & sz_iov, uint16_t packet_id)

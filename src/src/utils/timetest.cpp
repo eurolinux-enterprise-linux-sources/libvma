@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2001-2016 Mellanox Technologies, Ltd. All rights reserved.
+ * Copyright (c) 2001-2017 Mellanox Technologies, Ltd. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -35,7 +35,7 @@
 #include <cstring>
 #include <iostream>
 #include "clock.h"
-#include "rdtsc.h"
+#include "utils/rdtsc.h"
 
 #define ITERATION_NUM 10000000
 #define ITERATION_NUM_LOW_PPS 100

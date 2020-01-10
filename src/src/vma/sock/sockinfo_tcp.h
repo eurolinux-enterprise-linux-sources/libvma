@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2001-2016 Mellanox Technologies, Ltd. All rights reserved.
+ * Copyright (c) 2001-2017 Mellanox Technologies, Ltd. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -40,6 +40,7 @@
 #include "vma/sock/socket_fd_api.h"
 #include "vma/dev/buffer_pool.h"
 #include "vma/dev/cq_mgr.h"
+#include "vma/vma_extra.h"
 
 // LWIP includes
 #include "vma/lwip/opt.h"
@@ -92,7 +93,7 @@ typedef std::map<peer_key, vma_desc_list_t> peer_map_t;
 class sockinfo_tcp : public sockinfo, public timer_handler
 {
 public:
-	sockinfo_tcp(int fd) throw (vma_exception);
+	sockinfo_tcp(int fd);
 	virtual ~sockinfo_tcp();
 
 	virtual void clean_obj();
@@ -115,10 +116,10 @@ public:
 	void create_dst_entry();
 	bool prepare_dst_to_send(bool is_accepted_socket = false);
 
-	virtual int fcntl(int __cmd, unsigned long int __arg) throw (vma_error);
-	virtual int ioctl(unsigned long int __request, unsigned long int __arg)  throw (vma_error);
-	virtual int setsockopt(int __level, int __optname, const void *__optval, socklen_t __optlen) throw (vma_error);
-	virtual int getsockopt(int __level, int __optname, void *__optval, socklen_t *__optlen) throw (vma_error);
+	virtual int fcntl(int __cmd, unsigned long int __arg);
+	virtual int ioctl(unsigned long int __request, unsigned long int __arg);
+	virtual int setsockopt(int __level, int __optname, const void *__optval, socklen_t __optlen);
+	virtual int getsockopt(int __level, int __optname, void *__optval, socklen_t *__optlen);
 	int getsockopt_offload(int __level, int __optname, void *__optval, socklen_t *__optlen);
 	virtual int connect(const sockaddr*, socklen_t);
 	virtual int bind(const sockaddr *__addr, socklen_t __addrlen);
@@ -127,21 +128,29 @@ public:
 	virtual int accept4(struct sockaddr *__addr, socklen_t *__addrlen, int __flags);
 	virtual int getsockname(sockaddr *__name, socklen_t *__namelen);
 	virtual int getpeername(sockaddr *__name, socklen_t *__namelen);
-	virtual void statistics_print(vlog_levels_t log_level = VLOG_DEBUG);
+
 	virtual	int	free_packets(struct vma_packet_t *pkts, size_t count);
+#ifdef DEFINED_VMAPOLL	
+	virtual	int	free_buffs(uint16_t len);
+#else
+	virtual void statistics_print(vlog_levels_t log_level = VLOG_DEBUG);	
+#endif // DEFINED_VMAPOLL	
 
 	//Returns the connected pcb, with 5 tuple which matches the input arguments,
 	//in state "SYN Received" or NULL if pcb wasn't found
 
 	struct tcp_pcb* get_syn_received_pcb(in_addr_t src_addr, in_port_t src_port, in_addr_t dest_addr, in_port_t dest_port);
 
-	ssize_t tx(const tx_call_t call_type, const struct iovec *p_iov, const ssize_t sz_iov, const int flags = 0, const struct sockaddr *__to = NULL, const socklen_t __tolen = 0);
+	ssize_t tx(const tx_call_t call_type, const iovec *p_iov, const ssize_t sz_iov, const int flags = 0, const struct sockaddr *__to = NULL, const socklen_t __tolen = 0);
 	ssize_t rx(const rx_call_t call_type, iovec *p_iov, ssize_t sz_iov, int *p_flags, sockaddr *__from = NULL, socklen_t *__fromlen = NULL, struct msghdr *__msg = NULL);
-	static err_t ip_output(struct pbuf *p, void* v_p_conn, int is_rexmit);
-	static err_t ip_output_syn_ack(struct pbuf *p, void* v_p_conn, int is_rexmit);
+	static err_t ip_output(struct pbuf *p, void* v_p_conn, int is_rexmit, uint8_t is_dummy);
+	static err_t ip_output_syn_ack(struct pbuf *p, void* v_p_conn, int is_rexmit, uint8_t is_dummy);
 	static void tcp_state_observer(void* pcb_container, enum tcp_state new_state);
+	static uint16_t get_route_mtu(struct tcp_pcb *pcb);
 
-	virtual bool rx_input_cb(mem_buf_desc_t* p_rx_pkt_mem_buf_desc_info, void* pv_fd_ready_array = NULL);
+	virtual bool rx_input_cb(mem_buf_desc_t* p_rx_pkt_mem_buf_desc_info, void* pv_fd_ready_array);
+	virtual void set_rx_packet_processor(void) { }
+
 	static struct pbuf * tcp_tx_pbuf_alloc(void* p_conn);
 	static void tcp_tx_pbuf_free(void* p_conn, struct pbuf *p_buff);
 	static struct tcp_seg * tcp_seg_alloc(void* p_conn);
@@ -197,6 +206,8 @@ public:
 		return FD_TYPE_SOCKET;
 	}
 
+	virtual bool addr_in_reuse(void) { return false; }
+
 #if _BullseyeCoverage
     #pragma BullseyeCoverage off
 #endif
@@ -226,7 +237,7 @@ private:
 	tcp_sock_offload_e m_sock_offload;
 	tcp_sock_state_e m_sock_state;
 	sockinfo_tcp *m_parent;
-	//received packet source (true if its from internal thread) 
+	//received packet source (true if its from internal thread)
 	bool m_vma_thr;
 	/* connection state machine */
 	int m_conn_timeout;
@@ -286,7 +297,8 @@ private:
 	vma_desc_list_t m_rx_ctl_reuse_list;
 	ready_pcb_map_t m_ready_pcbs;
 	static const unsigned TX_CONSECUTIVE_EAGAIN_THREASHOLD = 10;
-	unsigned m_tx_consecutive_eagain_count;
+	unsigned	m_tx_consecutive_eagain_count;
+	bool		m_sysvar_rx_poll_on_tx_tcp;
 
 	inline void init_pbuf_custom(mem_buf_desc_t *p_desc);
 
@@ -298,6 +310,11 @@ private:
 
 	//Builds rfs key
 	static void create_flow_tuple_key_from_pcb(flow_tuple &key, struct tcp_pcb *pcb);
+
+#ifdef DEFINED_VMAPOLL
+	//auto accept function
+	static void auto_accept_connection(sockinfo_tcp *parent, sockinfo_tcp *child);
+#endif // DEFINED_VMAPOLL	
 
 	// accept cb func
 	static err_t accept_lwip_cb(void *arg, struct tcp_pcb *child_pcb, err_t err);
@@ -336,6 +353,8 @@ private:
 	void register_timer();
 
 	void handle_socket_linger();
+
+	int handle_rx_error();
 
 	/** Function prototype for tcp error callback functions. Called when the pcb
 	 * receives a RST or is unexpectedly closed for any other reason.
@@ -376,7 +395,9 @@ private:
 
 	//lock_spin_recursive m_rx_cq_lck;
 	/* pick all cqs that match given address */
-	int 		rx_wait(int & poll_count, bool is_blocking);
+	virtual int	rx_verify_available_data();
+	inline int 	rx_wait(int & poll_count, bool is_blocking);
+	inline int 	rx_wait_lockless(int & poll_count, bool is_blocking);
 	int 		rx_wait_helper(int & poll_count, bool is_blocking);
 	void 		fit_rcv_wnd(bool force_fit);
 	void 		fit_snd_bufs(unsigned int new_max);
@@ -391,6 +412,7 @@ private:
 	void process_children_ctl_packets();
 	void process_reuse_ctl_packets();
 	void process_rx_ctl_packets();
+	bool check_dummy_send_conditions(const int flags, const iovec* p_iov, const ssize_t sz_iov);
 };
 typedef struct tcp_seg tcp_seg;
 

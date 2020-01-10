@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2001-2016 Mellanox Technologies, Ltd. All rights reserved.
+ * Copyright (c) 2001-2017 Mellanox Technologies, Ltd. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -44,8 +44,11 @@
 #define dst_udp_mc_logfuncall         __log_info_funcall
 
 
-dst_entry_udp_mc::dst_entry_udp_mc(in_addr_t dst_ip, uint16_t dst_port, uint16_t src_port, in_addr_t tx_if_ip, bool mc_b_loopback, uint8_t mc_ttl, int owner_fd) :
-					dst_entry_udp(dst_ip, dst_port, src_port, owner_fd),
+dst_entry_udp_mc::dst_entry_udp_mc(in_addr_t dst_ip, uint16_t dst_port,
+				   uint16_t src_port, in_addr_t tx_if_ip,
+				   bool mc_b_loopback, uint8_t mc_ttl,
+				   int owner_fd, resource_allocation_key &ring_alloc_logic):
+					dst_entry_udp(dst_ip, dst_port, src_port, owner_fd, ring_alloc_logic),
 					m_mc_tx_if_ip(tx_if_ip), m_b_mc_loopback_enabled(mc_b_loopback)
 {
 	m_ttl = mc_ttl;
@@ -81,9 +84,28 @@ bool dst_entry_udp_mc::conf_l2_hdr_and_snd_wqe_ib()
 	return ret_val;
 }
 
-//The following function supposed to be called under m_lock
-bool dst_entry_udp_mc::resolve_net_dev()
+void dst_entry_udp_mc::set_src_addr()
 {
+	m_pkt_src_ip = INADDR_ANY;
+	
+	if (m_bound_ip) {
+		m_pkt_src_ip = m_bound_ip;
+	}
+	else if (m_mc_tx_if_ip.get_in_addr() && !m_mc_tx_if_ip.is_mc()) {
+		m_pkt_src_ip = m_mc_tx_if_ip.get_in_addr();
+	}
+	else if (m_p_rt_val && m_p_rt_val->get_src_addr()) {
+		m_pkt_src_ip = m_p_rt_val->get_src_addr();
+	}
+	else if (m_p_net_dev_val && m_p_net_dev_val->get_local_addr()) {
+		m_pkt_src_ip = m_p_net_dev_val->get_local_addr();
+	}
+}
+
+//The following function supposed to be called under m_lock
+bool dst_entry_udp_mc::resolve_net_dev(bool is_connect)
+{
+	NOT_IN_USE(is_connect);
 	bool ret_val = false;
 	cache_entry_subject<ip_address, net_device_val*>* p_ces = NULL;
 
@@ -125,7 +147,7 @@ bool dst_entry_udp_mc::get_net_dev_val()
 	}
 	else {
 		if (m_p_net_dev_entry) {
-			ret_val = m_p_net_dev_entry->get_val(m_p_net_dev_val);
+			m_p_net_dev_entry->get_val(m_p_net_dev_val);
 			dst_udp_mc_logfunc("%s Using directly netdev entry to get net_dev", to_str().c_str());
 			ret_val = true;
 		}

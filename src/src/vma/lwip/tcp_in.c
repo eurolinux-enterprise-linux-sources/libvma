@@ -69,6 +69,23 @@ static void tcp_parseopt(struct tcp_pcb *pcb, tcp_in_data* in_data);
 
 static err_t tcp_listen_input(struct tcp_pcb_listen *pcb, tcp_in_data* in_data);
 static err_t tcp_timewait_input(struct tcp_pcb *pcb, tcp_in_data* in_data);
+static s8_t tcp_quickack(struct tcp_pcb *pcb, tcp_in_data* in_data);
+
+/**
+ * Send quickack if TCP_QUICKACK is enabled
+ * Change LWIP_TCP_QUICKACK_THRESHOLD value in order to send quickacks
+ * depending on the payload size.
+ */
+s8_t
+tcp_quickack(struct tcp_pcb *pcb, tcp_in_data* in_data)
+{
+#if TCP_QUICKACK_THRESHOLD
+	return pcb->quickack && in_data->tcplen <= TCP_QUICKACK_THRESHOLD;
+#else
+	LWIP_UNUSED_ARG(in_data);
+	return pcb->quickack;
+#endif
+}
 
 #if LWIP_3RD_PARTY_L3
 void
@@ -187,7 +204,6 @@ L3_level_tcp_input(struct pbuf *p, struct tcp_pcb* pcb)
 					   PCB. */
 					tcp_pcb_remove(pcb);
 				} else {
-					err = ERR_OK;
 					/* If the application has registered a "sent" function to be
 					   called when new send buffer space is available, we call it
 					   now. */
@@ -371,7 +387,7 @@ tcp_listen_input(struct tcp_pcb_listen *pcb, tcp_in_data* in_data)
     npcb->rcv_scale = 0;
 
     /* calculate advtsd_mss before parsing MSS option such that the resulting mss will take into account the updated advertized MSS */
-    npcb->advtsd_mss = (LWIP_TCP_MSS > 0) ? tcp_eff_send_mss(LWIP_TCP_MSS, &(npcb->remote_ip)) : tcp_mss_follow_mtu_with_default(536, &(npcb->remote_ip));
+    npcb->advtsd_mss = (LWIP_TCP_MSS > 0) ? tcp_eff_send_mss(LWIP_TCP_MSS, npcb) : tcp_mss_follow_mtu_with_default(536, npcb);
 
     /* Parse any options in the SYN. */
     tcp_parseopt(npcb, in_data);
@@ -385,7 +401,7 @@ tcp_listen_input(struct tcp_pcb_listen *pcb, tcp_in_data* in_data)
   	npcb->snd_wnd_max = npcb->snd_wnd;
   	npcb->ssthresh = npcb->snd_wnd;
 #if TCP_CALCULATE_EFF_SEND_MSS
-    u16_t snd_mss = tcp_eff_send_mss(npcb->mss, &(npcb->remote_ip));
+    u16_t snd_mss = tcp_eff_send_mss(npcb->mss, npcb);
     UPDATE_PCB_BY_MSS(npcb, snd_mss); 
 #endif /* TCP_CALCULATE_EFF_SEND_MSS */
 
@@ -469,8 +485,6 @@ tcp_process(struct tcp_pcb *pcb, tcp_in_data* in_data)
   u8_t acceptable = 0;
   err_t err;
 
-  err = ERR_OK;
-
   /* Process incoming RST segments. */
   if (in_data->flags & TCP_RST) {
     /* First, determine if the reset is acceptable. */
@@ -532,7 +546,7 @@ tcp_process(struct tcp_pcb *pcb, tcp_in_data* in_data)
       set_tcp_state(pcb, ESTABLISHED);
 
 #if TCP_CALCULATE_EFF_SEND_MSS
-      u16_t eff_mss = tcp_eff_send_mss(pcb->mss, &(pcb->remote_ip));
+      u16_t eff_mss = tcp_eff_send_mss(pcb->mss, pcb);
       UPDATE_PCB_BY_MSS(pcb, eff_mss);
 #endif /* TCP_CALCULATE_EFF_SEND_MSS */
 
@@ -766,7 +780,7 @@ tcp_receive(struct tcp_pcb *pcb, tcp_in_data* in_data)
       pcb->snd_wl1 = in_data->seqno;
       pcb->snd_wl2 = in_data->ackno;
       if (pcb->snd_wnd == 0) {
-        if (pcb->persist_backoff == 0) {
+        if (pcb->persist_backoff == 0 && pcb->unacked == NULL) {
           /* start persist timer */
           pcb->persist_cnt = 0;
           pcb->persist_backoff = 1;
@@ -1266,7 +1280,7 @@ tcp_receive(struct tcp_pcb *pcb, tcp_in_data* in_data)
 
 
         /* Acknowledge the segment(s). */
-        if (in_data->recv_data && in_data->recv_data->next) {
+        if ((in_data->recv_data && in_data->recv_data->next) || tcp_quickack(pcb, in_data)) {
         	tcp_ack_now(pcb);
         } else {
         	tcp_ack(pcb);

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2001-2016 Mellanox Technologies, Ltd. All rights reserved.
+ * Copyright (c) 2001-2017 Mellanox Technologies, Ltd. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -30,10 +30,8 @@
  * SOFTWARE.
  */
 
-
 #include "vma/util/to_str.h"
 #include "vma/util/verbs_extra.h"
-#include <string.h>
 
 #ifndef IB_WQE_TEMPLATE_H
 #define IB_WQE_TEMPLATE_H
@@ -46,6 +44,13 @@ public:
 
 	void init_wqe(vma_ibv_send_wr &wqe_to_init, struct ibv_sge* sge_list, uint32_t num_sge);
 	void init_inline_wqe(vma_ibv_send_wr &wqe_to_init, struct ibv_sge* sge_list, uint32_t num_sge);
+	void init_not_inline_wqe(vma_ibv_send_wr &wqe_to_init, struct ibv_sge* sge_list, uint32_t num_sge);
+
+	inline vma_ibv_wr_opcode set_opcode(vma_ibv_send_wr &wqe, vma_ibv_wr_opcode opcode) {
+		vma_ibv_wr_opcode last_opcode = vma_send_wr_opcode(wqe);
+		vma_send_wr_opcode(wqe) = opcode;
+		return last_opcode;
+	}
 
 #ifndef VMA_NO_HW_CSUM
 	inline void  enable_hw_csum (vma_ibv_send_wr &send_wqe) { vma_send_wr_send_flags(send_wqe) |= VMA_IBV_SEND_IP_CSUM; }
@@ -56,13 +61,6 @@ public:
 #endif
 
 	inline void enable_inline (vma_ibv_send_wr &send_wqe) { vma_send_wr_send_flags(send_wqe) |= VMA_IBV_SEND_INLINE; }
-#if _BullseyeCoverage
-    #pragma BullseyeCoverage off
-#endif
-	inline void disable_inline (vma_ibv_send_wr &send_wqe) { vma_send_wr_send_flags(send_wqe) &= ~VMA_IBV_SEND_INLINE; }
-#if _BullseyeCoverage
-    #pragma BullseyeCoverage on
-#endif
 };
 
 #endif /* IB_WQE_TEMPLATE_H */

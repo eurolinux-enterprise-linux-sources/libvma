@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2001-2016 Mellanox Technologies, Ltd. All rights reserved.
+ * Copyright (c) 2001-2017 Mellanox Technologies, Ltd. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -51,10 +51,15 @@
 #include "vma/dev/ah_cleaner.h"
 #include "vma/dev/cq_mgr.h"
 
+#ifdef HAVE_INFINIBAND_MLX5_HW_H
+#include <infiniband/mlx5_hw.h>
+#endif // HAVE_INFINIBAND_MLX5_HW_H
+
 class buffer_pool;
 class cq_mgr;
 class ring;
 class ring_simple;
+class ring_eth_cb;
 
 #ifndef MAX_SUPPORTED_IB_INLINE_SIZE
 #define MAX_SUPPORTED_IB_INLINE_SIZE	884
@@ -93,111 +98,146 @@ typedef hash_map<ibv_gid, uint32_t> mgid_ref_count_map_t;
  */
 class qp_mgr
 {
+friend class cq_mgr;
+friend class cq_mgr_mlx5;
+friend class cq_mgr_mp;
 public:
 	qp_mgr(const ring_simple* p_ring, const ib_ctx_handler* p_context, const uint8_t port_num, const uint32_t tx_num_wr);
 	virtual ~qp_mgr();
 
-	void 			up();
-	void 			down();
+	virtual void        up();
+	virtual void        down();
 
-	int			post_recv(mem_buf_desc_t* p_mem_buf_desc); // Post for receive a list of mem_buf_desc
-	int 			send(vma_ibv_send_wr* p_send_wqe);
+	int                 post_recv(mem_buf_desc_t* p_mem_buf_desc); // Post for receive a list of mem_buf_desc
+	int                 send(vma_ibv_send_wr* p_send_wqe, vma_wr_tx_packet_attr attr);
 
-	uint32_t		get_max_inline_tx_data() const {return m_max_inline_data; }
-	int			get_port_num() const { return m_port_num; }
+	uint32_t            get_max_inline_tx_data() const {return m_max_inline_data; }
+	int                 get_port_num() const { return m_port_num; }
 #if _BullseyeCoverage
     #pragma BullseyeCoverage off
 #endif
-	virtual uint16_t	get_pkey_index() const { return 0; };
-	virtual uint16_t	get_partiton() const { return 0; };
+	virtual uint16_t    get_pkey_index() const { return 0; };
+	virtual uint16_t    get_partiton() const { return 0; };
+	virtual uint32_t    get_underly_qpn() const { return 0; };
 #if _BullseyeCoverage
     #pragma BullseyeCoverage on
 #endif
-	struct ibv_qp*		get_ibv_qp() const { return m_qp; };
-	class cq_mgr*  	get_tx_cq_mgr() const { return m_p_cq_mgr_tx; }
-	class cq_mgr*  	get_rx_cq_mgr() const { return m_p_cq_mgr_rx; }
-	ib_ctx_handler* 	get_ib_ctx_handler() const { return m_p_ib_ctx_handler; }
-	uint32_t		get_rx_max_wr_num();
+	struct ibv_qp*      get_ibv_qp() const { return m_qp; };
+	class cq_mgr*       get_tx_cq_mgr() const { return m_p_cq_mgr_tx; }
+	class cq_mgr*       get_rx_cq_mgr() const { return m_p_cq_mgr_rx; }
+	ib_ctx_handler*     get_ib_ctx_handler() const { return m_p_ib_ctx_handler; }
+	uint32_t            get_rx_max_wr_num();
+	// This function can be replaced with a parameter during ring creation.
+	// chain of calls may serve as cache warm for dummy send feature.
+	inline bool         get_hw_dummy_send_support() {return m_hw_dummy_send_support; }
 
 	// create a AH cleaner object which will be linked to the following post send (if any)
-	void                    ah_cleanup(struct ibv_ah* ah);
+	void                ah_cleanup(struct ibv_ah* ah);
 
-	virtual void 		modify_qp_to_ready_state() = 0;
-	void 			modify_qp_to_error_state();
+	virtual void        modify_qp_to_ready_state() = 0;
+	void                modify_qp_to_error_state();
 
-	void			release_rx_buffers();
-	void 			release_tx_buffers();
-	void			trigger_completion_for_all_sent_packets();
+	void                release_rx_buffers();
+	void                release_tx_buffers();
+	virtual void        trigger_completion_for_all_sent_packets();
+	bool                set_qp_ratelimit(const uint32_t ratelimit_kbps);
+	int                 modify_qp_ratelimit(const uint32_t ratelimit_kbps);
+	static inline bool  is_lib_mlx5(const char* device_name) {return strstr(device_name, "mlx5");}
+	virtual void        dm_release_data(mem_buf_desc_t* buff) { NOT_IN_USE(buff); }
 
 protected:
-	struct ibv_qp*		m_qp;
-	ring_simple*		m_p_ring;
-	uint8_t 		m_port_num;
-	ib_ctx_handler*		m_p_ib_ctx_handler;
+	uint64_t            m_rq_wqe_counter;
+	uint64_t*           m_rq_wqe_idx_to_wrid;
+#ifdef DEFINED_VMAPOLL
+	struct mlx5_qp*	    m_mlx5_hw_qp;
+#endif // DEFINED_VMAPOLL
+	struct ibv_qp*      m_qp;
 
-	ah_cleaner*             m_p_ahc_head;
-	ah_cleaner*             m_p_ahc_tail;
+	ring_simple*        m_p_ring;
+	uint8_t             m_port_num;
+	ib_ctx_handler*     m_p_ib_ctx_handler;
 
-	uint32_t		m_max_inline_data;
-	uint32_t		m_max_qp_wr;
+	ah_cleaner*         m_p_ahc_head;
+	ah_cleaner*         m_p_ahc_tail;
 
-	cq_mgr*			m_p_cq_mgr_rx;
-	cq_mgr*			m_p_cq_mgr_tx;
+	uint32_t            m_max_inline_data;
+	uint32_t            m_max_qp_wr;
 
-	uint32_t 		m_rx_num_wr;
-	uint32_t 		m_tx_num_wr;
+	cq_mgr*             m_p_cq_mgr_rx;
+	cq_mgr*             m_p_cq_mgr_tx;
 
-	const uint32_t 		m_n_sysvar_rx_num_wr_to_post_recv;
-	const uint32_t 		m_n_sysvar_tx_num_wr_to_signal;
-	const uint32_t		m_n_sysvar_rx_prefetch_bytes_before_poll;
+	uint32_t            m_rx_num_wr;
+	uint32_t            m_tx_num_wr;
+
+	bool                m_hw_dummy_send_support;
+
+	uint32_t            m_n_sysvar_rx_num_wr_to_post_recv;
+	const uint32_t      m_n_sysvar_tx_num_wr_to_signal;
+	const uint32_t      m_n_sysvar_rx_prefetch_bytes_before_poll;
 
 	// recv_wr
-	ibv_sge*		m_ibv_rx_sg_array;
-	ibv_recv_wr*		m_ibv_rx_wr_array;
-	uint32_t		m_curr_rx_wr;
-	uintptr_t 		m_last_posted_rx_wr_id; // Remember so in case we flush RQ we know to wait until this WR_ID is received
+	ibv_sge*            m_ibv_rx_sg_array;
+	ibv_recv_wr*        m_ibv_rx_wr_array;
+	uint32_t            m_curr_rx_wr;
+	uintptr_t           m_last_posted_rx_wr_id; // Remember so in case we flush RQ we know to wait until this WR_ID is received
 
 	// send wr
-	uint32_t		m_n_unsignaled_count;
-	uint32_t		m_n_tx_count;
-	mem_buf_desc_t*		m_p_last_tx_mem_buf_desc; // Remembered so we can list several mem_buf_desc_t on a single notification request
+	uint32_t            m_n_unsignaled_count;
+	mem_buf_desc_t*     m_p_last_tx_mem_buf_desc; // Remembered so we can list several mem_buf_desc_t on a single notification request
 
-	mem_buf_desc_t*		m_p_prev_rx_desc_pushed;
+	mem_buf_desc_t*     m_p_prev_rx_desc_pushed;
 
 	// generating packet IDs
-	uint16_t		m_n_ip_id_base;
-	uint16_t		m_n_ip_id_offset;
+	uint16_t            m_n_ip_id_base;
+	uint16_t            m_n_ip_id_offset;
+	uint32_t            m_ratelimit_kbps;
 
-	mgid_ref_count_map_t	m_attach_mc_grp_ref_cnt;
+	mgid_ref_count_map_t  m_attach_mc_grp_ref_cnt;
 
-	int 			configure(struct ibv_comp_channel* p_rx_comp_event_channel);
-	virtual int		prepare_ibv_qp(struct ibv_qp_init_attr& qp_init_attr) = 0;
+	int             configure(struct ibv_comp_channel* p_rx_comp_event_channel);
+	virtual int     prepare_ibv_qp(vma_ibv_qp_init_attr& qp_init_attr) = 0;
+	inline void     set_unsignaled_count(void) { m_n_unsignaled_count = m_n_sysvar_tx_num_wr_to_signal - 1;	}
+
+	virtual cq_mgr* init_rx_cq_mgr(struct ibv_comp_channel* p_rx_comp_event_channel);
+	virtual cq_mgr* init_tx_cq_mgr(void);
+
+	virtual int     post_qp_create(void) { return 0;};
+	virtual int     send_to_wire(vma_ibv_send_wr* p_send_wqe, vma_wr_tx_packet_attr attr, bool request_comp);
+	virtual bool    is_completion_need() { return !m_n_unsignaled_count; };
 };
-
 
 class qp_mgr_eth : public qp_mgr
 {
 public:
-	qp_mgr_eth(const ring_simple* p_ring, const ib_ctx_handler* p_context, const uint8_t port_num,
-			struct ibv_comp_channel* p_rx_comp_event_channel, const uint32_t tx_num_wr, const uint16_t vlan) throw (vma_error) :
-		qp_mgr(p_ring, p_context, port_num, tx_num_wr), m_vlan(vlan) { if(configure(p_rx_comp_event_channel)) throw_vma_exception("failed creating qp"); };
+	qp_mgr_eth(const ring_simple* p_ring, const ib_ctx_handler* p_context,
+		   const uint8_t port_num,
+		   struct ibv_comp_channel* p_rx_comp_event_channel,
+		   const uint32_t tx_num_wr, const uint16_t vlan,
+		   bool call_configure = true):
+			qp_mgr(p_ring, p_context, port_num, tx_num_wr), m_vlan(vlan) {
+		if(call_configure && configure(p_rx_comp_event_channel))
+			throw_vma_exception("failed creating qp");
+	};
+
+	virtual ~qp_mgr_eth() {}
 
 	virtual void 		modify_qp_to_ready_state();
 	virtual uint16_t	get_partiton() const { return m_vlan; };
 
 protected:
-	virtual int		prepare_ibv_qp(struct ibv_qp_init_attr& qp_init_attr);
+	virtual int		prepare_ibv_qp(vma_ibv_qp_init_attr& qp_init_attr);
 private:
 	const uint16_t 		m_vlan;
 };
-
 
 class qp_mgr_ib : public qp_mgr
 {
 public:
 	qp_mgr_ib(const ring_simple* p_ring, const ib_ctx_handler* p_context, const uint8_t port_num,
-			struct ibv_comp_channel* p_rx_comp_event_channel, const uint32_t tx_num_wr, const uint16_t pkey) throw (vma_error) :
-		qp_mgr(p_ring, p_context, port_num, tx_num_wr), m_pkey(pkey) { update_pkey_index(); if(configure(p_rx_comp_event_channel)) throw_vma_exception("failed creating qp"); };
+			struct ibv_comp_channel* p_rx_comp_event_channel, const uint32_t tx_num_wr, const uint16_t pkey):
+	qp_mgr(p_ring, p_context, port_num, tx_num_wr), m_pkey(pkey), m_underly_qpn(0) {
+		update_pkey_index();
+		if(configure(p_rx_comp_event_channel)) throw_vma_exception("failed creating qp"); };
 
 	virtual void 		modify_qp_to_ready_state();
 	virtual uint16_t	get_partiton() const { return m_pkey; };
@@ -208,13 +248,15 @@ public:
 #if _BullseyeCoverage
     #pragma BullseyeCoverage on
 #endif
+	virtual uint32_t	get_underly_qpn() const { return m_underly_qpn; };
 
 protected:
-	virtual int		prepare_ibv_qp(struct ibv_qp_init_attr& qp_init_attr);
+	virtual int		prepare_ibv_qp(vma_ibv_qp_init_attr& qp_init_attr);
 
 private:
 	const uint16_t 		m_pkey;
 	uint16_t 		m_pkey_index;
+	uint32_t 		m_underly_qpn;
 
 	void 			update_pkey_index();
 };

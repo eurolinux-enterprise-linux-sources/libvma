@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2001-2016 Mellanox Technologies, Ltd. All rights reserved.
+ * Copyright (c) 2001-2017 Mellanox Technologies, Ltd. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -36,13 +36,11 @@
 
 #include <netinet/in.h>
 #include <arpa/inet.h>
-
-#include "vma/dev/net_device_val.h"
-#include "vma/dev/net_device_table_mgr.h"
+#include "utils/bullseye.h"
 
 #define BUFF_SIZE 255
 
-class route_val : public cache_observer
+class route_val
 {
 public:
 	route_val();
@@ -60,6 +58,7 @@ public:
 	inline void set_scope(unsigned char scope) 		{ m_scope = scope; };
 	inline void set_type(unsigned char type) 		{ m_type = type; };
 	inline void set_table_id(unsigned char table_id)	{ m_table_id = table_id; };
+	void set_mtu(uint32_t mtu);
 #if _BullseyeCoverage
     #pragma BullseyeCoverage on
 #endif
@@ -78,6 +77,7 @@ public:
 	inline unsigned char 	get_table_id() const		{ return m_table_id; };
 	inline int 		get_if_index() const		{ return m_if_index; };
 	inline const char* 	get_if_name() const		{ return m_if_name; };
+	inline uint32_t		get_mtu() const			{ return m_mtu; };
 
 	inline void set_state(bool state) 			{ m_is_valid = state; };
 	inline bool is_valid() const		 		{ return m_is_valid; };
@@ -127,7 +127,7 @@ private:
 	bool 		m_is_valid;
 	bool 		m_b_deleted;
 	bool 		m_b_if_up;
-
+	uint32_t	m_mtu;
 	char 		m_str[BUFF_SIZE]; // Nice str to represent route_val
 };
 

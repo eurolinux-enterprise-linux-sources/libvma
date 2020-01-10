@@ -1,3 +1,389 @@
+Version 8.4.10-0:
+Date + Time 2017-11-23
+=============================================================
+Added:
+        - RM #1207424 Send quickack depending on the payload size
+        - RM #1179641 Add MTU find logic to ring
+        - RM #1190606 VMA stats - Remove timewait interval in last cycle
+Fixed:
+        - RM #1192017 Fix ibv_destroy_cq() failure while VMA_TCP_3T_RULES=1
+        - RM #1213984 Use dst_enty to find the route MTU
+        - RM #1175479 Inherit missing properties from the parent
+        - RM #1175657 Fix ring statistics are not updated was flowtag is enabled
+        - RM #1201040 Fix VMA_BUFFER_BATCHING_MODE is ignored while set from spec
+
+Version 8.4.9-0:
+Date + Time 2017-11-13
+=============================================================
+Added:
+        - RM #1179641 Override MTU from route over interface MTU
+        - RM #1179641 Add parsing route table metrics
+        - RM #1190054 Rename VMA_SPEC parameter 6973 to 7750
+        - RM #1176937 Add VMA_TCP_QUICKACK environment variable
+        - RM #1176937 Add TCP_QUICKACK option support
+        - RM #1176937 Add delayed ack control into LWIP
+        - RM #1151606 Modify valgrind suppression file
+        - RM #1182826 Check if the module parameters exists
+        - RM #847360 Add Coverity badge to README.md
+        - RM #1172255 Disable parser warning coverity checker
+Fixed:
+        - RM #1182981 Fix TCP zero-window probe message sequence number
+        - RM #1181379 Fix TCP zero window probe when there is data in-flight
+        - RM #1185978 Fix compilation for --enable-opt-log=high
+        - RM #1164732 Fix possible deadlock during connect
+        - RM #1185372 Fix traffic is not offloaded for high VMA_RX_WRE values
+
+Version 8.4.8-0:
+Date + Time 2017-10-10
+=============================================================
+Added:
+        - RM #1163086 Remove pkg.m4 from sources
+        - RM #1156840 Add TCP Tx window availability
+Fixed:
+        - RM #1160823 Fix a crash when reg_mr fails
+
+Version 8.4.7-0:
+Date + Time 2017-10-08
+=============================================================
+Added:
+        - RM #1151343 Update MP RQ dropped packet statistics in case of bad CSUM
+        - RM #1150137 Remove VMA_THROW from functions signature
+Fixed:
+        - RM #1150011 Fix ioctl() FIONREAD return value
+        - RM #1154650 Fix IP fragmentation threshold
+        - RM #1152517 Fix flags order to compile VMA with O3
+
+Version 8.4.6-0:
+Date + Time 2017-09-27
+=============================================================
+Fixed:
+        - RM #1153175 Modify On Device Memory reg_mr API according to libmlx5/libibverbs
+        - RM #1150366 Align memory barrier to verbs's one
+        - RM #1151606 Modify valgrind suppresion file
+        - RM #1147574 Fix missing argument in modify_qp_to_ready_state()
+        - RM #1148076 Remove volatile when handling CQE
+
+Version 8.4.5-0:
+Date + Time 2017-09-19
+=============================================================
+Added:
+        - RM #1065079 Add On Device Memory support
+        - RM #1117626 Move epoll's poll_os logic to the internal thread
+        - RM #1073223 Enable Debian package timestamp
+Fixed:
+        - RM #1088208 consider cache_line when getting CQE
+        - RM #1137302 Solve gcc7.x [deprecated]
+        - RM #1137302 Solve gcc7.x [format-overflow]
+        - RM #1137302 Solve gcc7.x [array-bounds]
+        - RM #1137302 Solve gcc7.x [implicit-fallthrough]
+        - RM #1062367 Fix TCP window deadlock in case of a small window
+        - RM #1134718 Fix lack of interface reinitialization (Tx PRM implementation)
+        - RM #1141586 Fix Valgrind issue - uninitialized byte(s)
+        - RM #1041212 Fix wrong handling of UDP setsockopt() using UDP_MAP_REMOVE
+
+Version 8.4.4-0:
+Date + Time 2017-09-10
+=============================================================
+Added:
+        - RM #1081001 Add netmap API VMA wrapper
+        - RM #1089826 Add statistics to Multi-Packet rings
+Fixed:
+        - RM #1131365 Update output example and default parameters in README.txt
+        - RM #1096849 Fix for the first packet checksum in case VLAN trunk
+        - RM #1127632 Remove ambiguous line from insufficient hugepage warning
+        - RM #1079751 Fix possible crash when migration occurs
+        - RM #1114239 Fix compilation error when configuring using disable-exp-cq
+        - RM #1094542 Reduce interval for syncing time_converter clock parameters
+        - RM #1117819 Nullify application name after freeing its pointer
+
+Version 8.4.3-0:
+Date + Time 2017-08-14
+=============================================================
+Fixed:
+        - RM #1115999 Fix DUMMY_SEND packets in new PostSend PRM
+
+Version 8.4.2-0:
+Date + Time 2017-08-08
+=============================================================
+Added:
+        - RM #1097641 Add a dummy packet send during getsockname()
+        - RM #1055917 Enable dynamic signaling for Tx PostSend PRM
+        - RM #1055917 Enable dynamic WQE size inlining in BlueFlame
+        - RM #1055917 Amend VMAPOLL Tx to use MLX5 PostSend PRM
+        - RM #1055917 Enable TX Post-Send PRM for non-VMAPOLL
+        - RM #1055917 Add scatter/gather array helper
+        - RM #933949 Add KVM virtualization detection
+        - RM #1049758 Support ioctl() with FIONREAD flag
+        - RM #1061103 Improve performance of epoll implementation
+        - RM #1080207 Add an option to gracefully exit() on startup failure
+        - RM #1063479 Add valgrind detection macros
+        - RM #1078695 Disable ring migration for RING_LOGIC_PER_USER_ID
+        - RM #1049980 Eliminate coverity-8.7 failures
+        - RM #1063164 Update License date to 2017
+
+Fixed:
+        - RM #884440 Fix handling of SO_LINGER in case l_linger is zero
+        - RM #863457 Change logic of interface selection in attach receiver
+        - RM #1097116 Reduce amount of log messaging for DBG level
+        - RM #1085670 Fix VMA_POLL crash when exiting
+        - RM #1043830 Add set of gtest cases
+        - RM #1043830 Fix flags parameter verification for UDP flow
+        - RM #1043830 Fix incorrect setting EEXIST in global_ring_wakeup
+        - RM #1043830 Fix error processing for send operations
+        - RM #1079098 Fix array out of range in vma_extra api
+        - RM #1063479 Fix some Valgrind issues in VMA
+        - RM #1075811 Fix csbuild reported errors (one error is suppressed)
+
+Version 8.4.1-0:
+Date + Time 2017-07-04
+=============================================================
+Added:
+        - RM #959307 Link VMA with libnl1 or libnl3 based on libibverbs
+        - RM #1050652 Improve Jenkins - increase csbuild detection timeout, upgrade to cppcheck ver 1.79
+Fixed:
+        - RM #1065276 Fix incorrect logging strings
+
+Version 8.3.7-0:
+Date + Time 2017-06-19
+=============================================================
+Fixed:
+        - RM #1055915 Fix tcp performance related to MP_RQ
+
+Version 8.3.6-0:
+Date + Time 2017-06-14
+=============================================================
+Added:
+        - RM #953382 Support Precision Time Protocol (PTP)
+        - RM #788404 Support Packet Pacing (socket option SO_MAX_PACING_RATE)
+        - RM #1048224 Improve performance while searching for non-offloaded data
+        - RM #1055915 Improve performance under MP-RQ mode
+        - RM #1052605 Increase monitored epoll fds, CQs and RINGs in vma_stats
+        - RM #1061898 Disable flow tag when TCP GRO is used
+
+Fixed:
+        - RM #1041107 Fix flow_tag handling on VLAN interfaces
+        - RM #1031172 Fix Checkmarx security application reported issues 
+
+Version 8.3.5-0:
+Date + Time 2017-05-25
+=============================================================
+Fixed:
+        - RM #1050059 Fix corruption in the net device ring map
+
+Version 8.3.4-0:
+Date + Time 2017-05-24
+=============================================================
+Added:
+        - RM #1014125 Support cyclic buffer handling of multi packets based on HW Striding-RQ 
+        - RM #1014125 Separate buffer memory allocation from buffer pool logic
+        - RM #968024 Improve latency with PRM implementation for poll cq
+        - RM #1037898 Reduce latency max numbers (high percentile) by avoiding malloc calls at runtime
+        - RM #1026406 Add libvma-debug.so installation (supporting max log level FUNC_ALL) 
+        - RM #998528 Verify --enable-vmapoll configuration is supported by OFED
+        - RM #959833 Do not offload ConnectX-3 interfaces in vmapoll mode
+        - RM #1023040 Show VMA Git number in VMA banner at startup
+        - RM #1025933 Add -Wundef flag to VMA compilation
+        - RM #1036427 Print driver (OFED) version in VMA banner
+        - RM #847360 Remove Coverity badge from README.md file
+        - RM #1010036 Update VMA_TCP_TIMESTAMP_OPTION description in README.txt
+        - RM #1042006 Delete redundant files from libvma home directory
+
+Fixed:
+        - RM #962481 Fix cqe error under vmapoll mode
+        - RM #1008712 Fix mutual exclusion access in ring bond
+        - RM #1027871 Fix valgrind uninitialized struct epoll_event
+        - RM #1037215 Fix autotool detection of rdma_lib_reset
+        - RM #1020667 Fix VMA_CQ_POLL_BATCH_MAX incorrect value in README.txt
+        - RM #1043382 Fix VMA_PROGRESS_ENGINE_WCE_MAX value in README.txt 
+
+Version 8.3.3-0:
+Date + Time 2017-04-25
+=============================================================
+Added:
+        - RM #1030331 Update global_sn update in cq_mgr_mlx5 class
+
+Fixed:
+        - RM #1030299 Fix wrong consumer index in request notification
+        - RM #1027659 Fix timestamp cqe conversion in prm poll
+        - RM #1030134 Fix RX UDP hardware timestamp calculation
+        - RM #1029468 Fix crash in cq_mgr_mlx5 destructor
+        - RM #1029287 Fix RX UDP local if in buffer descriptor
+
+Version 8.3.2-0:
+Date + Time 2017-04-20
+=============================================================
+Added:
+        - RM #968024  Improve latency by direct cq polling instead of interfacing libibverbs 
+        - RM #1006374 Optimize Tx data path - prepare in advance TCP next buffer and segment
+        - RM #1006374 Optimize Tx data path - remove redundant variable
+        - RM #1006374 Optimize Tx data path - reorder ring and qp_mgr::send() operations
+        - RM #1025129 Reduce TCP lock contention in case of high rate polling
+        - RM #1023714 Remove redundant if statement from dst_entry_udp fast path
+        - RM #1023040 Show VMA Git number in VMA banner at startup
+        - RM #996086  Add configuration option --enable-opt-log levels (max VMA log level is DEBUG) 
+        - RM #1011829 Add VMA_TCP_NODELAY parameter (Nagle algorithm)
+
+Fixed:
+        - RM #1005856 Fix MC flow_tag id when flow_tag is not supported
+
+Version 8.3.1-0:
+Date + Time 2017-03-28
+=============================================================
+Added:
+        - RM #933410 Support IPoIB on ConnectX-4
+        - RM #968200 Support Flow tag for vmapoll mode
+        - RM #968200 Support flow tag for multicast flows
+        - RM #987802 Support Flow tag for non-VMAPOLL modes
+        - RM #996018 Add README file for GTEST suite
+
+Version 8.2.10-0:
+Date + Time 2017-03-22 (branch: fast_update_release_20032017)
+=============================================================
+Fixed:
+        - RM #922411 Fix usage of AC_SUBST in rdma_lib_reset() detection
+
+Version 8.2.9-0:
+Date + Time 2017-03-21 (branch: fast_update_release_20032017)
+=============================================================
+Added:
+        - RM #964022 Optimize vma_list.h for performance
+        - RM #972524 Optimize data-path by removing unnecessary if statements
+        - RM #973211 Optimize buffer pool code
+        - RM #981372 Optimize mem_buf_desc_t class
+        - RM #987687 Request buffer for next packet after send_ring_buffer()
+        - RM #965720 Add new specification VMA_SPEC=multi_ring_latency
+        - RM #972524 Protect pointer access to OS API
+        - RM #981342 Remove buffer disorder statistics
+        - RM #964360 Reduce page fault events in mlx5_send() call
+        - RM #968751 Add boolean configuration parameter VMA_RX_POLL_ON_TX_TCP
+        - RM #969414 Set log severity to ERROR (was DEBUG) in case of insufficient buffers in pool
+        - RM #953380 Support dynamic routing in case of "add route" event
+        - RM #910917 Return error on socket API if exception occurred
+
+Fixed:
+        - RM #922411  Fix fork() in child process
+	- RM #922411  Fix rdma_lib_reset() auto detection
+        - RM #957729  Fix potential race condition in vma_stats
+        - RM #906042  Fix VMA errno when reaching TCP max backlog to match OS
+        - RM #973194  Fix configure on parameters that caused compilation errors
+        - RM #987687  Fix request buffer for next packet after send_ring_buffer()
+        - RM #1003524 Fix fanotify_init() failure on aarch64 architecture
+
+Version 8.2.8-0:
+Date + Time 2017-01-25
+=======================
+Added:
+        - RM #954841 Update README.txt file with last modification date
+
+Fixed:
+        - RM #962718 Fix peer-notification daemon removal on Ubuntu 14.10
+        - RM #955209 Fix vma_extra.h zero-copy example
+
+Version 8.2.7-0:
+Date + Time 2017-01-18
+=======================
+Added:
+        - RM #954841 Document VMA_SPEC "latency" in README.txt file
+
+Fixed:
+        - RM #946914 Fix epoll_create() should return an error if size is 0
+
+Version 8.2.6-0:
+Date + Time 2017-01-08
+=======================
+Added:
+        - RM #850311 Update log info when link is down on VMA bringup
+        - RM #802922 Added TCP server-client window size exerciser test
+
+Fixed:
+        - RM #943551 Fix received UDP vlan over bond (fail_over_mac=1) prints an error
+
+Version 8.2.5-0:
+Date + Time 2016-12-28
+=======================
+Added:
+        - RM #784338 Add VMA gtest (vmapoll API)
+        - RM #784338 Add testbed application (vmapoll API)
+        - RM #784338 Extend jenkins tests (vmapoll API)
+        - RM #865066 Use one vma_extra.h file for both vmapoll and legacy socket API
+        - RM #850311 Add support for socket offload even if link is down on VMA bringup
+        - RM #850270 Add VMA_TCP_CTL_THREAD=2 parameter under spec 6973
+        - RM #925571 Add textual vma spec support and a new latency spec
+        - RM #865066 Merge experimental branch (vmapoll API) into master branch
+
+Fixed:
+        - RM #924683 Fix src addr when sending MCAST with IP_MULTICAST_IF option
+        - RM #896067 Fix remove ring event during socket closure (vmapoll API)
+
+Version 8.2.4-0:
+Date + Time 2016-12-27
+=======================
+Added:
+        - RM #933236 Improve peer-notification debian package removal procedure
+
+Version 8.2.3-0:
+Date + Time 2016-12-26
+=======================
+Fixed:
+        - RM #768398 Fix peer-notification vma daemon package removal under debian
+
+Version 8.2.2-0:
+Date + Time 2016-12-20
+=======================
+Added:
+        - RM #768398 Peer-notification daemon implementation (on half-open TCP connections)
+        - RM #842842 Move udp rx hw timestamp conversion from cq_mgr to sockinfo_udp
+        - RM #825055 Implement "Dummy Send" for improving low msg rate latency
+
+Fixed:
+        - RM #910917 Fix vma crash after installing libvma from GitHub on RH7.3 inbox drivers
+
+Version 8.2.1-0:
+Date + Time 2016-12-14
+=======================
+Added:
+        - RM #897296 Advanced routing update
+        - RM #866429 Add HW and SW timestamps to user callback data
+
+Fixed:
+        - RM #898505 Fix connecting twice to dest IP through non-exiting GW causes seg fault
+        - RM #897296 Fix resolving the correct outgoing interface for route decision
+        - RM #888475 Fix core dump for IB pkeys under bond 
+        - RM #888475 Fix IB not offloaded in case of two bonds over pkeys
+        - RM #865172 Fix illegal memory access by netlink wrapper.
+        - RM #911076 Fix rcvmsg failure with MSG_VMA_ZCOPY_FORCE on OS socket
+        - RM #824880 Fix gtest compilation for gcc 4.4.7
+
+Version 8.1.7-0:
+Date + Time 2016-09-21
+=======================
+Added:
+        - RM #824880 Add Google Test based infrastructure
+
+Fixed:
+        - RM #857641 Fix setsockopt with IGMPv3 IP_DROP_SOURCE_MEMBERSHIP option
+
+Version 8.1.6-0:
+Date + Time 2016-09-16
+=======================
+Fixed:
+        - RM #864201 Fix double freeing of pbuf in LWIP split function
+
+Version 8.1.5-0:
+Date + Time 2016-09-08
+=======================
+Added:
+        - RM #749133 IGMPv3 - add support for 'Source Specific Multicast' 
+        - RM #770746 Add csbuild support into jenkins
+        - RM #770746 Update jenkins with valgrind support
+        - RM #848172 Code updates to comply with Coverity 8.5 version
+
+Fixed:
+        - RM #846042 Fix failure to receive fragmented multicast packets over ConnectX3-IB
+        - RM #843662 Fix log WARNING to DEBUG in case not an mlx4 driver on IPoIB interface
+        - RM #844374 Fix error handling while registering a socket with plural epoll instances
+        - RM #847025 Fix extra API tests failing on make with vlogger.h not found
+
 Version 8.1.4-0:
 Date + Time 2016-08-24
 =======================

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2001-2016 Mellanox Technologies, Ltd. All rights reserved.
+ * Copyright (c) 2001-2017 Mellanox Technologies, Ltd. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -36,6 +36,21 @@
 
 #include <stdint.h>
 #include <unistd.h>
+
+#define COPY_64B_NT(dst, src)	\
+	*dst++ = *src++;	\
+	*dst++ = *src++;	\
+	*dst++ = *src++;	\
+	*dst++ = *src++;	\
+	*dst++ = *src++;	\
+	*dst++ = *src++;	\
+	*dst++ = *src++;	\
+	*dst++ = *src++
+
+#define mb()	asm volatile("dsb sy" ::: "memory")
+#define rmb()	asm volatile("dsb ld" ::: "memory")
+#define wmb()	asm volatile("dsb st" ::: "memory")
+#define wc_wmb() wmb()
 
 /**
  * Add to the atomic variable.

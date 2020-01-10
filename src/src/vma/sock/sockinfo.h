@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2001-2016 Mellanox Technologies, Ltd. All rights reserved.
+ * Copyright (c) 2001-2017 Mellanox Technologies, Ltd. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -33,6 +33,7 @@
 #include <tr1/unordered_map>
 #include <ifaddrs.h>
 
+#include "config.h"
 #include "vlogger/vlogger.h"
 #include "utils/lock_wrapper.h"
 #include "vma/vma_extra.h"
@@ -55,8 +56,9 @@
 #ifndef BASE_SOCKINFO_H
 #define BASE_SOCKINFO_H
 
-#define MAX_RX_MEM_BUF_DESC		32
 #define SI_RX_EPFD_EVENT_MAX		16
+#define BYTE_TO_KB(BYTEVALUE)		(((BYTEVALUE) * 8) / 1000)
+#define KB_TO_BYTE(BYTEVALUE)		(((BYTEVALUE) * 1000) / 8)
 
 struct buff_info_t {
 		buff_info_t(){
@@ -102,7 +104,7 @@ typedef std::tr1::unordered_map<ring*, ring_info_t*> rx_ring_map_t;
 class sockinfo : public socket_fd_api, public pkt_rcvr_sink, public pkt_sndr_source, public wakeup_pipe
 {
 public:
-	sockinfo(int fd) throw (vma_exception);
+	sockinfo(int fd);
 	virtual ~sockinfo();
 
 #if _BullseyeCoverage
@@ -114,13 +116,37 @@ public:
 #if _BullseyeCoverage
     #pragma BullseyeCoverage on
 #endif
-
 	virtual void consider_rings_migration();
 
-	virtual void add_epoll_context(epfd_info *epfd);
+	virtual int add_epoll_context(epfd_info *epfd);
 	virtual void remove_epoll_context(epfd_info *epfd);
-	virtual void statistics_print(vlog_levels_t log_level = VLOG_DEBUG);
 
+	inline bool tcp_flow_is_5t(void) { return m_tcp_flow_is_5t; }
+	inline void set_tcp_flow_is_5t(void) { m_tcp_flow_is_5t = true; }
+	inline void set_flow_tag(int flow_tag_id) {
+		if ( flow_tag_id && (flow_tag_id != FLOW_TAG_MASK)) {
+			m_flow_tag_id = flow_tag_id;
+			m_flow_tag_enabled = true;
+		}
+	}
+	inline bool flow_tag_enabled(void) { return m_flow_tag_enabled; }
+	
+	virtual bool addr_in_reuse(void) = 0;
+	virtual int* get_rings_fds(int &res_length);
+	virtual int get_rings_num();
+#ifdef DEFINED_VMAPOLL
+
+	virtual bool check_rings() {return m_p_rx_ring ? true: false;}
+#else
+	virtual bool check_rings() {return true;}
+#endif
+
+
+#ifdef DEFINED_VMAPOLL
+	virtual int fast_nonblocking_rx(vma_packets_t *vma_pkts);
+#else
+	virtual void statistics_print(vlog_levels_t log_level = VLOG_DEBUG);	
+#endif // DEFINED_VMAPOLL	
 protected:
 	bool			m_b_closed;
 	bool 			m_b_blocking;
@@ -143,7 +169,7 @@ protected:
 	rx_net_device_map_t	m_rx_nd_map;
 	rx_flow_map_t		m_rx_flow_map;
 	// we either listen on ALL system cqs or bound to the specific cq
-	ring*			m_p_rx_ring; //used in TCP instead of m_rx_ring_map
+	ring*			m_p_rx_ring; //used in TCP/UDP
 	buff_info_t		m_rx_reuse_buff; //used in TCP instead of m_rx_ring_map
 	bool			m_rx_reuse_buf_pending; //used to periodically return buffers, even if threshold was not reached
 	bool			m_rx_reuse_buf_postponed; //used to mark threshold was reached, but free was not done yet
@@ -159,20 +185,43 @@ protected:
 	 * list of pending ready packet on the Rx,
 	 * each element is a pointer to the ib_conn_mgr that holds this ready rx datagram
 	 */
-	int			m_n_rx_pkt_ready_list_count;
-	size_t 			m_rx_pkt_ready_offset;
-	size_t			m_rx_ready_byte_count;
+	int						m_n_rx_pkt_ready_list_count;
+	size_t 					m_rx_pkt_ready_offset;
+	size_t					m_rx_ready_byte_count;
 
-	const int		m_n_sysvar_rx_num_buffs_reuse;
-	const int32_t		m_n_sysvar_rx_poll_num;
+	const int				m_n_sysvar_rx_num_buffs_reuse;
+	const int32_t				m_n_sysvar_rx_poll_num;
+	ring_alloc_logic_attr			m_ring_alloc_log_rx;
+	ring_alloc_logic_attr			m_ring_alloc_log_tx;
+
+#ifdef DEFINED_VMAPOLL
+	/* Track internal events to return in vma_poll()
+	 * Current design support single event for socket at a particular time
+	 */
+	struct ring_ec m_ec;
+	struct vma_completion_t* m_vma_poll_completion;
+	struct vma_buff_t*       m_vma_poll_last_buff_lst;
+#endif // DEFINED_VMAPOLL
 
 	// Callback function pointer to support VMA extra API (vma_extra.h)
 	vma_recv_callback_t	m_rx_callback;
 	void*			m_rx_callback_context; // user context
+	uint32_t		m_so_ratelimit;
+#ifdef DEFINED_VMAPOLL	
+	void*			m_fd_context;
+#endif // DEFINED_VMAPOLL	
+	uint32_t		m_flow_tag_id;	// Flow Tag for this socket
+	bool			m_flow_tag_enabled; // for this socket
+	bool			m_tcp_flow_is_5t; // to bypass packet analysis
 
+	int*			m_rings_fds;
 	virtual void 		set_blocking(bool is_blocked);
-	virtual int 		fcntl(int __cmd, unsigned long int __arg) throw (vma_error);
-	virtual int 		ioctl(unsigned long int __request, unsigned long int __arg) throw (vma_error);
+	virtual int 		fcntl(int __cmd, unsigned long int __arg);
+	virtual int 		ioctl(unsigned long int __request, unsigned long int __arg);
+#ifdef DEFINED_VMAPOLL	
+	virtual int setsockopt(int __level, int __optname, const void *__optval, socklen_t __optlen);
+#endif // DEFINED_VMAPOLL	
+	virtual int getsockopt(int __level, int __optname, void *__optval, socklen_t *__optlen);
 
 	virtual	mem_buf_desc_t* get_front_m_rx_pkt_ready_list() = 0;
 	virtual	size_t get_size_m_rx_pkt_ready_list() = 0;
@@ -186,6 +235,7 @@ protected:
 	void 			save_stats_tx_os(int bytes);
 	void 			save_stats_rx_offload(int nbytes);
 
+	virtual int             rx_verify_available_data() = 0;
 	virtual mem_buf_desc_t *get_next_desc (mem_buf_desc_t *p_desc) = 0;
 	virtual	mem_buf_desc_t* get_next_desc_peek(mem_buf_desc_t *p_desc, int& rx_pkt_ready_list_idx) = 0;
 	
@@ -198,13 +248,15 @@ protected:
 
 	bool 			attach_receiver(flow_tuple_with_local_if &flow_key);
 	bool 			detach_receiver(flow_tuple_with_local_if &flow_key);
+	net_device_resources_t* create_nd_resources(const ip_address ip_local);
+	bool                    destroy_nd_resources(const ip_address ip_local);
 	void			do_rings_migration();
 
 	// Attach to all relevant rings for offloading receive flows - always used from slow path
 	// According to bounded information we need to attach to all UC relevant flows
 	// If local_ip is ANY then we need to attach to all offloaded interfaces OR to the one our connected_ip is routed to
 	bool			attach_as_uc_receiver(role_t role, bool skip_rules = false);
-
+	virtual void		set_rx_packet_processor(void) = 0;
 	transport_t 		find_target_family(role_t role, struct sockaddr *sock_addr_first, struct sockaddr *sock_addr_second = NULL);
 
 	// This callback will notify that socket is ready to receive and map the cq.
@@ -215,10 +267,59 @@ protected:
 	virtual void		unlock_rx_q() {m_lock_rcv.unlock();}
 
 	void 			destructor_helper();
+	int 			modify_ratelimit(dst_entry* p_dst_entry, const uint32_t rate_limit_bytes_per_second);
 
 	void 			move_owned_rx_ready_descs(const mem_buf_desc_owner* p_desc_owner, descq_t* toq); // Move all owner's rx ready packets ro 'toq'
 
 	virtual bool try_un_offloading(); // un-offload the socket if possible
+#ifdef DEFINED_VMAPOLL	
+	virtual inline void do_wakeup()
+	{
+		/* TODO: Let consider if we really need this check */
+		if (!check_vma_active()) {
+			wakeup_pipe::do_wakeup();
+		}
+	}
+
+	inline bool check_vma_active(void)
+	{
+		return (m_p_rx_ring && m_p_rx_ring->get_vma_active());
+	}
+
+	inline void set_events(uint64_t events)
+	{
+		/* Collect all events if rx ring is enabled */
+		if (m_p_rx_ring) {
+			if (m_vma_poll_completion) {
+				if (!m_vma_poll_completion->events) {
+					m_vma_poll_completion->user_data = (uint64_t)m_fd_context;
+				}
+				m_vma_poll_completion->events |= events;
+			}
+			else {
+				if (!m_ec.completion.events) {
+					m_ec.completion.user_data = (uint64_t)m_fd_context;
+					m_p_rx_ring->put_ec(&m_ec);
+				}
+				m_ec.completion.events |= events;
+			}
+		}
+
+		if ((uint32_t)events) {
+			socket_fd_api::notify_epoll_context((uint32_t)events);
+		}
+	}
+
+	inline uint64_t get_events(void)
+	{
+		return m_ec.completion.events;
+	}
+
+	inline void clear_events(void)
+	{
+		m_ec.completion.events = 0;
+	}
+#endif // DEFINED_VMAPOLL	
 
 	// This function validates the ipoib's properties
 	// Input params:
@@ -258,12 +359,12 @@ protected:
 		int rx_pkt_ready_offset = m_rx_pkt_ready_offset;
 
 		pdesc = get_front_m_rx_pkt_ready_list();
-		void *iov_base = (uint8_t*)pdesc->path.rx.frag.iov_base + m_rx_pkt_ready_offset;
-		size_t bytes_left = pdesc->path.rx.frag.iov_len - m_rx_pkt_ready_offset;
-		size_t payload_size = pdesc->path.rx.sz_payload;
+		void *iov_base = (uint8_t*)pdesc->rx.frag.iov_base + m_rx_pkt_ready_offset;
+		size_t bytes_left = pdesc->rx.frag.iov_len - m_rx_pkt_ready_offset;
+		size_t payload_size = pdesc->rx.sz_payload;
 
 		if (__from && __fromlen)
-			fetch_peer_info(&pdesc->path.rx.src, __from, __fromlen);
+			fetch_peer_info(&pdesc->rx.src, __from, __fromlen);
 
 		if (in_flags & MSG_VMA_ZCOPY) {
 			relase_buff = false;
@@ -292,8 +393,8 @@ protected:
 						}
 						m_rx_pkt_ready_offset = 0;
 						if (pdesc) {
-							iov_base = pdesc->path.rx.frag.iov_base;
-							bytes_left = pdesc->path.rx.frag.iov_len;
+							iov_base = pdesc->rx.frag.iov_base;
+							bytes_left = pdesc->rx.frag.iov_len;
 						}
 					}
 
@@ -327,7 +428,7 @@ protected:
             descq_t *rx_reuse = &iter->second->rx_reuse_info.rx_reuse;
             int& n_buff_num = iter->second->rx_reuse_info.n_buff_num;
             rx_reuse->push_back(buff);
-            n_buff_num += buff->n_frags;
+            n_buff_num += buff->rx.n_frags;
             if(n_buff_num < m_n_sysvar_rx_num_buffs_reuse){
         	    return;
             }
@@ -440,5 +541,11 @@ protected:
     }
     //////////////////////////////////////////////////////////////////
 };
+
+#ifdef DEFINED_VMAPOLL
+#define NOTIFY_ON_EVENTS(context, events) context->set_events(events)
+#else
+#define NOTIFY_ON_EVENTS(context, events) context->notify_epoll_context(events)
+#endif // DEFINED_VMAPOLL
 
 #endif /* BASE_SOCKINFO_H */

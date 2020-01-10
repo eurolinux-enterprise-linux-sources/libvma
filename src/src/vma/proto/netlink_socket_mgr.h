@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2001-2016 Mellanox Technologies, Ltd. All rights reserved.
+ * Copyright (c) 2001-2017 Mellanox Technologies, Ltd. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -137,7 +137,7 @@ netlink_socket_mgr <Type>::netlink_socket_mgr(nl_data_t data_type)
 		return;
 	}
 
-	if (fcntl(m_fd, F_SETFD, FD_CLOEXEC) != 0) {
+	if (orig_os_api.fcntl(m_fd, F_SETFD, FD_CLOEXEC) != 0) {
 		__log_warn("Fail in fctl, error = %d", errno);
 	}
 	BULLSEYE_EXCLUDE_BLOCK_END
@@ -245,18 +245,15 @@ int netlink_socket_mgr <Type>::recv_info()
 		}
 		BULLSEYE_EXCLUDE_BLOCK_END
 
+		buf_ptr += readLen;
+		msgLen += readLen;
+
 		//Check if the its the last message
-		if(nlHdr->nlmsg_type == NLMSG_DONE) {
+		if(nlHdr->nlmsg_type == NLMSG_DONE ||
+		   (nlHdr->nlmsg_flags & NLM_F_MULTI) == 0) {
 			break;
-		}
-		else{
-			buf_ptr += readLen;
-			msgLen += readLen;
 		}
 
-		if((nlHdr->nlmsg_flags & NLM_F_MULTI) == 0) {
-			break;
-		}
 	} while((nlHdr->nlmsg_seq != m_seq_num) || (nlHdr->nlmsg_pid != m_pid));
 	return msgLen;
 }

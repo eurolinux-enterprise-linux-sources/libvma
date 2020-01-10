@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2001-2016 Mellanox Technologies, Ltd. All rights reserved.
+ * Copyright (c) 2001-2017 Mellanox Technologies, Ltd. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -104,7 +104,7 @@ public:
 	{
 		uint8_t csum = 0;
 		uint8_t* pval = (uint8_t*)this;
-		for (size_t i = 0; i < (sizeof(flow_tuple)-STR_MAX_LENGTH); ++i, ++pval) { csum ^= *pval; }
+		for (size_t i = 0; i < (sizeof(flow_tuple) - sizeof(m_str)); ++i, ++pval) { csum ^= *pval; }
 		return csum;
 	}
 #if _BullseyeCoverage
@@ -156,7 +156,7 @@ public:
 	{
 		uint8_t csum = 0;
 		uint8_t* pval = (uint8_t*)this;
-		for (size_t i = 0; i < (sizeof(flow_tuple_with_local_if)-STR_MAX_LENGTH); ++i, ++pval) { csum ^= *pval; }
+		for (size_t i = 0; i < (sizeof(flow_tuple_with_local_if) - sizeof(m_str)); ++i, ++pval) { csum ^= *pval; }
 		return csum;
 	}
 

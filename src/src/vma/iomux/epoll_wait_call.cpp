@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2001-2016 Mellanox Technologies, Ltd. All rights reserved.
+ * Copyright (c) 2001-2017 Mellanox Technologies, Ltd. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -69,8 +69,8 @@ void epoll_wait_call::init_offloaded_fds()
 	m_epfd_info->get_offloaded_fds_arr_and_size(&m_p_num_all_offloaded_fds, &m_p_all_offloaded_fds);
 	m_num_all_offloaded_fds = *m_p_num_all_offloaded_fds; // TODO: fix orig ugly code, and then remove this
 
-	__log_func("building: epfd=%d, m_epfd_info->get_fd_info().size()=%d, *m_p_num_all_offloaded_fds=%d", m_epfd, (int)m_epfd_info->get_fd_info().size(), (int)*m_p_num_all_offloaded_fds  );
-
+	__log_func("building: epfd=%d, m_epfd_info->get_fd_offloaded_size()=%zu, m_epfd_info->get_fd_non_offloaded_size()=%zu, *m_p_num_all_offloaded_fds=%d",
+			m_epfd, m_epfd_info->get_fd_offloaded_size(), m_epfd_info->get_fd_non_offloaded_size(), *m_p_num_all_offloaded_fds);
 }
 
 int epoll_wait_call::get_current_events()
@@ -81,24 +81,20 @@ int epoll_wait_call::get_current_events()
 
 	vma_list_t<socket_fd_api, socket_fd_api::socket_fd_list_node_offset> socket_fd_list;
 	lock();
-	int i,r,w,fd;
-	i = r = w = m_n_all_ready_fds;
+	int i, ready_rfds = 0, ready_wfds = 0;
+	i = m_n_all_ready_fds;
 	socket_fd_api *p_socket_object;
-	epoll_fd_rec fd_rec;
 	list_iterator_t<socket_fd_api, socket_fd_api::ep_ready_fd_node_offset> iter = m_epfd_info->m_ready_fds.begin();
 	while (iter != m_epfd_info->m_ready_fds.end() && i < m_maxevents) {
 		p_socket_object = *iter;
-		fd = p_socket_object->get_fd();
 		++iter;
-
-		if(!m_epfd_info->get_fd_rec_by_fd(fd, fd_rec)) continue;
 
 		m_events[i].events = 0; //initialize
 
 		bool got_event = false;
 
 		//epoll_wait will always wait for EPOLLERR and EPOLLHUP; it is not necessary to set it in events.
-		uint32_t mutual_events = p_socket_object->m_epoll_event_flags & (fd_rec.events | EPOLLERR | EPOLLHUP);
+		uint32_t mutual_events = p_socket_object->m_epoll_event_flags & (p_socket_object->m_fd_rec.events | EPOLLERR | EPOLLHUP);
 
 		//EPOLLHUP & EPOLLOUT are mutually exclusive. see poll man pages. epoll adapt poll behavior.
 		if ((mutual_events & EPOLLHUP) &&  (mutual_events & EPOLLOUT)) {
@@ -106,23 +102,23 @@ int epoll_wait_call::get_current_events()
 		}
 
 		if (mutual_events & EPOLLIN) {
-			if (handle_epoll_event(p_socket_object->is_readable(NULL), EPOLLIN, fd, fd_rec, i)) {
-				r++;
+			if (handle_epoll_event(p_socket_object->is_readable(NULL), EPOLLIN, p_socket_object, i)) {
+				ready_rfds++;
 				got_event = true;
 			}
 			mutual_events &= ~EPOLLIN;
 		}
 
 		if (mutual_events & EPOLLOUT) {
-			if (handle_epoll_event(p_socket_object->is_writeable(), EPOLLOUT, fd, fd_rec, i)) {
-				w++;
+			if (handle_epoll_event(p_socket_object->is_writeable(), EPOLLOUT, p_socket_object, i)) {
+				ready_wfds++;
 				got_event = true;
 			}
 			mutual_events &= ~EPOLLOUT;
 		}
 
 		if (mutual_events) {
-			if (handle_epoll_event(true, mutual_events, fd, fd_rec, i)) {
+			if (handle_epoll_event(true, mutual_events, p_socket_object, i)) {
 				got_event = true;
 			}
 		}
@@ -133,8 +129,6 @@ int epoll_wait_call::get_current_events()
 		}
 	}
 
-	int ready_rfds = r - m_n_all_ready_fds; //MNY: not only rfds, different counters for read/write ?
-	int ready_wfds = w - m_n_all_ready_fds;
 	m_n_ready_rfds += ready_rfds;
 	m_n_ready_wfds += ready_wfds;
 	m_p_stats->n_iomux_rx_ready += ready_rfds;
@@ -151,8 +145,8 @@ int epoll_wait_call::get_current_events()
 	 * see RM task 212058
 	 */
 	while (!socket_fd_list.empty()) {
-		socket_fd_list.front()->consider_rings_migration();
-		socket_fd_list.pop_front();
+		socket_fd_api* sockfd = socket_fd_list.get_and_pop_front();
+		sockfd->consider_rings_migration();
 	}
 
 	return (i);
@@ -160,11 +154,6 @@ int epoll_wait_call::get_current_events()
 
 epoll_wait_call::~epoll_wait_call()
 {
-}
-
-void epoll_wait_call::prepare_to_poll()
-{
-	// Empty
 }
 
 void epoll_wait_call::prepare_to_block()
@@ -176,6 +165,7 @@ bool epoll_wait_call::_wait(int timeout)
 {
 	int i, ready_fds, fd;
 	bool cq_ready = false;
+	epoll_fd_rec* fd_rec;
 
 	__log_func("calling os epoll: %d", m_epfd);
 
@@ -225,7 +215,7 @@ bool epoll_wait_call::_wait(int timeout)
 			continue;
 		}
 		
-		if ((m_p_ready_events[i].events & EPOLLIN)) {
+		if (m_p_ready_events[i].events & EPOLLIN) {
 			socket_fd_api* temp_sock_fd_api = fd_collection_get_sockfd(fd);
 			if (temp_sock_fd_api) {
 				// Instructing the socket to sample the OS immediately to prevent hitting EAGAIN on recvfrom(),
@@ -236,10 +226,13 @@ bool epoll_wait_call::_wait(int timeout)
 
 		// Copy event bits and data
 		m_events[m_n_all_ready_fds].events = m_p_ready_events[i].events;
-		if (!m_epfd_info->get_data_by_fd(fd, &m_events[m_n_all_ready_fds].data)) {
-			continue;
+		fd_rec = m_epfd_info->get_fd_rec(fd);
+		if (fd_rec) {
+			m_events[m_n_all_ready_fds].data = fd_rec->epdata;
+			++m_n_all_ready_fds;
+		} else {
+			__log_dbg("error - could not found fd %d in m_fd_info of epfd %d", fd, m_epfd);
 		}
-		++m_n_all_ready_fds;
 	}
 	
 	return cq_ready;
@@ -337,32 +330,70 @@ bool epoll_wait_call::check_all_offloaded_sockets(uint64_t *p_poll_sn)
 	return m_n_all_ready_fds;
 }
 
-bool epoll_wait_call::immidiate_return()
+bool epoll_wait_call::immidiate_return(int &poll_os_countdown)
 {
+	NOT_IN_USE(poll_os_countdown);
 	return false;
 }
 
-bool epoll_wait_call::handle_epoll_event(bool is_ready, uint32_t events, int fd, epoll_fd_rec fd_rec, int index)
+bool epoll_wait_call::handle_epoll_event(bool is_ready, uint32_t events, socket_fd_api *socket_object, int index)
 {
 	if (is_ready) {
-
+		epoll_fd_rec& fd_rec = socket_object->m_fd_rec;
 		m_events[index].data = fd_rec.epdata;
 		m_events[index].events |= events;
 
 		if (fd_rec.events & EPOLLONESHOT) {
-			m_epfd_info->clear_events_for_fd(fd, events);
+			// Clear events for this fd
+			fd_rec.events &= ~events;
 		}
 		if (fd_rec.events & EPOLLET) {
-			m_epfd_info->remove_epoll_event(fd, events);
+			m_epfd_info->remove_epoll_event(socket_object, events);
 		}
 		return true;
 	}
 	else {
 		// not readable, need to erase from our ready list (LT support)
-		m_epfd_info->remove_epoll_event(fd, events);
+		m_epfd_info->remove_epoll_event(socket_object, events);
 		return false;
 	}
 
+}
+
+bool epoll_wait_call::handle_os_countdown(int &poll_os_countdown)
+{
+	NOT_IN_USE(poll_os_countdown);
+
+	if (!m_epfd_info->get_os_data_available() || !m_epfd_info->get_and_unset_os_data_available()) {
+		return false;
+	}
+
+	/*
+	 * Poll OS when the internal thread found non offloaded data.
+	 */
+	bool cq_ready = wait_os(true);
+
+	m_epfd_info->register_to_internal_thread();
+
+	if (cq_ready) {
+		// This will empty the cqepfd
+		// (most likely in case of a wakeup and probably only under epoll_wait (Not select/poll))
+		ring_wait_for_notification_and_process_element(&m_poll_sn, NULL);
+	}
+	/* Before we exit with ready OS fd's we'll check the CQs once more and exit
+	 * below after calling check_all_offloaded_sockets();
+	 * IMPORTANT : We cannot do an opposite with current code,
+	 * means we cannot poll cq and then poll os (for epoll) - because poll os
+	 * will delete ready offloaded fds.
+	 */
+	if (m_n_all_ready_fds) {
+		m_p_stats->n_iomux_os_rx_ready += m_n_all_ready_fds; // TODO: fix it - we only know all counter, not read counter
+		ring_poll_and_process_element(&m_poll_sn, NULL);
+		check_all_offloaded_sockets(&m_poll_sn);
+		return true;
+	}
+
+	return false;
 }
 
 int epoll_wait_call::ring_poll_and_process_element(uint64_t *p_poll_sn, void* pv_fd_ready_array/* = NULL*/)

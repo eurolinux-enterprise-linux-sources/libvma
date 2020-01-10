@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2001-2016 Mellanox Technologies, Ltd. All rights reserved.
+ * Copyright (c) 2001-2017 Mellanox Technologies, Ltd. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -113,11 +113,6 @@ poll_call::poll_call(int *off_rfds_buffer, offloaded_mode_t *off_modes_buffer, i
 	if(! m_num_all_offloaded_fds)
 		m_fds = m_orig_fds;
 	__log_func("num all offloaded_fds=%d", m_num_all_offloaded_fds);
-}
-
-void poll_call::prepare_to_poll()
-{
-	// Empty
 }
 
 void poll_call::prepare_to_block()

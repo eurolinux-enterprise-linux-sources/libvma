@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2001-2016 Mellanox Technologies, Ltd. All rights reserved.
+ * Copyright (c) 2001-2017 Mellanox Technologies, Ltd. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -39,6 +39,25 @@
 #include "utils/bullseye.h"
 
 #define __xg(x) ((volatile long *)(x))
+
+#define mb()	 asm volatile("" ::: "memory")
+#define rmb()	 mb()
+#define wmb()	 asm volatile("" ::: "memory")
+#define wc_wmb() asm volatile("sfence" ::: "memory")
+
+#define COPY_64B_NT(dst, src)		\
+	__asm__ __volatile__ (		\
+	" movdqa   (%1),%%xmm0\n"	\
+	" movdqa 16(%1),%%xmm1\n"	\
+	" movdqa 32(%1),%%xmm2\n"	\
+	" movdqa 48(%1),%%xmm3\n"	\
+	" movntdq %%xmm0,   (%0)\n"	\
+	" movntdq %%xmm1, 16(%0)\n"	\
+	" movntdq %%xmm2, 32(%0)\n"	\
+	" movntdq %%xmm3, 48(%0)\n"	\
+	: : "r" (dst), "r" (src) : "memory");	\
+	dst += 8;			\
+	src += 8
 
 #if _BullseyeCoverage
     #pragma BullseyeCoverage off

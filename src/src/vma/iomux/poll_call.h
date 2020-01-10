@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2001-2016 Mellanox Technologies, Ltd. All rights reserved.
+ * Copyright (c) 2001-2017 Mellanox Technologies, Ltd. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -61,9 +61,6 @@ public:
 	virtual void set_offloaded_rfd_ready(int fd_index);
 	virtual void set_offloaded_wfd_ready(int fd_index);
 	virtual void set_offloaded_efd_ready(int fd_index, int errors);
-
-	/// @override
-	virtual void prepare_to_poll();
 
 	/// @override
 	virtual void prepare_to_block();

@@ -60,7 +60,8 @@ void             L3_level_tcp_input   (struct pbuf *p, struct tcp_pcb *pcb);
 /* Used within the TCP code only: */
 struct tcp_pcb * tcp_alloc   (u8_t prio);
 struct pbuf *    tcp_tx_pbuf_alloc(struct tcp_pcb * pcb, u16_t length, pbuf_type type);
-void		 tcp_tx_pbuf_free(struct tcp_pcb * pcb, struct pbuf * pbuf);
+void             tcp_tx_preallocted_buffers_free(struct tcp_pcb * pcb);
+void             tcp_tx_pbuf_free(struct tcp_pcb * pcb, struct pbuf * pbuf);
 void             tcp_abandon (struct tcp_pcb *pcb, int reset);
 err_t            tcp_send_empty_ack(struct tcp_pcb *pcb);
 void             tcp_rexmit  (struct tcp_pcb *pcb);
@@ -301,8 +302,11 @@ struct tcp_seg {
 #define TF_SEG_DATA_CHECKSUMMED (u8_t)0x04U /* ALL data (not the header) is
                                                checksummed into 'chksum' */
 #define TF_SEG_OPTS_WNDSCALE	(u8_t)0x08U /* Include window scaling option */
+#define TF_SEG_OPTS_DUMMY_MSG	(u8_t)0x10U /* Include dummy send option */
   struct tcp_hdr *tcphdr;  /* the TCP header */
 };
+
+#define LWIP_IS_DUMMY_SEGMENT(seg) (seg->flags & TF_SEG_OPTS_DUMMY_MSG)
 
 #if LWIP_TCP_TIMESTAMPS
 #define LWIP_TCP_OPT_LEN_TS     10
@@ -460,9 +464,9 @@ void tcp_keepalive(struct tcp_pcb *pcb);
 void tcp_zero_window_probe(struct tcp_pcb *pcb);
 
 #if TCP_CALCULATE_EFF_SEND_MSS
-u16_t tcp_eff_send_mss(u16_t sendmss, ip_addr_t *addr);
+u16_t tcp_eff_send_mss(u16_t sendmss, struct tcp_pcb *pcb);
 #endif /* TCP_CALCULATE_EFF_SEND_MSS */
-u16_t tcp_mss_follow_mtu_with_default(u16_t sendmss, ip_addr_t *addr);
+u16_t tcp_mss_follow_mtu_with_default(u16_t sendmss, struct tcp_pcb *pcb);
 
 #if LWIP_CALLBACK_API
 err_t tcp_recv_null(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t err);

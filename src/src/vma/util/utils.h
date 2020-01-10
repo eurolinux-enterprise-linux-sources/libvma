@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2001-2016 Mellanox Technologies, Ltd. All rights reserved.
+ * Copyright (c) 2001-2017 Mellanox Technologies, Ltd. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -44,11 +44,14 @@
 #include "vtypes.h"
 #include "utils/rdtsc.h"
 #include "vlogger/vlogger.h"
+#include "vma/proto/mem_buf_desc.h"
 #include "vma/util/vma_stats.h"
 
 struct iphdr; //forward declaration
 
 #define VMA_ALIGN(x, y) ((((x) + (y) - 1) / (y)) * (y) )
+
+#define ARRAY_SIZE(arr) (sizeof(arr) / sizeof(arr[0]))
 
 /**
 * Check if file type is regular
@@ -70,7 +73,7 @@ unsigned short compute_tcp_checksum(const struct iphdr *p_iphdr, const uint16_t 
 * get udp checksum: given IP header and UDP datagram (assume checksum field in UDP header contains zero)
 * matches RFC 793
 */
-unsigned short compute_udp_checksum(const struct iphdr *p_iphdr, const uint16_t *p_ip_payload);
+unsigned short compute_udp_checksum_rx(const struct iphdr *p_iphdr, const struct udphdr *udphdrp, mem_buf_desc_t* p_rx_wc_buf_desc);
 
 /**
  * get user space max number of open fd's using getrlimit, default parameter equals to 1024
@@ -116,7 +119,6 @@ bool compare_double(double a, double b);
  * @param cmd_line to be exceuted wiout VMA in process space
  * @param return_str is the output of the system call
  */
-#define MAX_CMD_LINE_LEN		512
 int run_and_retreive_system_command(const char* cmd_line, char* return_str, int return_str_len);
 
 #if _BullseyeCoverage
@@ -155,6 +157,7 @@ static inline int memcpy_toiovec(u_int8_t* p_src, iovec* p_iov, size_t sz_iov,
 	}
 	return n_total;
 }
+
 #if _BullseyeCoverage
     #pragma BullseyeCoverage on
 #endif
@@ -230,13 +233,6 @@ int get_iftype_from_ifname(const char* ifname);
 int get_if_mtu_from_ifname(const char* ifname);
 
 /**
- * Get the OS max IGMP membership per socket.
- *
- * @return the OS max IGMP membership per socket, or -1 for disabled or failures
- */
-int get_igmp_max_membership();
-
-/**
  * Get the OS TCP window scaling factor when tcp_window_scaling is enabled.
  * The value is calculated from the maximum receive buffer value.
  *
@@ -289,17 +285,6 @@ size_t get_vlan_base_name_from_ifname(const char* ifname, char* base_ifname, siz
 /* Upon success - returns the actual address len in bytes; Upon error - returns zero*/
 size_t get_local_ll_addr(const char* ifname, unsigned char* addr, int addr_len,  bool is_broadcast);
 
-// This function translates the interface ipv4 address to IF name and queries the IF
-// Input params:
-// 	1. address of ib_con_mgr local if
-// Output params:
-//	1. name of ib_con_mgr local if
-//	2. if flags
-// Return Value
-// Type: boolean
-// Val:  if translation of ipv4 address fails return false otherwise true
-bool get_local_if_info(in_addr_t local_if, char* ifname, unsigned int &ifflags);
-
 bool get_bond_active_slave_name(IN const char* bond_name, OUT char* active_slave_name, IN int sz);
 bool get_bond_slave_state(IN const char* slave_name, OUT char* curr_state, IN int sz);
 bool get_bond_slaves_name_list(IN const char* bond_name, OUT char* slaves_list, IN int sz);
@@ -314,26 +299,30 @@ int validate_raw_qp_privliges();
 
 static inline int get_procname(int pid, char *proc, size_t size)
 {
-	int ret = -1;
-	char pid_str[10];
-	char app_full_name[FILE_NAME_MAX_SIZE];
-	char proccess_proc_dir[FILE_NAME_MAX_SIZE];
+	char app_full_name[FILE_NAME_MAX_SIZE] = {0};
+	char proccess_proc_dir[FILE_NAME_MAX_SIZE] = {0};
+	char* app_base_name = NULL;
+	int n = -1;
 
 	if (NULL == proc) {
 		return -1;
 	}
 
-	memset((void*)app_full_name, 0, sizeof(app_full_name));
-	memset((void*)proccess_proc_dir, 0 , sizeof(proccess_proc_dir));
-
-	sprintf(pid_str, "%d", pid);
-	strcat(strcat(strcpy(proccess_proc_dir, "/proc/"), pid_str), "/exe");
-	if (readlink(proccess_proc_dir, app_full_name, FILE_NAME_MAX_SIZE) >= 0) {
-		strncpy(proc, strrchr(app_full_name, '/') + 1, size - 1);
-		ret = 0;
+	n = snprintf(proccess_proc_dir, sizeof(proccess_proc_dir), "/proc/%d/exe", pid);
+	if (likely((0 < n) && (n < (int)sizeof(proccess_proc_dir)))) {
+		n = readlink(proccess_proc_dir, app_full_name, sizeof(app_full_name) - 1);
+		if (n > 0) {
+			app_full_name[n] = '\0';
+			app_base_name = strrchr(app_full_name, '/');
+			if (app_base_name) {
+				strncpy(proc, app_base_name + 1, size - 1);
+				proc[size - 1] = '\0';
+				return 0;
+			}
+		}
 	}
 
-	return ret;
+	return -1;
 }
 
 //Creates multicast MAC from multicast IP
@@ -506,4 +495,30 @@ create_vma_exception_class(vma_unsupported_api, vma_error);
 // uses for throwing  something that is derived from vma_error and has similar CTOR; msg will automatically be class name
 #define vma_throw_object(_class)  throw _class(#_class, __PRETTY_FUNCTION__, __FILE__, __LINE__, errno)
 #define vma_throw_object_with_msg(_class, _msg)  throw _class(_msg, __PRETTY_FUNCTION__, __FILE__, __LINE__, errno)
+
+/* Rounding up to nearest power of 2 */
+static inline uint32_t align32pow2(uint32_t x)
+{
+	x--;
+	x |= x >> 1;
+	x |= x >> 2;
+	x |= x >> 4;
+	x |= x >> 8;
+	x |= x >> 16;
+
+	return x + 1;
+}
+
+
+static inline int ilog_2(uint32_t n) {
+	if (n == 0)
+		return 0;
+
+	uint32_t t = 0;
+	while ((1 << t) < (int)n)
+		++t;
+
+	return (int)t;
+}
+
 #endif

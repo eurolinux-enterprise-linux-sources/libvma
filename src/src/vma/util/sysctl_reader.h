@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2001-2016 Mellanox Technologies, Ltd. All rights reserved.
+ * Copyright (c) 2001-2017 Mellanox Technologies, Ltd. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -86,7 +86,6 @@ public :
 	}
 
 	void update_all(){
-
 		get_tcp_max_syn_backlog(true);
 		get_listen_maxconn(true);
 		get_tcp_wmem(true);
@@ -95,6 +94,8 @@ public :
 		get_net_core_rmem_max(true);
 		get_net_core_wmem_max(true);
 		get_net_ipv4_tcp_timestamps(true);
+		get_igmp_max_membership(true);
+		get_igmp_max_source_membership(true);
 	}
 
 	int get_tcp_max_syn_backlog(bool update = false) {
@@ -163,6 +164,28 @@ public :
 		static int val;
 		if (update)
 			val = read_file_to_int("/proc/sys/net/ipv4/tcp_timestamps", 0);
+		return val;
+	}
+
+	int get_igmp_max_membership(bool update = false) {
+		static int val;
+		if (update) {
+			val = read_file_to_int("/proc/sys/net/ipv4/igmp_max_memberships", 1024);
+			if (0 > val) {
+				vlog_printf(VLOG_WARNING, "failed to read get_igmp_max_membership value");
+			}
+		}
+		return val;
+	}
+
+	int get_igmp_max_source_membership(bool update = false) {
+		static int val;
+		if (update) {
+			val = read_file_to_int("/proc/sys/net/ipv4/igmp_max_msf", 1024);
+			if (0 > val) {
+				vlog_printf(VLOG_WARNING, "failed to read get_igmp_max_source_membership value");
+			}
+		}
 		return val;
 	}
 };

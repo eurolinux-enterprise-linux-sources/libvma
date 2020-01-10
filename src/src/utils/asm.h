@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2001-2016 Mellanox Technologies, Ltd. All rights reserved.
+ * Copyright (c) 2001-2017 Mellanox Technologies, Ltd. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -38,8 +38,10 @@
 #include "asm-arm64.h"
 #elif defined(__powerpc64__)
 #include "asm-ppc64.h"
-#else
+#elif defined(__x86_64__)
 #include "asm-x86.h"
+#else
+#error No architecture specific memory barrier definitions found!
 #endif
 
 #endif

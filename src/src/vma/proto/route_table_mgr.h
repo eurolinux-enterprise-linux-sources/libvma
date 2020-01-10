@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2001-2016 Mellanox Technologies, Ltd. All rights reserved.
+ * Copyright (c) 2001-2017 Mellanox Technologies, Ltd. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -45,6 +45,16 @@
 
 #define ADDR_LEN 46 // needs 16-bytes for IPv4, and 46-bytes for IPv6
 
+typedef std::tr1::unordered_map<in_addr_t, route_entry*> in_addr_route_entry_map_t;
+typedef std::tr1::unordered_map<route_rule_table_key, cache_entry_subject<route_rule_table_key, route_val*> *> rt_tbl_cach_entry_map_t;
+
+struct route_result {
+	in_addr_t	p_src;
+	in_addr_t	p_gw;
+	uint32_t	mtu;
+	route_result(): p_src(0), p_gw(0) ,mtu(0) {}
+};
+
 class route_table_mgr : public netlink_socket_mgr<route_val>, public cache_table_mgr<route_rule_table_key, route_val*>, public observer
 {
 public:
@@ -52,7 +62,7 @@ public:
 	virtual ~route_table_mgr();
 
 	void		get_default_gw(in_addr_t *p_gw_ip, int *p_if_index);
-	bool		route_resolve(IN route_rule_table_key key, OUT in_addr_t *p_src, OUT in_addr_t *p_gw = NULL);
+	bool		route_resolve(IN route_rule_table_key key, OUT route_result &res);
 
 	route_entry* 	create_new_entry(route_rule_table_key key, const observer *obs);
 	void 		update_entry(INOUT route_entry* p_ent, bool b_register_to_net_dev = false);
@@ -65,7 +75,7 @@ protected:
 
 private:
 	// in constructor creates route_entry for each net_dev, to receive events in case there are no other route_entrys
-	std::tr1::unordered_map<in_addr_t, route_entry*> m_rte_list_for_each_net_dev;
+	in_addr_route_entry_map_t m_rte_list_for_each_net_dev;
 
 	bool		find_route_val(in_addr_t &dst_addr, unsigned char table_id, route_val* &p_val);
 	
@@ -80,9 +90,8 @@ private:
 	void 		add_rt_entry_val(route_val *p_val);
 
 
-	void 		create_route_val_from_info(const netlink_route_info *netlink_route_info, route_val &netlink_route_val);
 	void 		del_route_event(route_val &netlink_route_val);
-	void 		new_route_event(route_val &netlink_route_val);
+	void 		new_route_event(route_val* netlink_route_val);
 	route_val* 	find_route_val(route_val &netlink_route_val);
 };
 

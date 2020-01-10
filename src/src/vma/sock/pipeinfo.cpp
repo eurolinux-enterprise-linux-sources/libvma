@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2001-2016 Mellanox Technologies, Ltd. All rights reserved.
+ * Copyright (c) 2001-2017 Mellanox Technologies, Ltd. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -31,12 +31,14 @@
  */
 
 
-#include "pipeinfo.h"
 
 #include <vlogger/vlogger.h>
+#include "utils/bullseye.h"
 #include <vma/event/event_handler_manager.h>
 
 #include "sock-redirect.h"
+
+#include "pipeinfo.h"
 
 #define MODULE_NAME 	"pi"
 #undef  VLOG_PRINTF
@@ -47,13 +49,28 @@
 #define pi_logerr(log_fmt, log_args...) 							VLOG_PRINTF(VLOG_ERROR, log_fmt, ##log_args)
 #define pi_logwarn(log_fmt, log_args...) 							VLOG_PRINTF(VLOG_WARNING, log_fmt, ##log_args)
 #define pi_loginfo(log_fmt, log_args...) 							VLOG_PRINTF(VLOG_INFO, log_fmt, ##log_args)
-#define pi_logdbg_no_funcname(log_fmt, log_args...)     if (g_vlogger_level >= VLOG_DEBUG) 	vlog_printf(VLOG_DEBUG, MODULE_NAME ":%d:fd[%d]: " log_fmt "\n", __LINE__, m_fd, ##log_args)
-#define pi_logdbg(log_fmt, log_args...) 		if (g_vlogger_level >= VLOG_DEBUG) 	VLOG_PRINTF_DETAILS(VLOG_DEBUG, log_fmt, ##log_args)
-#define pi_logfunc(log_fmt, log_args...) 		if (g_vlogger_level >= VLOG_FUNC) 	VLOG_PRINTF_DETAILS(VLOG_FUNC, log_fmt, ##log_args)
-#define pi_logfuncall(log_fmt, log_args...) 		if (g_vlogger_level >= VLOG_FUNC_ALL) 	VLOG_PRINTF_DETAILS(VLOG_FUNC_ALL, log_fmt, ##log_args)
 
+#if (VMA_MAX_DEFINED_LOG_LEVEL < DEFINED_VLOG_DEBUG)
+#define pi_logdbg_no_funcname(log_fmt, log_args...)    ((void)0)
+#define pi_logdbg(log_fmt, log_args...)                ((void)0)
+#define si_logdbg_no_funcname(log_fmt, log_args...)    ((void)0)
+#else
+#define pi_logdbg_no_funcname(log_fmt, log_args...)     if (g_vlogger_level >= VLOG_DEBUG)      vlog_printf(VLOG_DEBUG, MODULE_NAME ":%d:fd[%d]: " log_fmt "\n", __LINE__, m_fd, ##log_args)
+#define pi_logdbg(log_fmt, log_args...)                 if (g_vlogger_level >= VLOG_DEBUG)      VLOG_PRINTF_DETAILS(VLOG_DEBUG, log_fmt, ##log_args)
 #define si_logdbg_no_funcname(log_fmt, log_args...)	do { if (g_vlogger_level >= VLOG_DEBUG) 	vlog_printf(VLOG_DEBUG, MODULE_NAME "[fd=%d]:%d: " log_fmt "\n", m_fd, __LINE__, ##log_args); } while (0)
+#endif
 
+#if (VMA_MAX_DEFINED_LOG_LEVEL < DEFINED_VLOG_FINE)
+#define pi_logfunc(log_fmt, log_args...)               ((void)0)
+#else
+#define pi_logfunc(log_fmt, log_args...)                if (g_vlogger_level >= VLOG_FUNC)       VLOG_PRINTF_DETAILS(VLOG_FUNC, log_fmt, ##log_args)
+#endif
+
+#if (VMA_MAX_DEFINED_LOG_LEVEL < DEFINED_VLOG_FINER)
+#define pi_logfuncall(log_fmt, log_args...)            ((void)0)
+#else
+#define pi_logfuncall(log_fmt, log_args...) 		if (g_vlogger_level >= VLOG_FUNC_ALL) 	VLOG_PRINTF_DETAILS(VLOG_FUNC_ALL, log_fmt, ##log_args)
+#endif /* VMA_MAX_DEFINED_LOG_LEVEL */
 
 pipeinfo::pipeinfo(int fd) : socket_fd_api(fd),
     m_lock("pipeinfo::m_lock"),
@@ -126,7 +143,7 @@ void pipeinfo::clean_obj()
 	g_p_event_handler_manager->unregister_timers_event_and_delete(this);
 }
 
-int pipeinfo::fcntl(int __cmd, unsigned long int __arg) throw (vma_error)
+int pipeinfo::fcntl(int __cmd, unsigned long int __arg)
 {
 	switch (__cmd) {
 	case F_SETFL:
@@ -164,7 +181,7 @@ int pipeinfo::fcntl(int __cmd, unsigned long int __arg) throw (vma_error)
 	return orig_os_api.fcntl(m_fd, __cmd, __arg);
 }
 
-int pipeinfo::ioctl(unsigned long int __request, unsigned long int __arg) throw (vma_error)
+int pipeinfo::ioctl(unsigned long int __request, unsigned long int __arg)
 {
 	int *p_arg = (int *)__arg;
 
@@ -196,7 +213,7 @@ ssize_t pipeinfo::rx(const rx_call_t call_type, iovec* p_iov, ssize_t sz_iov,
                      int* p_flags, sockaddr *__from, socklen_t *__fromlen, struct msghdr *__msg)
 {
 	pi_logfunc("");
-	ssize_t ret = socket_fd_api::rx_os(call_type, p_iov, sz_iov, p_flags, __from, __fromlen, __msg);
+	ssize_t ret = socket_fd_api::rx_os(call_type, p_iov, sz_iov, *p_flags, __from, __fromlen, __msg);
 	save_stats_rx_os(ret);
 	return ret;
 }
@@ -316,22 +333,19 @@ void pipeinfo::statistics_print()
 		b_any_activiy = true;
 	}
 	if (m_p_socket_stats->counters.n_rx_poll_miss || m_p_socket_stats->counters.n_rx_poll_hit) {
-		float rx_poll_hit_percentage = (float)(m_p_socket_stats->counters.n_rx_poll_hit * 100) / (float)(m_p_socket_stats->counters.n_rx_poll_miss + m_p_socket_stats->counters.n_rx_poll_hit);
-		pi_logdbg_no_funcname("Rx poll: %d / %d (%2.2f%%) [miss/hit]", m_p_socket_stats->counters.n_rx_poll_miss, m_p_socket_stats->counters.n_rx_poll_hit, rx_poll_hit_percentage);
+		pi_logdbg_no_funcname("Rx poll: %d / %d (%2.2f%%) [miss/hit]", m_p_socket_stats->counters.n_rx_poll_miss, m_p_socket_stats->counters.n_rx_poll_hit,
+			(float)(m_p_socket_stats->counters.n_rx_poll_hit * 100) / (float)(m_p_socket_stats->counters.n_rx_poll_miss + m_p_socket_stats->counters.n_rx_poll_hit));
 		b_any_activiy = true;
 	}
 	if (m_p_socket_stats->counters.n_rx_ready_byte_drop) {
-		float rx_drop_percentage = 0;
-		if (m_p_socket_stats->counters.n_rx_packets)
-			rx_drop_percentage = (float)(m_p_socket_stats->counters.n_rx_ready_byte_drop * 100) / (float)m_p_socket_stats->counters.n_rx_packets;
-		si_logdbg_no_funcname("Rx byte: max %d / dropped %d (%2.2f%%) [limit is %d]", m_p_socket_stats->counters.n_rx_ready_byte_max, m_p_socket_stats->counters.n_rx_ready_byte_drop, rx_drop_percentage, m_p_socket_stats->n_rx_ready_byte_limit);
+		si_logdbg_no_funcname("Rx byte: max %d / dropped %d (%2.2f%%) [limit is %d]", m_p_socket_stats->counters.n_rx_ready_byte_max, m_p_socket_stats->counters.n_rx_ready_byte_drop,
+			(m_p_socket_stats->counters.n_rx_packets ? (float)(m_p_socket_stats->counters.n_rx_ready_byte_drop * 100) / (float)m_p_socket_stats->counters.n_rx_packets : 0),
+			m_p_socket_stats->n_rx_ready_byte_limit);
 		b_any_activiy = true;
 	}
 	if (m_p_socket_stats->counters.n_rx_ready_pkt_drop) {
-		float rx_drop_percentage = 0;
-		if (m_p_socket_stats->counters.n_rx_packets)
-			rx_drop_percentage = (float)(m_p_socket_stats->counters.n_rx_ready_pkt_drop * 100) / (float)m_p_socket_stats->counters.n_rx_packets;
-		si_logdbg_no_funcname("Rx pkt : max %d / dropped %d (%2.2f%%)", m_p_socket_stats->counters.n_rx_ready_pkt_max, m_p_socket_stats->counters.n_rx_ready_pkt_drop, rx_drop_percentage);
+		si_logdbg_no_funcname("Rx pkt : max %d / dropped %d (%2.2f%%)", m_p_socket_stats->counters.n_rx_ready_pkt_max, m_p_socket_stats->counters.n_rx_ready_pkt_drop,
+			(m_p_socket_stats->counters.n_rx_packets ? (float)(m_p_socket_stats->counters.n_rx_ready_pkt_drop * 100) / (float)m_p_socket_stats->counters.n_rx_packets : 0));
 		b_any_activiy = true;
 	}
 	if (b_any_activiy == false) {

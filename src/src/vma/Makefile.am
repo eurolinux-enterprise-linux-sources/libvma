@@ -26,6 +26,8 @@ SUBDIRS = infra netlink
 
 EXTRA_DIST = \
 	util/hash_map.inl \
+	dev/cq_mgr.inl \
+	dev/cq_mgr_mlx5.inl \
 	util/libvma.conf \
 	util/30-libvma-limits.conf
 
@@ -57,7 +59,7 @@ libvma_la_LDFLAGS := -no-undefined -version-number @VMA_LIBRARY_MAJOR@:@VMA_LIBR
 endif
 
 libvma_la_LIBADD = \
-	-lrt -ldl -lpthread -libverbs -lrdmacm $(LIBNL_LIBS) \
+	-lrt -ldl -lpthread $(VERBS_FLAGS) $(LIBNL_LIBS) \
 	$(top_builddir)/src/utils/libutils.la \
 	$(top_builddir)/src/vlogger/libvlogger.la \
 	$(top_builddir)/src/state_machine/libstate_machine.la \
@@ -68,16 +70,23 @@ libvma_la_LIBADD = \
 	
 libvma_la_SOURCES := \
 	dev/ah_cleaner.cpp \
+	dev/allocator.cpp \
 	dev/buffer_pool.cpp \
 	dev/cq_mgr.cpp \
+	dev/cq_mgr_mlx5.cpp \
+	dev/cq_mgr_mp.cpp \
 	dev/qp_mgr.cpp \
+	dev/qp_mgr_eth_mlx5.cpp \
+	dev/qp_mgr_mp.cpp \
 	dev/gro_mgr.cpp \
 	dev/ring_allocation_logic.cpp \
 	dev/rfs.cpp \
 	dev/rfs_uc.cpp \
 	dev/rfs_uc_tcp_gro.cpp \
 	dev/rfs_mc.cpp \
-	dev/ib_ctx_time_converter.cpp \
+	dev/time_converter.cpp \
+	dev/time_converter_ptp.cpp \
+	dev/time_converter_ib_ctx.cpp \
 	dev/ib_ctx_handler.cpp \
 	dev/ib_ctx_handler_collection.cpp \
 	dev/net_device_val.cpp \
@@ -87,7 +96,9 @@ libvma_la_SOURCES := \
 	dev/wqe_send_ib_handler.cpp \
 	dev/ring.cpp \
 	dev/ring_simple.cpp \
+	dev/ring_eth_cb.cpp \
 	dev/ring_bond.cpp \
+	dev/ring_profile.cpp \
 	\
 	event/delta_timer.cpp \
 	event/event_handler_manager.cpp \
@@ -146,20 +157,30 @@ libvma_la_SOURCES := \
 	util/verbs_extra.cpp \
 	util/instrumentation.cpp \
 	util/sys_vars.cpp \
+	util/agent.cpp \
+	util/dm_context.cpp \
+	\
 	libvma.c \
 	main.cpp \
 	\
 	dev/ah_cleaner.h \
+	dev/allocator.h \
 	dev/buffer_pool.h \
 	dev/cq_mgr.h \
+	dev/cq_mgr_mlx5.h \
+	dev/cq_mgr_mp.h \
 	dev/gro_mgr.h \
 	dev/ib_ctx_handler_collection.h \
 	dev/ib_ctx_handler.h \
-	dev/ib_ctx_time_converter.h \
+	dev/time_converter.h \
+        dev/time_converter_ptp.h \
+	dev/time_converter_ib_ctx.h \
 	dev/net_device_entry.h \
 	dev/net_device_table_mgr.h \
 	dev/net_device_val.h \
 	dev/qp_mgr.h \
+	dev/qp_mgr_eth_mlx5.h \
+	dev/qp_mgr_mp.h \
 	dev/rfs.h \
 	dev/rfs_mc.h \
 	dev/rfs_uc.h \
@@ -168,8 +189,11 @@ libvma_la_SOURCES := \
 	dev/ring_bond.h \
 	dev/ring.h \
 	dev/ring_simple.h \
+	dev/ring_eth_cb.h \
+	dev/ring_profile.h \
 	dev/wqe_send_handler.h \
 	dev/wqe_send_ib_handler.h \
+	\
 	event/command.h \
 	event/delta_timer.h \
 	event/event.h \
@@ -181,15 +205,18 @@ libvma_la_SOURCES := \
 	event/timer_handler.h \
 	event/timers_group.h \
 	event/vlogger_timer_handler.h \
+	\
 	infra/sender.h \
 	infra/sender_info_dst.h \
 	infra/subject_observer.h \
 	infra/cache_subject_observer.h \
+	\
 	iomux/epfd_info.h \
 	iomux/epoll_wait_call.h \
 	iomux/io_mux_call.h \
 	iomux/poll_call.h \
 	iomux/select_call.h \
+	\
 	lwip/cc_cubic.h \
 	lwip/cc.h \
 	lwip/def.h \
@@ -202,23 +229,25 @@ libvma_la_SOURCES := \
 	lwip/stats.h \
 	lwip/tcp.h \
 	lwip/tcp_impl.h \
+	\
 	netlink/link_info.h \
 	netlink/neigh_info.h \
 	netlink/netlink_compatibility.h \
 	netlink/netlink_wrapper.h \
 	netlink/route_info.h \
+	\
 	proto/arp.h \
-        proto/dst_entry.h \
-        proto/dst_entry_tcp.h \
-        proto/dst_entry_udp.h \
-        proto/dst_entry_udp_mc.h \
-        proto/flow_tuple.h \
-        proto/header.h \
-        proto/igmp_handler.h \
-        proto/igmp_mgr.h \
-        proto/ip_address.h \
-        proto/ip_frag.h \
-        proto/L2_address.h \
+	proto/dst_entry.h \
+	proto/dst_entry_tcp.h \
+	proto/dst_entry_udp.h \
+	proto/dst_entry_udp_mc.h \
+	proto/flow_tuple.h \
+	proto/header.h \
+	proto/igmp_handler.h \
+	proto/igmp_mgr.h \
+	proto/ip_address.h \
+	proto/ip_frag.h \
+	proto/L2_address.h \
 	proto/mem_buf_desc.h \
 	proto/neighbour.h \
 	proto/neighbour_observer.h \
@@ -233,37 +262,46 @@ libvma_la_SOURCES := \
 	proto/rule_table_mgr.h \
 	proto/rule_val.h \
 	proto/vma_lwip.h \
+	\
 	sock/cleanable_obj.h \
-        sock/fd_collection.h \
-        sock/pipeinfo.h \
-        sock/pkt_rcvr_sink.h \
-        sock/pkt_sndr_source.h \
-        sock/socket_fd_api.h \
-        sock/sockinfo.h \
-        sock/sockinfo_tcp.h \
-        sock/sockinfo_udp.h \
-        sock/sock-redirect.h \
-        util/hash_map.h \
-        util/if.h \
-        util/instrumentation.h \
-        util/libvma.h \
-        util/linked_unordered_map.h \
-        util/list.h \
-        util/sock_addr.h \
-        util/sysctl_reader.h \
-        util/sys_vars.h \
-        util/to_str.h \
-        util/utils.h \
-        util/valgrind.h \
-        util/verbs_extra.h \
-        util/vma_list.h \
-        util/vma_stats.h \
-        util/vtypes.h \
-        util/wakeup.h \
-        util/wakeup_pipe.h \
+	sock/fd_collection.h \
+	sock/pipeinfo.h \
+	sock/pkt_rcvr_sink.h \
+	sock/pkt_sndr_source.h \
+	sock/socket_fd_api.h \
+	sock/sockinfo.h \
+	sock/sockinfo_tcp.h \
+	sock/sockinfo_udp.h \
+	sock/sock-redirect.h \
+	\
+	util/chunk_list.h \
+	util/hash_map.h \
+	util/if.h \
+	util/instrumentation.h \
+	util/libvma.h \
+	util/linked_unordered_map.h \
+	util/list.h \
+	util/sg_array.h \
+	util/dm_context.h \
+	util/sock_addr.h \
+	util/sysctl_reader.h \
+	util/sys_vars.h \
+	util/to_str.h \
+	util/utils.h \
+	util/valgrind.h \
+	util/verbs_extra.h \
+	util/vma_list.h \
+	util/vma_stats.h \
+	util/vtypes.h \
+	util/wakeup.h \
+	util/wakeup_pipe.h \
+	util/agent.h \
+	util/agent_def.h \
+	\
 	config_parser.h \
 	main.h \
-	vma_extra.h
+	vma_extra.h \
+	hw/mlx5/wqe.h
 
 libvma_la_DEPENDENCIES = \
 	$(top_builddir)/src/vlogger/libvlogger.la \

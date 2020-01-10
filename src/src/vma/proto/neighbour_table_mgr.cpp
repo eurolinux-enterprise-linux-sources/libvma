@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2001-2016 Mellanox Technologies, Ltd. All rights reserved.
+ * Copyright (c) 2001-2017 Mellanox Technologies, Ltd. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -73,6 +73,24 @@ neigh_table_mgr::neigh_table_mgr():m_neigh_cma_event_channel(NULL)
 	start_garbage_collector(DEFAULT_GARBAGE_COLLECTOR_TIME);
 }
 
+neigh_table_mgr::~neigh_table_mgr()
+{
+	stop_garbage_collector();
+	rdma_destroy_event_channel(m_neigh_cma_event_channel);
+}
+
+bool neigh_table_mgr::register_observer(neigh_key key,
+				const cache_observer *new_observer,
+				cache_entry_subject<neigh_key, class neigh_val*> **cache_entry)
+{
+	//Register to netlink event handler only if this is the first entry
+	if (get_cache_tbl_size() == 0) {
+		g_p_netlink_handler->register_event(nlgrpNEIGH, this);
+		neigh_mgr_logdbg("Registered to g_p_netlink_handler");
+	}
+	return cache_table_mgr<neigh_key, class neigh_val*>::register_observer(key, new_observer, cache_entry);
+}
+
 neigh_entry* neigh_table_mgr::create_new_entry(neigh_key neigh_key, const observer* new_observer)
 {
 	observer * tmp = const_cast<observer *>(new_observer);
@@ -87,12 +105,6 @@ neigh_entry* neigh_table_mgr::create_new_entry(neigh_key neigh_key, const observ
 
 
 	transport_type_t transport = dst->get_obs_transport_type();
-
-	//Register to netlink event handler only if this is the first entry
-	if (get_cache_tbl_size() == 0) {
-			g_p_netlink_handler->register_event(nlgrpNEIGH, this);
-			neigh_mgr_logdbg("Registered to g_p_netlink_handler");
-	}
 
 	if (transport == VMA_TRANSPORT_IB) {
 		if(IS_BROADCAST_N(neigh_key.get_in_addr())){
@@ -144,19 +156,12 @@ void neigh_table_mgr::notify_cb(event *ev)
 		for (itr = p_ndv_val_lst->begin(); itr != p_ndv_val_lst->end(); ++itr) {
 			net_device_val* p_ndev = dynamic_cast <net_device_val *>(*itr);
 			if (p_ndev) {
-				std::tr1::unordered_map< neigh_key, cache_entry_subject<neigh_key,neigh_val*> *>::iterator cache_itr;
-				cache_itr = m_cache_tbl.find(neigh_key(ip_address(neigh_ip), p_ndev));
-				if (cache_itr == m_cache_tbl.end()) {
+				neigh_entry *p_ne = dynamic_cast <neigh_entry *>(get_entry(neigh_key(ip_address(neigh_ip), p_ndev)));
+				if (p_ne) {
+					// Call the relevant neigh_entry to handle the event
+					p_ne->handle_neigh_event(nl_ev);
+				} else {
 					neigh_mgr_logdbg("Ignoring netlink neigh event for IP = %s if:%s, index=%d, p_ndev=%p", nl_info->dst_addr_str.c_str(), p_ndev->to_str().c_str(), nl_info->ifindex, p_ndev);
-				}
-				else {
-
-					neigh_entry *p_ne = dynamic_cast <neigh_entry *>(cache_itr->second);
-
-					if (p_ne) {
-						// Call the relevant neigh_entry to handle the event
-						p_ne->handle_neigh_event(nl_ev);
-					}
 				}
 			} else {
 				neigh_mgr_logdbg("could not find ndv_val for ifindex=%d", nl_info->ifindex);

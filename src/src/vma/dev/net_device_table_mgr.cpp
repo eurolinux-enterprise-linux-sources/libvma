@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2001-2016 Mellanox Technologies, Ltd. All rights reserved.
+ * Copyright (c) 2001-2017 Mellanox Technologies, Ltd. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -42,6 +42,7 @@
 #include "vma/event/event_handler_manager.h"
 #include "vma/util/verbs_extra.h"
 #include "vma/util/utils.h"
+#include "vma/util/valgrind.h"
 #include "vma/sock/sock-redirect.h"
 #include "vma/sock/fd_collection.h"
 #include "vma/dev/ring.h"
@@ -106,6 +107,7 @@ net_device_table_mgr::net_device_table_mgr() : cache_table_mgr<ip_address,net_de
 		throw_vma_exception("map_net_devices failed");
 	}
 
+#ifndef DEFINED_NO_THREAD_LOCK
 	if (safe_mce_sys().progress_engine_interval_msec != MCE_CQ_DRAIN_INTERVAL_DISABLED && safe_mce_sys().progress_engine_wce_max != 0) {
 		ndtm_logdbg("registering timer for ring draining with %d msec intervales", safe_mce_sys().progress_engine_interval_msec);
 		g_p_event_handler_manager->register_timer_event(safe_mce_sys().progress_engine_interval_msec, this, PERIODIC_TIMER, (void*)RING_PROGRESS_ENGINE_TIMER);
@@ -115,6 +117,7 @@ net_device_table_mgr::net_device_table_mgr() : cache_table_mgr<ip_address,net_de
 		ndtm_logdbg("registering timer for cq adaptive moderation with %d msec intervales", safe_mce_sys().cq_aim_interval_msec);
 		g_p_event_handler_manager->register_timer_event(safe_mce_sys().cq_aim_interval_msec, this, PERIODIC_TIMER, (void*)RING_ADAPT_CQ_MODERATION_TIMER);
 	}
+#endif // DEFINED_NO_THREAD_LOCK
 }
 
 void net_device_table_mgr::free_ndtm_resources()
@@ -129,10 +132,10 @@ void net_device_table_mgr::free_ndtm_resources()
 	orig_os_api.close(m_global_ring_pipe_fds[1]);
 	orig_os_api.close(m_global_ring_pipe_fds[0]);
 
-	net_device_map_t::iterator net_dev_iter;
-	for (net_dev_iter=m_net_device_map.begin(); net_dev_iter!=m_net_device_map.end(); net_dev_iter++)
-	{
-		delete net_dev_iter->second;
+	net_device_map_t::iterator iter;
+	while ((iter = m_net_device_map.begin()) != m_net_device_map.end()) {
+		delete iter->second;
+		m_net_device_map.erase(iter);
 	}
 	m_lock.unlock();
 
@@ -173,10 +176,6 @@ int net_device_table_mgr::map_net_devices()
 		}
 		if (ifa->ifa_flags & IFF_SLAVE) {
 			ndtm_logdbg("Blocking offload: Interface ('%s') is a bonding slave", ifa->ifa_name);
-			continue;
-		}
-		if (!(ifa->ifa_flags & IFF_RUNNING)) {
-			ndtm_logdbg("Blocking offload: Interface ('%s') is not running", ifa->ifa_name);
 			continue;
 		}
 
@@ -232,9 +231,10 @@ int net_device_table_mgr::map_net_devices()
 			continue;
 		}
 
-		//check if port is in active mode. if not, dont create net_device_val_ib.
-		if (ib_ctx->get_port_state(cma_id->port_num) != IBV_PORT_ACTIVE) {
-			ndtm_logdbg("Blocking offload: non-active interfaces ('%s')", ifa->ifa_name);
+#ifdef DEFINED_VMAPOLL
+		// only support mlx5 device for vmapoll
+		if(strncmp(ib_ctx->get_ibv_device()->name, "mlx4", 4) == 0) {
+			ndtm_logdbg("Blocking offload: vmapoll mlx4 interfaces ('%s')", ifa->ifa_name);
 
 			// Close the cma_id which will not be offload
 			IF_RDMACM_FAILURE(rdma_destroy_id(cma_id)) {
@@ -242,15 +242,16 @@ int net_device_table_mgr::map_net_devices()
 			} ENDIF_RDMACM_FAILURE;
 			continue;
 		}
+#endif // DEFINED_VMAPOLL
 
 		bool valid = false;
 		char base_ifname[IFNAMSIZ];
 		get_base_interface_name((const char*)(ifa->ifa_name), base_ifname, sizeof(base_ifname));
 		if (check_device_exist(base_ifname, BOND_DEVICE_FILE)) {
 			// this is a bond interface (or a vlan/alias over bond), find the slaves
-			valid = verify_bond_ipoib_or_eth_qp_creation(ifa);
+			valid = verify_bond_ipoib_or_eth_qp_creation(ifa, cma_id->port_num);
 		} else {
-			valid = verify_ipoib_or_eth_qp_creation(ifa->ifa_name, ifa);
+			valid = verify_ipoib_or_eth_qp_creation(ifa->ifa_name, ifa, cma_id->port_num);
 		}
 		if (!valid) {
 			// Close the cma_id which will not be offload
@@ -284,8 +285,8 @@ int net_device_table_mgr::map_net_devices()
 		m_if_indx_to_nd_val_lst[p_net_device_val->get_if_idx()].push_back(p_net_device_val);
 		m_lock.unlock();
 
-		ndtm_logdbg("Offload interface '%s': Mapped to ibv device '%s' [%p] on port %d",
-				ifa->ifa_name, ib_ctx->get_ibv_device()->name, ib_ctx->get_ibv_device(), cma_id->port_num);
+		ndtm_logdbg("Offload interface '%s': Mapped to ibv device '%s' [%p] on port %d (Active: %d), Running: %d",
+				ifa->ifa_name, ib_ctx->get_ibv_device()->name, ib_ctx->get_ibv_device(), cma_id->port_num, (ib_ctx->get_port_state(cma_id->port_num) == IBV_PORT_ACTIVE), (!!(ifa->ifa_flags & IFF_RUNNING)));
 
 		IF_RDMACM_FAILURE(rdma_destroy_id(cma_id)) {
 			ndtm_logerr("Failed in rdma_destroy_id (errno=%d %m)", errno);
@@ -301,7 +302,7 @@ int net_device_table_mgr::map_net_devices()
 	return 0;
 }
 
-bool net_device_table_mgr::verify_bond_ipoib_or_eth_qp_creation(struct ifaddrs * ifa)
+bool net_device_table_mgr::verify_bond_ipoib_or_eth_qp_creation(struct ifaddrs * ifa, uint8_t port_num)
 {
 	char base_ifname[IFNAMSIZ];
 	get_base_interface_name((const char*)(ifa->ifa_name), base_ifname, sizeof(base_ifname));
@@ -320,7 +321,7 @@ bool net_device_table_mgr::verify_bond_ipoib_or_eth_qp_creation(struct ifaddrs *
 	{
 		char* p = strchr(slave_name, '\n');
 		if (p) *p = '\0'; // Remove the tailing 'new line" char
-		if (!verify_ipoib_or_eth_qp_creation(slave_name, ifa)) {
+		if (!verify_ipoib_or_eth_qp_creation(slave_name, ifa, port_num)) {
 			//check all slaves but print only once for bond
 			bond_ok =  false;
 		}
@@ -336,15 +337,15 @@ bool net_device_table_mgr::verify_bond_ipoib_or_eth_qp_creation(struct ifaddrs *
 }
 
 //interface name can be slave while ifa struct can describe bond
-bool net_device_table_mgr::verify_ipoib_or_eth_qp_creation(const char* interface_name, struct ifaddrs * ifa)
+bool net_device_table_mgr::verify_ipoib_or_eth_qp_creation(const char* interface_name, struct ifaddrs * ifa, uint8_t port_num)
 {
 	int iftype = get_iftype_from_ifname(interface_name);
 	if (iftype == ARPHRD_INFINIBAND) {
-		if (verify_enable_ipoib(interface_name) && verify_mlx4_ib_device(interface_name) && verify_ipoib_mode(ifa)) {
+		if (verify_enable_ipoib(interface_name) && verify_ipoib_mode(ifa)) {
 			return true;
 		}
 	} else {
-		if (verify_eth_qp_creation(interface_name)) {
+		if (verify_eth_qp_creation(interface_name, port_num)) {
 			return true;
 		}
 	}
@@ -396,21 +397,7 @@ bool net_device_table_mgr::verify_ipoib_mode(struct ifaddrs* ifa)
 }
 
 //ifname should point to a physical device
-bool net_device_table_mgr::verify_mlx4_ib_device(const char* ifname)
-{
-	if (!check_device_exist(ifname, MLX4_DRIVER_PATH)) {
-		vlog_printf(VLOG_WARNING,"*******************************************************************************************************\n");
-		ndtm_logdbg("* Flow Steering of IPoIB traffic is not supported on your HCA");
-		ndtm_logdbg("* Please refer to VMA Release Notes for details limitations.");
-		ndtm_logdbg("* All traffic over interface %s will not be offloaded!", ifname);
-		vlog_printf(VLOG_WARNING,"*******************************************************************************************************\n");
-		return false;
-	}
-	return true;
-}
-
-//ifname should point to a physical device
-bool net_device_table_mgr::verify_eth_qp_creation(const char* ifname)
+bool net_device_table_mgr::verify_eth_qp_creation(const char* ifname, uint8_t port_num)
 {
 	int num_devices = 0;
 	bool success = false;
@@ -424,9 +411,9 @@ bool net_device_table_mgr::verify_eth_qp_creation(const char* ifname)
 	vma_ibv_cq_init_attr attr;
 	memset(&attr, 0, sizeof(attr));
 
-	qp_init_attr.cap.max_send_wr = safe_mce_sys().tx_num_wr;
-	qp_init_attr.cap.max_recv_wr = safe_mce_sys().rx_num_wr;
-	qp_init_attr.cap.max_inline_data = safe_mce_sys().tx_max_inline;
+	qp_init_attr.cap.max_send_wr = MCE_DEFAULT_TX_NUM_WRE;
+	qp_init_attr.cap.max_recv_wr = MCE_DEFAULT_RX_NUM_WRE;
+	qp_init_attr.cap.max_inline_data = MCE_DEFAULT_TX_MAX_INLINE;
 	qp_init_attr.cap.max_send_sge = MCE_DEFAULT_TX_NUM_SGE;
 	qp_init_attr.cap.max_recv_sge = MCE_DEFAULT_RX_NUM_SGE;
 	qp_init_attr.sq_sig_all = 0;
@@ -442,9 +429,10 @@ bool net_device_table_mgr::verify_eth_qp_creation(const char* ifname)
 	priv_safe_read_file(resource_path, sys_res, 1024);
 	for (int j=0; j<num_devices; j++) {
 		char ib_res[1024] = {0};
-		char ib_path[256] = {0};
-		sprintf(ib_path, "%s/device/resource", pp_ibv_context_list[j]->device->ibdev_path);
-		priv_safe_read_file(ib_path, ib_res, 1024);
+		const char ib_path_format[] = "%s/device/resource";
+		char ib_path[IBV_SYSFS_PATH_MAX + sizeof(ib_path_format)] = {0};
+		snprintf(ib_path, sizeof(ib_path), ib_path_format, pp_ibv_context_list[j]->device->ibdev_path);
+		priv_safe_read_file(ib_path, ib_res, sizeof(ib_res));
 		if (strcmp(sys_res, ib_res) == 0) {
 			//create qp resources
 			ib_ctx_handler* p_ib_ctx = g_p_ib_ctx_handler_collection->get_ib_ctx(pp_ibv_context_list[j]);
@@ -454,6 +442,7 @@ bool net_device_table_mgr::verify_eth_qp_creation(const char* ifname)
 				success = false;
 				break;
 			}
+			VALGRIND_MAKE_MEM_DEFINED(channel, sizeof(ibv_comp_channel));
 			cq = vma_ibv_create_cq(p_ib_ctx->get_ibv_context(), safe_mce_sys().tx_num_wr, (void*)this, channel, 0, &attr);
 			if (!cq) {
 				ndtm_logdbg("cq creation failed for interface %s (errno=%d %m)", ifname, errno);
@@ -465,6 +454,12 @@ bool net_device_table_mgr::verify_eth_qp_creation(const char* ifname)
 			qp = ibv_create_qp(p_ib_ctx->get_ibv_pd(), &qp_init_attr);
 			if (qp) {
 				success = true;
+
+				if (!priv_ibv_query_flow_tag_supported(qp, port_num)) {
+					p_ib_ctx->set_flow_tag_capability(true);
+				}
+				ndtm_logdbg("verified interface %s for flow tag capabilities : %s", ifname, p_ib_ctx->get_flow_tag_capability() ? "enabled" : "disabled");
+
 			} else {
 				ndtm_logdbg("QP creation failed on interface %s (errno=%d %m), Traffic will not be offloaded \n", ifname, errno);
 				success = false;
@@ -510,6 +505,7 @@ bool net_device_table_mgr::verify_eth_qp_creation(const char* ifname)
 			ndtm_logdbg("channel destroy failed on interface %s (errno=%d %m)", ifname, errno);
 			success = false;
 		} ENDIF_VERBS_FAILURE;
+		VALGRIND_MAKE_MEM_UNDEFINED(channel, sizeof(ibv_comp_channel));
 	}
 	rdma_free_devices(pp_ibv_context_list);
 	return success;
@@ -607,10 +603,11 @@ int net_device_table_mgr::global_ring_poll_and_process_element(uint64_t *p_poll_
 		}
 		ret_total += ret;
 	}
-	if (ret_total)
+	if (ret_total) {
 		ndtm_logfunc("ret_total=%d", ret_total);
-	else
+	} else {
 		ndtm_logfuncall("ret_total=%d", ret_total);
+	}
 	return ret_total;
 }
 
@@ -679,10 +676,11 @@ int net_device_table_mgr::global_ring_wait_for_notification_and_process_element(
 			}
 		}
 	}
-	if (ret_total)
+	if (ret_total) {
 		ndtm_logfunc("ret_total=%d", ret_total);
-	else
+	} else {
 		ndtm_logfuncall("ret_total=%d", ret_total);
+	}
 	return ret_total;
 }
 
@@ -700,10 +698,11 @@ int net_device_table_mgr::global_ring_drain_and_procces()
 		}
 		ret_total += ret;
 	}
-	if (ret_total)
+	if (ret_total) {
 		ndtm_logfunc("ret_total=%d", ret_total);
-	else
+	} else {
 		ndtm_logfuncall("ret_total=%d", ret_total);
+	}
 	return ret_total;
 }
 
@@ -722,7 +721,16 @@ void net_device_table_mgr::handle_timer_expired(void* user_data)
 	int timer_type = (uint64_t)user_data;
 	switch (timer_type) {
 	case RING_PROGRESS_ENGINE_TIMER:
+#ifdef DEFINED_VMAPOLL
+#if 0 /* TODO: see explanation */
+		/* Do not call draining RX logic from internal thread for vma_poll mode
+		 * It is disable by default
+		 * See: cq_mgr::drain_and_proccess()
+		 */
+#endif // 0
+#else
 		global_ring_drain_and_procces();
+#endif // DEFINED_VMAPOLL		
 		break;
 	case RING_ADAPT_CQ_MODERATION_TIMER:
 		global_ring_adapt_cq_moderation();
@@ -735,15 +743,18 @@ void net_device_table_mgr::handle_timer_expired(void* user_data)
 void net_device_table_mgr::global_ring_wakeup()
 {
 	ndtm_logdbg("");
-	struct epoll_event ev;
+	epoll_event ev = {0, {0}};
+
 	ev.events = EPOLLIN;
 	ev.data.ptr = NULL;
+	int errno_tmp = errno; //don't let wakeup affect errno, as this can fail with EEXIST
 	BULLSEYE_EXCLUDE_BLOCK_START
 	if ((orig_os_api.epoll_ctl(m_global_ring_epfd, EPOLL_CTL_ADD, 
 			   m_global_ring_pipe_fds[0], &ev)) && (errno != EEXIST)) {
 		ndtm_logerr("failed to add pipe channel fd to internal epfd (errno=%d %m)", errno);
 	}
 	BULLSEYE_EXCLUDE_BLOCK_END
+	errno = errno_tmp;
 }
 
 void net_device_table_mgr::set_max_mtu(uint32_t mtu)

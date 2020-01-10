@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2001-2016 Mellanox Technologies, Ltd. All rights reserved.
+ * Copyright (c) 2001-2017 Mellanox Technologies, Ltd. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -85,8 +85,6 @@ public:
 
 	static int sockaddr2ipaddr(const sockaddr *__to, socklen_t __tolen, ip_addr_t & ip, uint16_t & port);
 	void do_timers();
-
-	static u16_t vma_ip_route_mtu(ip_addr_t *dest);
 
 	//RX: feed packet to the LWIP stack
 	static int  vma_tcp_input(mem_buf_desc_t* p_rx_wc_buf_desc, tcp_pcb* p_conn, void* pv_fd_ready_array);

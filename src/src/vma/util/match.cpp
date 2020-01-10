@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2001-2016 Mellanox Technologies, Ltd. All rights reserved.
+ * Copyright (c) 2001-2017 Mellanox Technologies, Ltd. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -212,9 +212,9 @@ static void print_rules_lst(struct dbl_lst_node *curr_node)
 
 static void print_instance_conf(struct instance *instance)
 {
-	if (!instance)
+	if (!instance) {
 		match_logdbg("\tinstance is empty");
-	else {
+	} else {
 		print_instance_id_str(instance);
 
 		struct dbl_lst_node *node = instance->tcp_srv_rules_lst.head;
@@ -690,11 +690,11 @@ int __vma_sockaddr_to_vma(const struct sockaddr *addr_in, socklen_t addrlen, str
 
 
 		if (inet_ntop (addr_out->sin_family, (void *) &(addr_out->sin_addr), buf,
-				 MAX_ADDR_STR_LEN) == NULL)
+				 MAX_ADDR_STR_LEN) == NULL) {
 			match_logdbg("__vma_sockaddr_to_vma: Converted IPv4 address is illegal");
-		else
+		} else {
 			match_logdbg("__vma_sockaddr_to_vma: Converted IPv4 is:%s", buf);
-
+		}
 		if (was_ipv6)
 			*was_ipv6 = 1;
 

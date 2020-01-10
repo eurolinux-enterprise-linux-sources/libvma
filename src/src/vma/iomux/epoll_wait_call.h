@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2001-2016 Mellanox Technologies, Ltd. All rights reserved.
+ * Copyright (c) 2001-2017 Mellanox Technologies, Ltd. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -63,9 +63,6 @@ public:
 	/// @override
 	virtual void set_offloaded_rfd_ready(int fd_index);
 	virtual void set_offloaded_wfd_ready(int fd_index);
-        
-	/// @override
-	virtual void prepare_to_poll();
 
 	/// @override
 	virtual void prepare_to_block();
@@ -95,7 +92,7 @@ public:
 	virtual void unlock();
 
 	/// @override
-	virtual bool immidiate_return();
+	virtual bool immidiate_return(int &poll_os_countdown);
 
 	/// @override
 	virtual bool check_all_offloaded_sockets(uint64_t *p_poll_sn);
@@ -104,7 +101,7 @@ public:
 
 	int get_current_events();
 
-	bool handle_epoll_event(bool is_ready, uint32_t events, int fd, epoll_fd_rec fd_rec, int index);
+	bool handle_epoll_event(bool is_ready, uint32_t events, socket_fd_api *socket_object, int index);
 
 protected:
 	virtual int ring_poll_and_process_element(uint64_t *p_poll_sn, void* pv_fd_ready_array = NULL);
@@ -112,6 +109,8 @@ protected:
 	virtual int ring_request_notification(uint64_t poll_sn);
 
 	virtual int ring_wait_for_notification_and_process_element(uint64_t *p_poll_sn, void* pv_fd_ready_array = NULL);
+
+	virtual bool handle_os_countdown(int &poll_os_countdown);
 
 private:
 	bool _wait(int timeout);

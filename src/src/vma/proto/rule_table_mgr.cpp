@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2001-2016 Mellanox Technologies, Ltd. All rights reserved.
+ * Copyright (c) 2001-2017 Mellanox Technologies, Ltd. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -39,6 +39,7 @@
 #include <sys/socket.h>
 #include <linux/rtnetlink.h>
 #include <linux/netlink.h>
+#include <linux/fib_rules.h>
 #include <netinet/in.h>
 #include <netinet/ether.h>
 #include <arpa/inet.h>
@@ -106,7 +107,7 @@ bool rule_table_mgr::parse_enrty(nlmsghdr *nl_header, rule_val *p_val)
 	rt_msg = (struct rtmsg *) NLMSG_DATA(nl_header);
 
 	// we are not concerned about the local and default rule table
-	if (rt_msg->rtm_family != AF_INET || rt_msg->rtm_table == RT_TABLE_LOCAL || rt_msg->rtm_table == RT_TABLE_DEFAULT)
+	if (rt_msg->rtm_family != AF_INET || rt_msg->rtm_table == RT_TABLE_LOCAL)
 		return false;
 
 	p_val->set_protocol(rt_msg->rtm_protocol);
@@ -133,22 +134,25 @@ bool rule_table_mgr::parse_enrty(nlmsghdr *nl_header, rule_val *p_val)
 void rule_table_mgr::parse_attr(struct rtattr *rt_attribute, rule_val *p_val)
 {
 	switch (rt_attribute->rta_type) {
-		case RTA_PRIORITY:
+		case FRA_PRIORITY:
 			p_val->set_priority(*(uint32_t *)RTA_DATA(rt_attribute));
 			break;			
-		case RTA_DST:
+		case FRA_DST:
 			p_val->set_dst_addr(*(in_addr_t *)RTA_DATA(rt_attribute));
 			break;
-		case RTA_SRC:
+		case FRA_SRC:
 			p_val->set_src_addr(*(in_addr_t *)RTA_DATA(rt_attribute));
 			break;			
-		case RTA_IIF:
+		case FRA_IFNAME:
 			p_val->set_iif_name((char *)RTA_DATA(rt_attribute));
 			break;	
-		case RTA_OIF:
+#if DEFINED_FRA_OIFNAME
+		case FRA_OIFNAME:
 			p_val->set_oif_name((char *)RTA_DATA(rt_attribute));
 			break;				
+#endif
 		default:
+			rr_mgr_logdbg("got undetected rta_type %d %x", rt_attribute->rta_type, *(uint32_t *)RTA_DATA(rt_attribute));
 			break;
 	}
 }

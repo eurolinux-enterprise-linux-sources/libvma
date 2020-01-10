@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2001-2016 Mellanox Technologies, Ltd. All rights reserved.
+ * Copyright (c) 2001-2017 Mellanox Technologies, Ltd. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -49,6 +49,8 @@
 #include "vma/sock/fd_collection.h"
 #include "vma/event/event_handler_manager.h"
 #include "vma/dev/buffer_pool.h"
+#include "vma/dev/ring_simple.h"
+#include "vma/dev/ring_profile.h"
 #include "vma/proto/route_table_mgr.h"
 #include "vma/proto/rule_table_mgr.h"
 #include "vma/proto/dst_entry_tcp.h"
@@ -104,8 +106,6 @@ enum {
 #define UDP_MAP_ADD             101
 #define UDP_MAP_REMOVE          102
 
-int g_n_os_igmp_max_membership;
-
 /**/
 /** inlining functions can only help if they are implemented before their usage **/
 /**/
@@ -118,21 +118,19 @@ inline void	sockinfo_udp::reuse_buffer(mem_buf_desc_t *buff)
 	}
 }
 
-inline ssize_t sockinfo_udp::poll_os()
+inline int sockinfo_udp::poll_os()
 {
-	ssize_t ret;
-	pollfd os_fd[1];
+	int ret;
+	uint64_t pending_data = 0;
 
 	m_rx_udp_poll_os_ratio_counter = 0;
-	os_fd[0].fd = m_fd;
-	os_fd[0].events = POLLIN;
-	ret = orig_os_api.poll(os_fd, 1, 0); // Zero timeout - just poll and return quickly
+	ret = orig_os_api.ioctl(m_fd, FIONREAD, &pending_data);
 	if (unlikely(ret == -1)) {
 		m_p_socket_stats->counters.n_rx_os_errors++;
-		si_udp_logdbg("orig_os_api.poll returned with error in polling loop (errno=%d %m)", errno);
+		si_udp_logdbg("orig_os_api.ioctl returned with error in polling loop (errno=%d %m)", errno);
 		return -1;
 	}
-	if (ret == 1) {
+	if (pending_data > 0) {
 		m_p_socket_stats->counters.n_rx_poll_os_hit++;
 		return 1;
 	}
@@ -227,9 +225,11 @@ inline int sockinfo_udp::rx_wait(bool blocking)
 		// Block with epoll_wait()
 		// on all rx_cq's notification channels and the socket's OS fd until we get an ip packet
 		// release lock so other threads that wait on this socket will not consume CPU
+		/* coverity[double_lock] TODO: RM#1049980 */
 		m_lock_rcv.lock();
 		if (!m_n_rx_pkt_ready_list_count) {
 			going_to_sleep();
+			/* coverity[double_unlock] TODO: RM#1049980 */
 			m_lock_rcv.unlock();
 		} else {
 			m_lock_rcv.unlock();
@@ -238,8 +238,10 @@ inline int sockinfo_udp::rx_wait(bool blocking)
 
 		ret = orig_os_api.epoll_wait(m_rx_epfd, rx_epfd_events, SI_RX_EPFD_EVENT_MAX, m_loops_timer.time_left_msec());
 
+		/* coverity[double_lock] TODO: RM#1049980 */
 		m_lock_rcv.lock();
 		return_from_sleep();
+		/* coverity[double_unlock] TODO: RM#1049980 */
 		m_lock_rcv.unlock();
 
 		if ( ret == 0 ) { //timeout
@@ -275,8 +277,10 @@ inline int sockinfo_udp::rx_wait(bool blocking)
 			for (int event_idx = 0; event_idx < ret; ++event_idx) {
 				int fd = rx_epfd_events[event_idx].data.fd;
 				if (is_wakeup_fd(fd)) {
+					/* coverity[double_lock] TODO: RM#1049980 */
 					m_lock_rcv.lock();
 					remove_wakeup_fd();
+					/* coverity[double_unlock] TODO: RM#1049980 */
 					m_lock_rcv.unlock();
 					continue;
 				}
@@ -338,6 +342,8 @@ const char * setsockopt_so_opt_to_str(int opt)
 	case SO_TIMESTAMP:		return "SO_TIMESTAMP";
 	case SO_TIMESTAMPNS:		return "SO_TIMESTAMPNS";
 	case SO_BINDTODEVICE:		return "SO_BINDTODEVICE";
+	case SO_VMA_RING_ALLOC_LOGIC:	return "SO_VMA_RING_ALLOC_LOGIC";
+	case SO_MAX_PACING_RATE:	return "SO_MAX_PACING_RATE";
 	default:			break;
 	}
 	return "UNKNOWN SO opt";
@@ -347,11 +353,13 @@ const char * setsockopt_so_opt_to_str(int opt)
 const char * setsockopt_ip_opt_to_str(int opt)
 {
 	switch (opt) {
-	case IP_MULTICAST_IF:		return "IP_MULTICAST_IF";
-	case IP_MULTICAST_TTL:		return "IP_MULTICAST_TTL";
-	case IP_MULTICAST_LOOP: 	return "IP_MULTICAST_LOOP";
-	case IP_ADD_MEMBERSHIP: 	return "IP_ADD_MEMBERSHIP";    
-	case IP_DROP_MEMBERSHIP:	return "IP_DROP_MEMBERSHIP";
+	case IP_MULTICAST_IF:           return "IP_MULTICAST_IF";
+	case IP_MULTICAST_TTL:          return "IP_MULTICAST_TTL";
+	case IP_MULTICAST_LOOP:         return "IP_MULTICAST_LOOP";
+	case IP_ADD_MEMBERSHIP:         return "IP_ADD_MEMBERSHIP";
+	case IP_ADD_SOURCE_MEMBERSHIP:  return "IP_ADD_SOURCE_MEMBERSHIP";
+	case IP_DROP_MEMBERSHIP:        return "IP_DROP_MEMBERSHIP";
+	case IP_DROP_SOURCE_MEMBERSHIP: return "IP_DROP_SOURCE_MEMBERSHIP";
 	default:			break;
 	}
 	return "UNKNOWN IP opt";
@@ -362,14 +370,16 @@ const char * setsockopt_ip_opt_to_str(int opt)
 // Throttle the amount of ring polling we do (remember last time we check for receive packets)
 tscval_t g_si_tscv_last_poll = 0;
 
-sockinfo_udp::sockinfo_udp(int fd) throw (vma_exception) :
+sockinfo_udp::sockinfo_udp(int fd):
 	sockinfo(fd)
+	,m_rx_packet_processor(&sockinfo_udp::rx_process_udp_packet_full)
 	,m_mc_tx_if(INADDR_ANY)
 	,m_b_mc_tx_loop(safe_mce_sys().tx_mc_loopback_default) // default value is 'true'. User can change this with config parameter SYS_VAR_TX_MC_LOOPBACK
 	,m_n_mc_ttl(DEFAULT_MC_TTL)
 	,m_loops_to_go(safe_mce_sys().rx_poll_num_init) // Start up with a init polling loops value
 	,m_rx_udp_poll_os_ratio_counter(0)
 	,m_sock_offload(true)
+	,m_mc_num_grp_with_src_filter(0)
 	,m_port_map_lock("sockinfo_udp::m_ports_map_lock")
 	,m_port_map_index(0)
 	,m_p_last_dst_entry(NULL)
@@ -382,6 +392,10 @@ sockinfo_udp::sockinfo_udp(int fd) throw (vma_exception) :
 	,m_n_sysvar_rx_ready_byte_min_limit(safe_mce_sys().rx_ready_byte_min_limit)
 	,m_n_sysvar_rx_cq_drain_rate_nsec(safe_mce_sys().rx_cq_drain_rate_nsec)
 	,m_n_sysvar_rx_delta_tsc_between_cq_polls(safe_mce_sys().rx_delta_tsc_between_cq_polls)
+	,m_reuseaddr(false)
+	,m_sockopt_mapped(false)
+	,m_is_connected(false)
+	,m_multicast(false)
 {
 	si_udp_logfunc("");
 
@@ -402,7 +416,8 @@ sockinfo_udp::sockinfo_udp(int fd) throw (vma_exception) :
 	si_udp_logdbg("Sockets RCVBUF = %d bytes", n_so_rcvbuf_bytes);
 	rx_ready_byte_count_limit_update(n_so_rcvbuf_bytes);
 
-	struct epoll_event ev;
+	epoll_event ev = {0, {0}};
+
 	ev.events = EPOLLIN;
 
 	// Add the user's orig fd to the rx epfd handle
@@ -412,7 +427,6 @@ sockinfo_udp::sockinfo_udp(int fd) throw (vma_exception) :
 	if (unlikely(orig_os_api.epoll_ctl(m_rx_epfd, EPOLL_CTL_ADD, ev.data.fd, &ev)))
 		si_udp_logpanic("failed to add user's fd to internal epfd errno=%d (%m)", errno);
 	BULLSEYE_EXCLUDE_BLOCK_END
-
 
 	si_udp_logfunc("done");
 }
@@ -489,11 +503,11 @@ int sockinfo_udp::bind(const struct sockaddr *__addr, socklen_t __addrlen)
 		si_udp_logdbg("getsockname failed (ret=%d %m)", ret);
 		return -1; 
 	}
+
 	BULLSEYE_EXCLUDE_BLOCK_END
 	// save the bound info and then attach to offload flows
 	on_sockname_change(name, *namelen);
 	si_udp_logdbg("bound to %s", m_bound.to_str());
-
 	dst_entry_map_t::iterator dst_entry_iter = m_dst_entry_map.begin();
 	while (dst_entry_iter != m_dst_entry_map.end()) {
 		if (!m_bound.is_anyaddr() && !m_bound.is_mc()) {
@@ -581,7 +595,11 @@ int sockinfo_udp::connect(const struct sockaddr *__to, socklen_t __tolen)
 			return 0; // zero returned from orig_connect()
 		}
 		BULLSEYE_EXCLUDE_BLOCK_END
+
+		m_is_connected = true; // will inspect for SRC
+
 		on_sockname_change(name, *namelen);
+
 		si_udp_logdbg("bound to %s", m_bound.to_str());
 		in_port_t src_port = m_bound.get_in_port();
 
@@ -593,10 +611,12 @@ int sockinfo_udp::connect(const struct sockaddr *__to, socklen_t __tolen)
 		// Create the new dst_entry
 		if (IN_MULTICAST_N(dst_ip)) {
 			m_p_connected_dst_entry = new dst_entry_udp_mc(dst_ip, dst_port, src_port,
-					m_mc_tx_if ? m_mc_tx_if : m_bound.get_in_addr(), m_b_mc_tx_loop, m_n_mc_ttl, m_fd);
+					m_mc_tx_if ? m_mc_tx_if : m_bound.get_in_addr(),
+							m_b_mc_tx_loop, m_n_mc_ttl, m_fd, m_ring_alloc_log_tx);
 		}
 		else {
-			m_p_connected_dst_entry = new dst_entry_udp(dst_ip, dst_port, src_port, m_fd);
+			m_p_connected_dst_entry = new dst_entry_udp(dst_ip, dst_port,
+					src_port, m_fd, m_ring_alloc_log_tx);
 		}
 		BULLSEYE_EXCLUDE_BLOCK_START
 		if (!m_p_connected_dst_entry) {
@@ -605,6 +625,7 @@ int sockinfo_udp::connect(const struct sockaddr *__to, socklen_t __tolen)
 			m_p_socket_stats->connected_ip = INADDR_ANY;
 			m_connected.set_in_port(INPORT_ANY);
 			m_p_socket_stats->connected_port = INPORT_ANY;
+			m_is_connected = false; // will skip inspection for SRC
 			return 0;
 		}
 		BULLSEYE_EXCLUDE_BLOCK_END
@@ -699,13 +720,58 @@ int sockinfo_udp::on_sockname_change(struct sockaddr *__name, socklen_t __namele
 	return 0;
 }
 
+int sockinfo_udp::set_ring_attr(vma_ring_alloc_logic_attr *attr)
+{
+	if ((attr->comp_mask & VMA_RING_ALLOC_MASK_RING_ENGRESS) && attr->engress) {
+		if (set_ring_attr_helper(&m_ring_alloc_log_tx, attr)) {
+			return -1;
+		}
+	}
+	if ((attr->comp_mask & VMA_RING_ALLOC_MASK_RING_INGRESS) && attr->ingress) {
+		if (set_ring_attr_helper(&m_ring_alloc_log_rx, attr)) {
+			return -1;
+		}
+		m_ring_alloc_logic = ring_allocation_logic_rx(get_fd(), m_ring_alloc_log_rx, this);
+	}
+	return 0;
+}
+
+int sockinfo_udp::set_ring_attr_helper(ring_alloc_logic_attr *sock_attr,
+					vma_ring_alloc_logic_attr *user_attr)
+{
+	if (user_attr->comp_mask & VMA_RING_ALLOC_MASK_RING_PROFILE_KEY) {
+		if (sock_attr->get_ring_profile_key()) {
+			si_udp_logdbg("ring_profile_key is already set and "
+				      "cannot be changed");
+			return -1;
+		}
+		sock_attr->set_ring_profile_key(user_attr->ring_profile_key);
+	}
+	
+	sock_attr->set_ring_alloc_logic(user_attr->ring_alloc_logic);
+
+	if (user_attr->comp_mask & VMA_RING_ALLOC_MASK_RING_USER_ID) {
+		sock_attr->set_user_id_key(user_attr->user_id);
+	}
+	return 0;
+}
+
 ////////////////////////////////////////////////////////////////////////////////
-int sockinfo_udp::setsockopt(int __level, int __optname, __const void *__optval, socklen_t __optlen) throw (vma_error)
+int sockinfo_udp::setsockopt(int __level, int __optname, __const void *__optval, socklen_t __optlen)
 {
 	si_udp_logfunc("level=%d, optname=%d", __level, __optname);
 
 	if (unlikely(m_b_closed) || unlikely(g_b_exit))
 		return orig_os_api.setsockopt(m_fd, __level, __optname, __optval, __optlen);
+
+#ifdef DEFINED_VMAPOLL
+	/* Process VMA specific options only at the moment
+	 * VMA option does not require additional processing after return
+	 */
+	if (0 == sockinfo::setsockopt(__level, __optname, __optval, __optlen)) {
+		return 0;
+	}
+#endif // DEFINED_VMAPOLL
 
 	auto_unlocker lock_tx(m_lock_snd);
 	auto_unlocker lock_rx(m_lock_rcv);
@@ -718,8 +784,12 @@ int sockinfo_udp::setsockopt(int __level, int __optname, __const void *__optval,
 			switch (__optname) {
 
 			case SO_REUSEADDR:
+				set_reuseaddr(*(bool*)__optval);
+				si_udp_logdbg("SOL_SOCKET, %s=%s", setsockopt_so_opt_to_str(__optname), (*(bool*)__optval ? "true" : "false"));
+				break;
+
 			case SO_BROADCAST:
-				si_udp_logdbg("SOL_SOCKET, %s=%s", setsockopt_so_opt_to_str(__optname), ((bool*)__optval ? "true" : "false"));
+				si_udp_logdbg("SOL_SOCKET, %s=%s", setsockopt_so_opt_to_str(__optname), (*(bool*)__optval ? "true" : "false"));
 				break;
 
 			case SO_RCVBUF:
@@ -778,9 +848,9 @@ int sockinfo_udp::setsockopt(int __level, int __optname, __const void *__optval,
 
 					if (val & (SOF_TIMESTAMPING_RAW_HARDWARE | SOF_TIMESTAMPING_RX_HARDWARE)) {
 						if (g_p_ib_ctx_handler_collection->get_ctx_time_conversion_mode() == TS_CONVERSION_MODE_DISABLE){
-							if (safe_mce_sys().rx_udp_hw_ts_conversion ==  TS_CONVERSION_MODE_DISABLE) {
+							if (safe_mce_sys().hw_ts_conversion_mode ==  TS_CONVERSION_MODE_DISABLE) {
 								errno = EPERM;
-								si_udp_logdbg("SOL_SOCKET, SOF_TIMESTAMPING_RAW_HARDWARE and SOF_TIMESTAMPING_RX_HARDWARE socket options were disabled (VMA_UDP_RX_HW_TS_CONVERSION = %d) , errno set to EPERM", TS_CONVERSION_MODE_DISABLE);
+								si_udp_logdbg("SOL_SOCKET, SOF_TIMESTAMPING_RAW_HARDWARE and SOF_TIMESTAMPING_RX_HARDWARE socket options were disabled (VMA_HW_TS_CONVERSION = %d) , errno set to EPERM", TS_CONVERSION_MODE_DISABLE);
 								return -1;
 							} else {
 								errno = ENODEV;
@@ -802,7 +872,7 @@ int sockinfo_udp::setsockopt(int __level, int __optname, __const void *__optval,
 				if (__optval) {
 					struct sockaddr_in sockaddr;
 					if (__optlen == 0 || ((char*)__optval)[0] == '\0') {
-						m_so_bindtodevice_ip = 0;
+						m_so_bindtodevice_ip = INADDR_ANY;
 					} else if (get_ipv4_from_ifname((char*)__optval, &sockaddr)) {
 						si_udp_logdbg("SOL_SOCKET, %s=\"???\" - NOT HANDLED, cannot find if_name", setsockopt_so_opt_to_str(__optname));
 						break;
@@ -828,7 +898,61 @@ int sockinfo_udp::setsockopt(int __level, int __optname, __const void *__optval,
 					si_udp_logdbg("SOL_SOCKET, %s=\"???\" - NOT HANDLED, optval == NULL", setsockopt_so_opt_to_str(__optname));
 				}
 				break;
+			case SO_VMA_RING_ALLOC_LOGIC:
+				if (__optval) {
+					if (__optlen == sizeof(vma_ring_alloc_logic_attr)) {
+						vma_ring_alloc_logic_attr *attr = (vma_ring_alloc_logic_attr *)__optval;
+						return set_ring_attr(attr);
+					}
+					else {
+						si_udp_logdbg("VMA_MP_RQ, %s=\"???\" - bad length expected %d got %d",
+							      setsockopt_so_opt_to_str(__optname),
+							      sizeof(vma_ring_alloc_logic_attr), __optlen);
+						break;
+					}
+				}
+				else {
+					si_udp_logdbg("VMA_MP_RQ, %s=\"???\" - NOT HANDLED, optval == NULL", setsockopt_so_opt_to_str(__optname));
+				}
+				break;
+			case SO_MAX_PACING_RATE:
+				if (__optval) {
+					uint32_t val = *(uint32_t *)__optval; // value is in bytes per second
+					if (modify_ratelimit(m_p_connected_dst_entry, val) < 0) {
+						si_udp_logdbg("error setting setsockopt SO_MAX_PACING_RATE for connected dst_entry %p: %d bytes/second ", m_p_connected_dst_entry, val);
 
+						// Do not fall back to kernel in this case.
+						// The kernel's support for packet pacing is of no consequence
+						// to the VMA user and may only confuse the calling application.
+						return -1;
+					}
+
+					size_t dst_entries_not_modified = 0;
+					dst_entry_map_t::iterator dst_entry_iter ;
+					for (dst_entry_iter = m_dst_entry_map.begin();
+					     dst_entry_iter != m_dst_entry_map.end();
+					     ++dst_entry_iter) {
+						dst_entry* p_dst_entry = dst_entry_iter->second;
+						if (modify_ratelimit(p_dst_entry, val) < 0) {
+							si_udp_logdbg("error setting setsockopt SO_MAX_PACING_RATE "
+								      "for dst_entry %p: %d bytes/second ",
+								      p_dst_entry, val);
+							dst_entries_not_modified++;
+						}
+					}
+					// It is possible that the user has a setup with some NICs that support
+					// packet pacing and some that don't.
+					// Setting packet pacing fails only if all NICs do not support it.
+					if (m_dst_entry_map.size() &&
+					    (dst_entries_not_modified == m_dst_entry_map.size())) {
+						return -1;
+					}
+					return 0;
+				}
+				else {
+					si_udp_logdbg("SOL_SOCKET, %s=\"???\" - NOT HANDLED, optval == NULL", setsockopt_so_opt_to_str(__optname));
+				}
+				break;
 			default:
 				si_udp_logdbg("SOL_SOCKET, optname=%s (%d)", setsockopt_so_opt_to_str(__optname), __optname);
 				supported = false;
@@ -916,114 +1040,146 @@ int sockinfo_udp::setsockopt(int __level, int __optname, __const void *__optval,
 				break;
 
 			case IP_ADD_MEMBERSHIP:
-			case IP_DROP_MEMBERSHIP:	
+			case IP_DROP_MEMBERSHIP:
+			case IP_ADD_SOURCE_MEMBERSHIP:
+			case IP_DROP_SOURCE_MEMBERSHIP:
 				{
-				if (!m_sock_offload) {
-					si_udp_logdbg("VMA Rx Offload is Disabled! calling OS setsockopt() for IPPROTO_IP, %s", setsockopt_ip_opt_to_str(__optname));
-					break;
-				}
+					if (!m_sock_offload) {
+						si_udp_logdbg("VMA Rx Offload is Disabled! calling OS setsockopt() for IPPROTO_IP, %s", setsockopt_ip_opt_to_str(__optname));
+						break;
+					}
 
-				if (__optval == NULL || (__optlen < sizeof(struct ip_mreq))) {
-					si_udp_logdbg("IPPROTO_IP, %s; Bad optval! calling OS setsockopt()", setsockopt_ip_opt_to_str(__optname));
-					break;
-				}
+					if (NULL == __optval) {
+						si_udp_logdbg("IPPROTO_IP, %s; Bad optval! calling OS setsockopt()", setsockopt_ip_opt_to_str(__optname));
+						break;
+					}
 
-				struct ip_mreq mreq = *(struct ip_mreq*)__optval;
-				if (__optlen >= sizeof(struct ip_mreqn)) {
-					struct ip_mreqn* p_mreqn = (struct ip_mreqn*)__optval;
-					if(p_mreqn->imr_ifindex) {
-						net_dev_lst_t* p_ndv_val_lst = g_p_net_device_table_mgr->get_net_device_val_lst_from_index(p_mreqn->imr_ifindex);
-						net_device_val* p_ndev = NULL;
-						if (p_ndv_val_lst && (p_ndev = dynamic_cast <net_device_val *>(*(p_ndv_val_lst->begin())))) {
-							mreq.imr_interface.s_addr = p_ndev->get_local_addr();
-						} else {
-							struct sockaddr_in src_addr;
-							if (get_ipv4_from_ifindex(p_mreqn->imr_ifindex, &src_addr) == 0) {
-								mreq.imr_interface.s_addr = src_addr.sin_addr.s_addr;
-							} else {
-								si_udp_logdbg("setsockopt(%s) will be passed to OS for handling, can't get address of interface index %d ", setsockopt_ip_opt_to_str(__optname), p_mreqn->imr_ifindex);
-								break;
+					// There are 3 types of structs that we can receive, ip_mreq(2 members), ip_mreqn(3 members), ip_mreq_source(3 members)
+					// ip_mreq struct type and size depend on command type, let verify all possibilities and continue
+					// below with safe logic.
+
+					// NOTE: The ip_mreqn structure is available only since Linux 2.2. For compatibility, the old ip_mreq
+					// structure (present since Linux 1.2) is still supported; it differs from ip_mreqn only by not
+					// including the imr_ifindex field.
+					if (__optlen < sizeof(struct ip_mreq)) {
+						si_udp_logdbg("IPPROTO_IP, %s; Bad optlen! calling OS setsockopt() with optlen=%d (required optlen=%d)",
+							setsockopt_ip_opt_to_str(__optname), __optlen, sizeof(struct ip_mreq));
+						break;
+					}
+					// IP_ADD_SOURCE_MEMBERSHIP (and DROP) used ip_mreq_source which is same size struct as ip_mreqn,
+					// but fields have different meaning
+					if (((IP_ADD_SOURCE_MEMBERSHIP == __optname) || (IP_DROP_SOURCE_MEMBERSHIP == __optname)) &&
+						    (__optlen < sizeof(struct ip_mreq_source))) {
+						si_udp_logdbg("IPPROTO_IP, %s; Bad optlen! calling OS setsockopt() with optlen=%d (required optlen=%d)",
+							setsockopt_ip_opt_to_str(__optname), __optlen, sizeof(struct ip_mreq_source));
+						break;
+					}
+
+					// Use  local variable for easy access
+					in_addr_t mc_grp = ((struct ip_mreq*)__optval)->imr_multiaddr.s_addr;
+				 	in_addr_t mc_if  = ((struct ip_mreq*)__optval)->imr_interface.s_addr;
+
+					// In case interface address is undefined[INADDR_ANY] we need to find the ip address to use
+					struct ip_mreq_source mreqprm = {{mc_grp}, {mc_if}, {0}};
+					if ((IP_ADD_MEMBERSHIP == __optname) || (IP_DROP_MEMBERSHIP == __optname)) {
+						if (__optlen >= sizeof(struct ip_mreqn)) {
+							struct ip_mreqn* p_mreqn = (struct ip_mreqn*)__optval;
+							if (p_mreqn->imr_ifindex) {
+								net_dev_lst_t* p_ndv_val_lst = g_p_net_device_table_mgr->get_net_device_val_lst_from_index(p_mreqn->imr_ifindex);
+								net_device_val* p_ndev = NULL;
+								if (p_ndv_val_lst && (p_ndev = dynamic_cast <net_device_val *>(*(p_ndv_val_lst->begin())))) {
+									mreqprm.imr_interface.s_addr = p_ndev->get_local_addr();
+								} else {
+									struct sockaddr_in src_addr;
+									if (get_ipv4_from_ifindex(p_mreqn->imr_ifindex, &src_addr) == 0) {
+										mreqprm.imr_interface.s_addr = src_addr.sin_addr.s_addr;
+									} else {
+										si_udp_logdbg("setsockopt(%s) will be passed to OS for handling, can't get address of interface index %d ",
+												setsockopt_ip_opt_to_str(__optname), p_mreqn->imr_ifindex);
+										break;
+									}
+								}
 							}
 						}
 					}
-				}
-
-				in_addr_t mc_grp = mreq.imr_multiaddr.s_addr;
-				in_addr_t mc_if = mreq.imr_interface.s_addr;
-
-				if(! IN_MULTICAST_N(mc_grp)) {
-					si_udp_logdbg("setsockopt(%s) will be passed to OS for handling, IP %d.%d.%d.%d is not MC ", setsockopt_ip_opt_to_str(__optname),  NIPQUAD(mc_grp));
-					break;
-				}
-				if (mc_if == INADDR_ANY) {
-					in_addr_t dst_ip	= mc_grp;
-					in_addr_t src_ip	= 0;
-					uint8_t tos		= 0;
-					
-					if (!m_bound.is_anyaddr() && !m_bound.is_mc()) {
-						src_ip = m_bound.get_in_addr();
-					}else if (m_so_bindtodevice_ip) {
-						src_ip = m_so_bindtodevice_ip;
+					else {
+						// Save and use the user provided source address filter in case of IP_ADD_SOURCE_MEMBERSHIP or IP_DROP_SOURCE_MEMBERSHIP
+						mreqprm.imr_sourceaddr.s_addr = ((struct ip_mreq_source*)__optval)->imr_sourceaddr.s_addr;
 					}
-					// Find local if for this MC ADD/DROP
-					g_p_route_table_mgr->route_resolve(route_rule_table_key(dst_ip, src_ip, tos), &mc_if);
-					si_udp_logdbg("IPPROTO_IP, %s=%d.%d.%d.%d, mc_if:INADDR_ANY (resolved to: %d.%d.%d.%d)", setsockopt_ip_opt_to_str(__optname), NIPQUAD(mc_grp), NIPQUAD(mc_if));
-				}
-				else {
-					si_udp_logdbg("IPPROTO_IP, %s=%d.%d.%d.%d, mc_if:%d.%d.%d.%d", setsockopt_ip_opt_to_str(__optname), NIPQUAD(mc_grp), NIPQUAD(mc_if));
-				}
 
-				if (mc_change_membership_start_helper(mc_grp, __optname)) {
-					return -1;
-				}
+					// Update interface IP in case it was changed above
+					mc_if  = mreqprm.imr_interface.s_addr;
 
-				// MNY: TODO: Check rules for local_if (blacklist interface feature)
-				/*sock_addr tmp_if_addr(AF_INET, mc_if, m_bound.get_in_port());
-				if (__vma_match_udp_receiver(TRANS_VMA, tmp_if_addr.get_p_sa(), tmp_if_addr.get_socklen(), safe_mce_sys().app_id) == TRANS_OS) {
-					// Break so we call orig setsockopt() and don't try to offlaod
-					si_udp_logdbg("setsockopt(%s) will be passed to OS for handling due to rule matching", setsockopt_ip_opt_to_str(__optname));
-					break;
-				}*/
+					if (!IN_MULTICAST_N(mc_grp)) {
+						si_udp_logdbg("setsockopt(%s) will be passed to OS for handling, IP %d.%d.%d.%d is not MC ",
+								setsockopt_ip_opt_to_str(__optname),  NIPQUAD(mc_grp));
+						break;
+					}
 
-				bool goto_os = false;
+					// Find local interface IP address
+					if (INADDR_ANY == mc_if) {
+						in_addr_t dst_ip	= mc_grp;
+						in_addr_t src_ip	= 0;
+						uint8_t tos		= 0;
 
-				// Check MC rules for not offloading
-				sock_addr tmp_grp_addr(AF_INET, mc_grp, m_bound.get_in_port());
-				if (__vma_match_udp_receiver(TRANS_VMA, safe_mce_sys().app_id, tmp_grp_addr.get_p_sa(), tmp_grp_addr.get_socklen()) == TRANS_OS) {
-					// call orig setsockopt() and don't try to offlaod
-					si_udp_logdbg("setsockopt(%s) will be passed to OS for handling due to rule matching", setsockopt_ip_opt_to_str(__optname));
-					goto_os = true;
-				}
-				// Check if local_if is not offloadable
-				else if (!g_p_net_device_table_mgr->get_net_device_val(mc_if)) {
-					// call orig setsockopt() and don't try to offlaod
-					si_udp_logdbg("setsockopt(%s) will be passed to OS for handling - not offload interface (%d.%d.%d.%d)", setsockopt_ip_opt_to_str(__optname), NIPQUAD(mc_if));
-					goto_os = true;
-				}
-				// offloaded, check if need to pend
-				else if (m_bound.get_in_port() == INPORT_ANY) {
-					// Delay attaching to this MC group until we have bound UDP port
-					int ret = orig_os_api.setsockopt(m_fd, __level, __optname, __optval, __optlen);
-					if (ret) return ret;
-					mc_change_pending_mreq(&mreq, __optname);
-				}
-				// Handle attach to this MC group now
-				else if (mc_change_membership(&mreq, __optname)) {
-					// Opps, failed in attaching??? call orig setsockopt()
-					goto_os = true;
-				}
+						if ((!m_bound.is_anyaddr()) && (!m_bound.is_mc())) {
+							src_ip = m_bound.get_in_addr();
+						} else if (m_so_bindtodevice_ip) {
+							src_ip = m_so_bindtodevice_ip;
+						}
+						// Find local if for this MC ADD/DROP
+						struct route_result res;
+						g_p_route_table_mgr->route_resolve(route_rule_table_key(dst_ip, src_ip, tos), res);
+						mc_if = res.p_src;
+						si_udp_logdbg("IPPROTO_IP, %s=%d.%d.%d.%d, mc_if:INADDR_ANY (resolved to: %d.%d.%d.%d)", setsockopt_ip_opt_to_str(__optname), NIPQUAD(mc_grp), NIPQUAD(mc_if));
+					}
+					else {
+						si_udp_logdbg("IPPROTO_IP, %s=%d.%d.%d.%d, mc_if:%d.%d.%d.%d mc_src:%d.%d.%d.%d", setsockopt_ip_opt_to_str(__optname), NIPQUAD(mc_grp), NIPQUAD(mc_if), NIPQUAD(mreqprm.imr_sourceaddr.s_addr));
+					}
 
-				if (goto_os) {
-					int ret = orig_os_api.setsockopt(m_fd, __level, __optname, __optval, __optlen);
-					if (ret) return ret;
-				}
+					// Add multicast group membership
+					if (mc_change_membership_start_helper(mc_grp, __optname)) {
+						return -1;
+					}
 
-				mc_change_membership_end_helper(mc_grp, __optname);
+					bool goto_os = false;
+					// Check MC rules for not offloading
+					sock_addr tmp_grp_addr(AF_INET, mc_grp, m_bound.get_in_port());
+					mc_pending_pram mcpram = {mreqprm.imr_multiaddr, mreqprm.imr_interface, mreqprm.imr_sourceaddr, __optname};
 
-				return 0;
+					if (TRANS_OS == __vma_match_udp_receiver(TRANS_VMA, safe_mce_sys().app_id, tmp_grp_addr.get_p_sa(), tmp_grp_addr.get_socklen())) {
+						// call orig setsockopt() and don't try to offlaod
+						si_udp_logdbg("setsockopt(%s) will be passed to OS for handling due to rule matching", setsockopt_ip_opt_to_str(__optname));
+						goto_os = true;
+					}
+					// Check if local_if is not offloadable
+					else if (!g_p_net_device_table_mgr->get_net_device_val(mc_if)) {
+						// call orig setsockopt() and don't try to offlaod
+						si_udp_logdbg("setsockopt(%s) will be passed to OS for handling - not offload interface (%d.%d.%d.%d)", setsockopt_ip_opt_to_str(__optname), NIPQUAD(mc_if));
+						goto_os = true;
+					}
+					// offloaded, check if need to pend
+					else if (INPORT_ANY == m_bound.get_in_port()) {
+						// Delay attaching to this MC group until we have bound UDP port
+						int ret = orig_os_api.setsockopt(m_fd, __level, __optname, __optval, __optlen);
+						if (ret) return ret;
+						mc_change_pending_mreq(&mcpram);
+					}
+					// Handle attach to this MC group now
+					else if (mc_change_membership( &mcpram )) {
+						// Opps, failed in attaching??? call orig setsockopt()
+						goto_os = true;
+					}
+
+					if (goto_os) {
+						int ret = orig_os_api.setsockopt(m_fd, __level, __optname, __optval, __optlen);
+						if (ret) return ret;
+					}
+
+					mc_change_membership_end_helper(mc_grp, __optname, mreqprm.imr_sourceaddr.s_addr);
+					return 0;
 				}
 				break;
-
 			case IP_PKTINFO:
 				if (__optval) {
 					if(*(int*)__optval)
@@ -1045,8 +1201,7 @@ int sockinfo_udp::setsockopt(int __level, int __optname, __const void *__optval,
 	case IPPROTO_UDP:
 		switch (__optname) {
 		case UDP_MAP_ADD:
-			if (! __optval)
-			{
+			if (! __optval) {
 				si_udp_loginfo("UDP_MAP_ADD __optval = NULL");
 				break;
 			}
@@ -1060,22 +1215,34 @@ int sockinfo_udp::setsockopt(int __level, int __optname, __const void *__optval,
 					m_port_map_lock.unlock();
 					return -1;
 				}
-				si_udp_logdbg("found UDP_MAP_ADD socket fd for port %d. fd is %d", ntohs(port_socket.port), port_socket.fd);			
+				if (m_port_map.empty()) {
+					m_sockopt_mapped = true;
+					// set full versus partial RX UDP handling due to updates in m_socket_mapped
+					set_rx_packet_processor();
+				}
+				si_udp_logdbg("found UDP_MAP_ADD socket fd for port %d. fd is %d", ntohs(port_socket.port), port_socket.fd);
 				m_port_map.push_back(port_socket);
 			}
 			m_port_map_lock.unlock();
 			return 0;
 
 		case UDP_MAP_REMOVE:
-			if (! __optval)
-			{
+			if (! __optval) {
 				si_udp_loginfo("UDP_MAP_REMOVE __optval = NULL");
 				break;
 			}
 			in_port_t port = *(in_port_t *)__optval;
 			si_udp_logdbg("stopping de-muxing packets to port %d", ntohs(port));
 			m_port_map_lock.lock();
-			m_port_map.erase(std::remove(m_port_map.begin(), m_port_map.end(), port), m_port_map.end());
+			std::vector<struct port_socket_t>::iterator iter = std::find(m_port_map.begin(), m_port_map.end(), port);
+			if (iter != m_port_map.end()) {
+				m_port_map.erase(iter);
+				if (m_port_map.empty()) {
+					m_sockopt_mapped = false;
+					// set full versus partial RX UDP handling due to updates in m_socket_mapped
+					set_rx_packet_processor();
+				}
+			}
 			m_port_map_lock.unlock();
 			return 0;
 		} // case IPPROTO_UDP
@@ -1107,7 +1274,7 @@ int sockinfo_udp::setsockopt(int __level, int __optname, __const void *__optval,
 	return orig_os_api.setsockopt(m_fd, __level, __optname, __optval, __optlen);
 }
 
-int sockinfo_udp::getsockopt(int __level, int __optname, void *__optval, socklen_t *__optlen) throw (vma_error)
+int sockinfo_udp::getsockopt(int __level, int __optname, void *__optval, socklen_t *__optlen)
 {
 	si_udp_logfunc("level=%d, optname=%d", __level, __optname);
 
@@ -1115,6 +1282,15 @@ int sockinfo_udp::getsockopt(int __level, int __optname, void *__optval, socklen
 
 	if (unlikely(m_b_closed) || unlikely(g_b_exit))
 		return ret;
+
+#ifdef DEFINED_VMAPOLL
+	/* Process VMA specific options only at the moment
+	 * VMA option does not require additional processing after return
+	 */
+	if (0 == sockinfo::getsockopt(__level, __optname, __optval, __optlen)) {
+		return 0;
+	}
+#endif // DEFINED_VMAPOLL	
 
 	auto_unlocker lock_tx(m_lock_snd);
 	auto_unlocker lock_rx(m_lock_rcv);
@@ -1140,6 +1316,10 @@ int sockinfo_udp::getsockopt(int __level, int __optname, void *__optval, socklen
 
 			case SO_SNDBUF:
 				si_udp_logdbg("SOL_SOCKET, SO_SNDBUF=%d", *(int*)__optval);
+				break;
+
+			case SO_MAX_PACING_RATE:
+				ret = sockinfo::getsockopt(__level, __optname, __optval, __optlen);
 				break;
 
 			default:
@@ -1188,12 +1368,11 @@ void sockinfo_udp::rx_ready_byte_count_limit_update(size_t n_rx_ready_bytes_limi
 	m_lock_rcv.lock();
 	while (m_p_socket_stats->n_rx_ready_byte_count > m_p_socket_stats->n_rx_ready_byte_limit) {
 		if (m_n_rx_pkt_ready_list_count) {
-			mem_buf_desc_t* p_rx_pkt_desc = m_rx_pkt_ready_list.front();
-			m_rx_pkt_ready_list.pop_front();
+			mem_buf_desc_t* p_rx_pkt_desc = m_rx_pkt_ready_list.get_and_pop_front();
 			m_n_rx_pkt_ready_list_count--;
-			m_rx_ready_byte_count -= p_rx_pkt_desc->path.rx.sz_payload;
+			m_rx_ready_byte_count -= p_rx_pkt_desc->rx.sz_payload;
 			m_p_socket_stats->n_rx_ready_pkt_count--;
-			m_p_socket_stats->n_rx_ready_byte_count -= p_rx_pkt_desc->path.rx.sz_payload;
+			m_p_socket_stats->n_rx_ready_byte_count -= p_rx_pkt_desc->rx.sz_payload;
 
 			reuse_buffer(p_rx_pkt_desc);
 			return_reuse_buffers_postponed();
@@ -1245,10 +1424,12 @@ ssize_t sockinfo_udp::rx(const rx_call_t call_type, iovec* p_iov,ssize_t sz_iov,
 	if ((m_n_sysvar_rx_udp_poll_os_ratio > 0) && (m_rx_udp_poll_os_ratio_counter >= m_n_sysvar_rx_udp_poll_os_ratio)) {
 		ret = poll_os();
 		if (ret == -1) {
+			/* coverity[double_lock] TODO: RM#1049980 */
 			m_lock_rcv.lock();
 			goto out;
 		}
 		if (ret == 1) {
+			/* coverity[double_lock] TODO: RM#1049980 */
 			m_lock_rcv.lock();
 			goto os;
 		}
@@ -1257,6 +1438,7 @@ ssize_t sockinfo_udp::rx(const rx_call_t call_type, iovec* p_iov,ssize_t sz_iov,
 	// First check if we have a packet in the ready list
 	if ((m_n_rx_pkt_ready_list_count > 0 && m_n_sysvar_rx_cq_drain_rate_nsec == MCE_RX_CQ_DRAIN_RATE_DISABLED)
 	    || is_readable(&poll_sn)) {
+		/* coverity[double_lock] TODO: RM#1049980 */
 		m_lock_rcv.lock();
 		m_rx_udp_poll_os_ratio_counter++;
 		if (m_n_rx_pkt_ready_list_count > 0) {
@@ -1265,6 +1447,7 @@ ssize_t sockinfo_udp::rx(const rx_call_t call_type, iovec* p_iov,ssize_t sz_iov,
 			ret = dequeue_packet(p_iov, sz_iov, (sockaddr_in *)__from, __fromlen, in_flags, &out_flags);
 			goto out;
 		}
+		/* coverity[double_unlock] TODO: RM#1049980 */
 		m_lock_rcv.unlock();
 	}
 
@@ -1299,6 +1482,8 @@ wait:
 	 */
 os:
 	if (in_flags & MSG_VMA_ZCOPY_FORCE) {
+		// Enable the next non-blocked read to check the OS 
+		m_rx_udp_poll_os_ratio_counter = m_n_sysvar_rx_udp_poll_os_ratio;
 		errno = EIO;
 		ret = -1;
 		goto out;
@@ -1309,7 +1494,8 @@ os:
 #endif
 
 	in_flags &= ~MSG_VMA_ZCOPY;
-	ret = socket_fd_api::rx_os(call_type, p_iov, sz_iov, &in_flags, __from, __fromlen, __msg);
+	ret = socket_fd_api::rx_os(call_type, p_iov, sz_iov, in_flags, __from, __fromlen, __msg);
+	*p_flags = in_flags;
 	save_stats_rx_os(ret);
 	if (ret > 0) {
 		// This will cause the next non-blocked read to check the OS again.
@@ -1318,6 +1504,7 @@ os:
 	}
 
 out:
+	/* coverity[double_unlock] TODO: RM#1049980 */
 	m_lock_rcv.unlock();
 
 	if (__msg)
@@ -1349,7 +1536,12 @@ void sockinfo_udp::handle_recv_timestamping(struct cmsg_state *cm_state)
 	memset(&tsing, 0, sizeof(tsing));
 
 	mem_buf_desc_t* packet = m_rx_pkt_ready_list.front();
-	struct timespec* packet_systime = &packet->path.rx.sw_timestamp;
+	if (unlikely(!packet)) {
+		si_udp_logdbg("m_rx_pkt_ready_list empty");
+		return ;
+	}
+
+	struct timespec* packet_systime = &packet->rx.udp.sw_timestamp;
 
 	// Only fill in SO_TIMESTAMPNS if both requested.
 	// This matches the kernel behavior.
@@ -1370,11 +1562,11 @@ void sockinfo_udp::handle_recv_timestamping(struct cmsg_state *cm_state)
 	}
 
 	if (m_n_tsing_flags & SOF_TIMESTAMPING_SOFTWARE) {
-		tsing.systime = packet->path.rx.sw_timestamp;
+		tsing.systime = packet->rx.udp.sw_timestamp;
 	}
 
 	if (m_n_tsing_flags & SOF_TIMESTAMPING_RAW_HARDWARE) {
-		tsing.hwtimeraw = packet->path.rx.hw_timestamp;
+		tsing.hwtimeraw = packet->rx.udp.hw_timestamp;
 	}
 
 	insert_cmsg(cm_state, SOL_SOCKET, SO_TIMESTAMPING, &tsing, sizeof(tsing));
@@ -1383,14 +1575,16 @@ void sockinfo_udp::handle_recv_timestamping(struct cmsg_state *cm_state)
 void sockinfo_udp::handle_ip_pktinfo(struct cmsg_state * cm_state)
 {
 	struct in_pktinfo in_pktinfo;
-	rx_net_device_map_t::iterator iter = m_rx_nd_map.find(m_rx_pkt_ready_list.front()->path.rx.local_if);
+	mem_buf_desc_t* p_desc = m_rx_pkt_ready_list.front();
+
+	rx_net_device_map_t::iterator iter = m_rx_nd_map.find(p_desc->rx.udp.local_if);
 	if (iter == m_rx_nd_map.end()) {
-		si_udp_logerr("could not find net device for ip %d.%d.%d.%d", NIPQUAD(m_rx_pkt_ready_list.front()->path.rx.local_if));
+		si_udp_logerr("could not find net device for ip %d.%d.%d.%d", NIPQUAD(p_desc->rx.udp.local_if));
 		return;
 	}
 	in_pktinfo.ipi_ifindex = iter->second.p_ndv->get_if_idx();
-	in_pktinfo.ipi_addr = m_rx_pkt_ready_list.front()->path.rx.dst.sin_addr;
-	in_pktinfo.ipi_spec_dst.s_addr = m_rx_pkt_ready_list.front()->path.rx.local_if;
+	in_pktinfo.ipi_addr = p_desc->rx.dst.sin_addr;
+	in_pktinfo.ipi_spec_dst.s_addr = p_desc->rx.udp.local_if;
 	insert_cmsg(cm_state, IPPROTO_IP, IP_PKTINFO, &in_pktinfo, sizeof(struct in_pktinfo));
 }
 
@@ -1551,11 +1745,11 @@ int sockinfo_udp::rx_request_notification(uint64_t poll_sn)
 	return ring_ready_count;
 }
 
-ssize_t sockinfo_udp::tx(const tx_call_t call_type, const struct iovec* p_iov, const ssize_t sz_iov,
+ssize_t sockinfo_udp::tx(const tx_call_t call_type, const iovec* p_iov, const ssize_t sz_iov,
 		     const int __flags /*=0*/, const struct sockaddr *__dst /*=NULL*/, const socklen_t __dstlen /*=0*/)
 {
 	int ret;
-	bool is_dropped = false;
+	bool is_dummy = IS_DUMMY_PACKET(__flags);
 	dst_entry* p_dst_entry = m_p_connected_dst_entry; // Default for connected() socket but we'll update it on a specific sendTO(__to) call
 
 	si_udp_logfunc("");
@@ -1564,13 +1758,29 @@ ssize_t sockinfo_udp::tx(const tx_call_t call_type, const struct iovec* p_iov, c
 
 	save_stats_threadid_tx();
 
-	if (unlikely(m_b_closed) || unlikely(g_b_exit))
+	/* Let allow OS to process all invalid scenarios to avoid any
+	 * inconsistencies in setting errno values.
+	 * Note: The field size sets a theoretical limit of 65,535 bytes
+	 * (8 byte header + 65,527 bytes of data) for a UDP datagram.
+	 * However the actual limit for the data length, which is imposed by
+	 * the underlying IPv4 protocol, is 65,507 bytes
+	 * (65,535 - 8 byte UDP header - 20 byte IP header).
+	 */
+	if (unlikely((m_b_closed) || (g_b_exit) ||
+			(NULL == p_iov) ||
+			(0 >= sz_iov) ||
+			(NULL == p_iov[0].iov_base) ||
+			(65507 < p_iov[0].iov_len))) {
 		goto tx_packet_to_os;
+	}
 
+	if (unlikely(__flags & MSG_OOB)) {
+		si_udp_logdbg("MSG_OOB not supported in UDP (tx-ing to os)");
+		goto tx_packet_to_os;
+	}
 #ifdef VMA_TIME_MEASURE
 	TAKE_T_TX_START;
 #endif
-
 	if (__dst != NULL) {
 		if (unlikely(__dstlen < sizeof(struct sockaddr_in))) {
 			si_udp_logdbg("going to os, dstlen < sizeof(struct sockaddr_in), dstlen = %d", __dstlen);
@@ -1578,10 +1788,6 @@ ssize_t sockinfo_udp::tx(const tx_call_t call_type, const struct iovec* p_iov, c
 		}
 		if (unlikely(get_sa_family(__dst) != AF_INET)) {
 			si_udp_logdbg("to->sin_family != AF_INET (tx-ing to os)");
-			goto tx_packet_to_os;
-		}
-		if (unlikely(__flags & MSG_OOB)) {
-			si_udp_logdbg("MSG_OOB not supported in UDP (tx-ing to os)");
 			goto tx_packet_to_os;
 		}
 
@@ -1622,12 +1828,23 @@ ssize_t sockinfo_udp::tx(const tx_call_t call_type, const struct iovec* p_iov, c
 
 				// Create the new dst_entry
 				if (dst.is_mc()) {
-					p_dst_entry = new dst_entry_udp_mc(dst.get_in_addr(), dst.get_in_port(), src_port,
-							m_mc_tx_if ? m_mc_tx_if : m_bound.get_in_addr(), m_b_mc_tx_loop, m_n_mc_ttl, m_fd);
+					p_dst_entry = new dst_entry_udp_mc(
+							dst.get_in_addr(),
+							dst.get_in_port(),
+							src_port,
+							m_mc_tx_if ? m_mc_tx_if : m_bound.get_in_addr(),
+							m_b_mc_tx_loop,
+							m_n_mc_ttl,
+							m_fd,
+							m_ring_alloc_log_tx);
 				}
 				else {
-					p_dst_entry = new dst_entry_udp(dst.get_in_addr(), dst.get_in_port(),
-							src_port, m_fd);
+					p_dst_entry = new dst_entry_udp(
+							dst.get_in_addr(),
+							dst.get_in_port(),
+							src_port,
+							m_fd,
+							m_ring_alloc_log_tx);
 				}
 				BULLSEYE_EXCLUDE_BLOCK_START
 				if (!p_dst_entry) {
@@ -1648,9 +1865,7 @@ ssize_t sockinfo_udp::tx(const tx_call_t call_type, const struct iovec* p_iov, c
 			*/
 			}
 		}
-	}
-
-	if (unlikely(!p_dst_entry)) {
+	} else if (unlikely(!p_dst_entry)) {
 		si_udp_logdbg("going to os, __dst = %p, m_p_connected_dst_entry = %p", __dst, m_p_connected_dst_entry);
 		goto tx_packet_to_os;
 	}
@@ -1660,17 +1875,17 @@ ssize_t sockinfo_udp::tx(const tx_call_t call_type, const struct iovec* p_iov, c
 		if (unlikely(__flags & MSG_DONTWAIT))
 			b_blocking = false;
 
-		if (unlikely(p_dst_entry->try_migrate_ring(m_lock_snd))) {
-			m_p_socket_stats->counters.n_tx_migrations++;
-		}
-
 		if (likely(p_dst_entry->is_valid())) {
 			// All set for fast path packet sending - this is our best performance flow
-			ret = p_dst_entry->fast_send((struct iovec*)p_iov, sz_iov, b_blocking);
+			ret = p_dst_entry->fast_send((iovec*)p_iov, sz_iov, is_dummy, b_blocking);
 		}
 		else {
 			// updates the dst_entry internal information and packet headers
-			ret = p_dst_entry->slow_send(p_iov, sz_iov, b_blocking, false, __flags, this, call_type);
+			ret = p_dst_entry->slow_send(p_iov, sz_iov, is_dummy, m_so_ratelimit, b_blocking, false, __flags, this, call_type);
+		}
+
+		if (unlikely(p_dst_entry->try_migrate_ring(m_lock_snd))) {
+			m_p_socket_stats->counters.n_tx_migrations++;
 		}
 
 		// TODO ALEXR - still need to handle "is_dropped" in send path
@@ -1681,9 +1896,9 @@ ssize_t sockinfo_udp::tx(const tx_call_t call_type, const struct iovec* p_iov, c
 
 		// MNY: Problematic in cases where packet was dropped because no tx buffers were available..
 		// Yet we need to add this code to avoid deadlocks in case of EPOLLOUT ET.
-		notify_epoll_context(EPOLLOUT);
+		NOTIFY_ON_EVENTS(this, EPOLLOUT);
 
-		save_stats_tx_offload(ret, is_dropped);
+		save_stats_tx_offload(ret, is_dummy);
 
 #ifdef VMA_TIME_MEASURE
 		TAKE_T_TX_END;
@@ -1721,63 +1936,69 @@ bool sockinfo_udp::tx_check_if_would_not_block()
     #pragma BullseyeCoverage on
 #endif
 
-bool sockinfo_udp::rx_input_cb(mem_buf_desc_t* p_desc, void* pv_fd_ready_array)
+int sockinfo_udp::rx_verify_available_data()
+{
+	int ret;
+
+	// Don't poll cq if offloaded data is ready
+	if (!m_rx_pkt_ready_list.empty()) {
+		auto_unlocker locker(m_lock_rcv);
+		if (!m_rx_pkt_ready_list.empty()) {
+			return m_rx_pkt_ready_list.front()->rx.sz_payload;
+		}
+	}
+
+	ret = rx_wait(false);
+
+	if (ret == 0) {
+		// Got 0, means we might have a ready packet
+		auto_unlocker locker(m_lock_rcv);
+		if (!m_rx_pkt_ready_list.empty()) {
+			ret = m_rx_pkt_ready_list.front()->rx.sz_payload;
+		}
+	}
+	else if (ret == 1) {
+		// Got 1, means we have a ready packet in OS
+		uint64_t pending_data = 0;
+		ret = orig_os_api.ioctl(m_fd, FIONREAD, &pending_data);
+		if (ret >= 0) {
+			// This will cause the next non-blocked read to check the OS again.
+			// We do this only after a successful read.
+			m_rx_udp_poll_os_ratio_counter = m_n_sysvar_rx_udp_poll_os_ratio;
+			ret = pending_data;
+		}
+	} else if (errno == EAGAIN) {
+		errno = 0;
+		ret = 0;
+	}
+
+	return ret;
+}
+
+/**
+ * sockinfo_udp::inspect_uc_packet inspects the input packet for basic rules,
+ * common for all cases. Its applicable for UC case as well.
+ */
+inline bool sockinfo_udp::inspect_uc_packet(mem_buf_desc_t* p_desc)
 {
 	// Check that sockinfo is bound to the packets dest port
-	if (unlikely(p_desc->path.rx.dst.sin_port != m_bound.get_in_port())) {
+	// This protects the case where a socket is closed and a new one is rapidly opened
+	// receiving the same socket id.
+	// In this case packets arriving for the old sockets should be dropped.
+	// This distinction assumes that the OS guarantees the old and new sockets to receive different
+	// port numbers from bind().
+	// If the user requests to bind the new socket to the same port number as the old one it will be
+	// impossible to identify packets designated for the old socket in this way.
+	if (unlikely(p_desc->rx.dst.sin_port != m_bound.get_in_port())) {
 		si_udp_logfunc("rx packet discarded - not socket's bound port (pkt: %d, sock:%s)",
-		           ntohs(p_desc->path.rx.dst.sin_port), m_bound.to_str_in_port());
+			   ntohs(p_desc->rx.dst.sin_port), m_bound.to_str_in_port());
 		return false;
-	}
-
-	if (m_connected.get_in_port() != INPORT_ANY && m_connected.get_in_addr() != INADDR_ANY) {
-		if (unlikely(m_connected.get_in_port() != p_desc->path.rx.src.sin_port)) {
-			si_udp_logfunc("rx packet discarded - not socket's connected port (pkt: %d, sock:%s)",
-				   ntohs(p_desc->path.rx.src.sin_port), m_connected.to_str_in_port());
-			return false;
-		}
-
-		if (unlikely(m_connected.get_in_addr() != p_desc->path.rx.src.sin_addr.s_addr)) {
-			si_udp_logfunc("rx packet discarded - not socket's connected port (pkt: [%d:%d:%d:%d], sock:[%s])",
-				   NIPQUAD(p_desc->path.rx.src.sin_addr.s_addr), m_connected.to_str_in_addr());
-			return false;
-		}
-	}
-
-	// if loopback is disabled, discard loopback packets.
-	// in linux, loopback control (set by setsockopt) is done in TX flow.
-	// since we currently can't control it in TX, we behave like windows, which filter on RX
-	if (unlikely(!m_b_mc_tx_loop && p_desc->path.rx.local_if == p_desc->path.rx.src.sin_addr.s_addr)) {
-		si_udp_logfunc("rx packet discarded - loopback is disabled (pkt: [%d:%d:%d:%d], sock:%s)",
-			NIPQUAD(p_desc->path.rx.src.sin_addr.s_addr), m_bound.to_str_in_addr());
-		return false;
-	}
-
-	// Check port mapping - redirecting packets to another socket
-	while (!m_port_map.empty()) {
-		m_port_map_lock.lock();
-		if (m_port_map.empty()) {
-			m_port_map_lock.unlock();
-			break;
-		}
-		m_port_map_index = ((m_port_map_index + 1) >= m_port_map.size() ? 0 : (m_port_map_index + 1));
-		int new_port = m_port_map[m_port_map_index].port;
-		socket_fd_api* sock_api = g_p_fd_collection->get_sockfd(m_port_map[m_port_map_index].fd);
-		if (!sock_api || sock_api->get_type()!=FD_TYPE_SOCKET) {
-			m_port_map.erase(std::remove(m_port_map.begin(), m_port_map.end(), m_port_map[m_port_map_index].port));
-			if(m_port_map_index) m_port_map_index--;
-			m_port_map_lock.unlock();
-			continue;
-		}
-		m_port_map_lock.unlock();
-		p_desc->path.rx.dst.sin_port = new_port;
-		return ((sockinfo_udp*)sock_api)->rx_input_cb(p_desc, pv_fd_ready_array);
 	}
 
 	// Check if sockinfo rx byte quato reached - then disregard this packet
 	if (unlikely(m_p_socket_stats->n_rx_ready_byte_count >= m_p_socket_stats->n_rx_ready_byte_limit)) {
 		si_udp_logfunc("rx packet discarded - socket limit reached (%d bytes)", m_p_socket_stats->n_rx_ready_byte_limit);
-		m_p_socket_stats->counters.n_rx_ready_byte_drop += p_desc->path.rx.sz_payload;
+		m_p_socket_stats->counters.n_rx_ready_byte_drop += p_desc->rx.sz_payload;
 		m_p_socket_stats->counters.n_rx_ready_pkt_drop++;
 		return false;
 	}
@@ -1786,72 +2007,305 @@ bool sockinfo_udp::rx_input_cb(mem_buf_desc_t* p_desc, void* pv_fd_ready_array)
 		si_udp_logfunc("rx packet discarded - fd closed");
 		return false;
 	}
+	return true;
+}
 
-	vma_recv_callback_retval_t callback_retval = VMA_PACKET_RECV;
-	if (m_rx_callback) {
-		mem_buf_desc_t *tmp;
-		vma_info_t pkt_info;
-		int nr_frags = 0;
-
-		pkt_info.struct_sz = sizeof(pkt_info);
-		pkt_info.packet_id = (void*)p_desc;
-		pkt_info.src = &p_desc->path.rx.src;
-		pkt_info.dst = &p_desc->path.rx.dst;
-		pkt_info.socket_ready_queue_pkt_count = m_p_socket_stats->n_rx_ready_pkt_count;
-		pkt_info.socket_ready_queue_byte_count = m_p_socket_stats->n_rx_ready_byte_count;
-
-		// fill io vector array with data buffer pointers
-		iovec iov[p_desc->n_frags];
-		nr_frags = 0;
-		for (tmp = p_desc; tmp; tmp = tmp->p_next_desc) {
-			iov[nr_frags++] = tmp->path.rx.frag;
+/**
+ *	Inspects UDP packets in case socket was connected
+ *
+ */
+inline bool sockinfo_udp::inspect_connected(mem_buf_desc_t* p_desc)
+{
+	if ((m_connected.get_in_port() != INPORT_ANY) && (m_connected.get_in_addr() != INADDR_ANY)) {
+		if (unlikely(m_connected.get_in_port() != p_desc->rx.src.sin_port)) {
+			si_udp_logfunc("rx packet discarded - not socket's connected port (pkt: %d, sock:%s)",
+				   ntohs(p_desc->rx.src.sin_port), m_connected.to_str_in_port());
+			return false;
 		}
 
-		// call user callback
-		callback_retval = m_rx_callback(m_fd, nr_frags, iov,
-		                                &pkt_info, m_rx_callback_context);
-
-		if (callback_retval == VMA_PACKET_DROP) {
-			si_udp_logfunc("rx packet discarded - by user callback");
+		if (unlikely(m_connected.get_in_addr() != p_desc->rx.src.sin_addr.s_addr)) {
+			si_udp_logfunc("rx packet discarded - not socket's connected port (pkt: [%d:%d:%d:%d], sock:[%s])",
+				   NIPQUAD(p_desc->rx.src.sin_addr.s_addr), m_connected.to_str_in_addr());
 			return false;
 		}
 	}
+	return true;
+}
 
-	// Yes, we want to keep this packet!
-	// And we must increment ref_counter before pushing this packet into the ready queue
-	//  to prevent race condition with the 'if( (--ref_count) <= 0)' in ib_comm_mgr
-	p_desc->inc_ref_count();
+/**
+ *	Inspects multicast packets
+ *
+ */
+inline bool sockinfo_udp::inspect_mc_packet(mem_buf_desc_t* p_desc)
+{
+	// if loopback is disabled, discard loopback packets.
+	// in linux, loopback control (set by setsockopt) is done in TX flow.
+	// since we currently can't control it in TX, we behave like windows, which filter on RX
+	if (unlikely(!m_b_mc_tx_loop && p_desc->rx.udp.local_if == p_desc->rx.src.sin_addr.s_addr)) {
+		si_udp_logfunc("rx packet discarded - loopback is disabled (pkt: [%d:%d:%d:%d], sock:%s)",
+			NIPQUAD(p_desc->rx.src.sin_addr.s_addr), m_bound.to_str_in_addr());
+		return false;
+	}
+	if (m_mc_num_grp_with_src_filter) {
+		in_addr_t mc_grp = p_desc->rx.dst.sin_addr.s_addr;
+		if (IN_MULTICAST_N(mc_grp)) {
+			in_addr_t mc_src = p_desc->rx.src.sin_addr.s_addr;
 
-	if (m_b_rcvtstamp || (m_n_tsing_flags & (SOF_TIMESTAMPING_RX_SOFTWARE | SOF_TIMESTAMPING_SOFTWARE))) {
-		clock_gettime(CLOCK_REALTIME, &(p_desc->path.rx.sw_timestamp));
+			if ((m_mc_memberships_map.find(mc_grp) == m_mc_memberships_map.end()) ||
+				((0 < m_mc_memberships_map[mc_grp].size()) &&
+				(m_mc_memberships_map[mc_grp].find(mc_src) == m_mc_memberships_map[mc_grp].end()))) {
+				si_udp_logfunc("rx packet discarded - multicast source mismatch");
+				return false;
+			}
+		}
+	}
+	return true;
+}
+
+/**
+ * Function to process SW & HW timestamps
+ */
+inline void sockinfo_udp::process_timestamps(mem_buf_desc_t* p_desc)
+{
+	// keep the sw_timestamp the same to all sockets
+	if ((m_b_rcvtstamp ||
+		 (m_n_tsing_flags &
+		  (SOF_TIMESTAMPING_RX_SOFTWARE | SOF_TIMESTAMPING_SOFTWARE))) &&
+		!p_desc->rx.udp.sw_timestamp.tv_sec) {
+		clock_gettime(CLOCK_REALTIME, &(p_desc->rx.udp.sw_timestamp));
 	}
 
+	// convert hw timestamp to system time
+	if (m_n_tsing_flags & SOF_TIMESTAMPING_RAW_HARDWARE) {
+		ring_simple* owner_ring = (ring_simple*) p_desc->p_desc_owner;
+		if (owner_ring) {
+			owner_ring->convert_hw_time_to_system_time(p_desc->rx.hw_raw_timestamp, &p_desc->rx.udp.hw_timestamp);
+		}
+	}
+}
+
+/**
+ *	Performs inspection by registered user callback
+ *
+ */
+inline vma_recv_callback_retval_t sockinfo_udp::inspect_by_user_cb(mem_buf_desc_t* p_desc)
+{
+	vma_info_t pkt_info;
+
+	pkt_info.struct_sz = sizeof(pkt_info);
+	pkt_info.packet_id = (void*)p_desc;
+	pkt_info.src = &p_desc->rx.src;
+	pkt_info.dst = &p_desc->rx.dst;
+	pkt_info.socket_ready_queue_pkt_count = m_p_socket_stats->n_rx_ready_pkt_count;
+	pkt_info.socket_ready_queue_byte_count = m_p_socket_stats->n_rx_ready_byte_count;
+
+	if (m_n_tsing_flags & SOF_TIMESTAMPING_RAW_HARDWARE) {
+		pkt_info.hw_timestamp = p_desc->rx.udp.hw_timestamp;
+	}
+	if (p_desc->rx.udp.sw_timestamp.tv_sec) {
+		pkt_info.sw_timestamp = p_desc->rx.udp.sw_timestamp;
+	}
+
+	// fill io vector array with data buffer pointers
+	iovec iov[p_desc->rx.n_frags];
+	int nr_frags = 0;
+
+	for (mem_buf_desc_t *tmp = p_desc; tmp; tmp = tmp->p_next_desc) {
+		iov[nr_frags++] = tmp->rx.frag;
+	}
+
+	// call user callback
+	return m_rx_callback(m_fd, nr_frags, iov, &pkt_info, m_rx_callback_context);
+}
+
+#ifdef DEFINED_VMAPOLL
+/* Update vma_completion with
+ * VMA_POLL_PACKET related data
+ */
+inline void sockinfo_udp::fill_completion(mem_buf_desc_t* p_desc)
+{
+	struct vma_completion_t *completion;
+
+	/* Try to process vma_poll() completion directly */
+	m_vma_poll_completion = m_p_rx_ring->get_comp();
+
+	if (m_vma_poll_completion) {
+		completion = m_vma_poll_completion;
+	} else {
+		completion = &m_ec.completion;
+	}
+
+	completion->packet.num_bufs = p_desc->rx.n_frags;
+	completion->packet.total_len = 0;
+
+	for(mem_buf_desc_t *tmp_p=p_desc; tmp_p; tmp_p=tmp_p->p_next_desc) {
+		completion->packet.total_len        += tmp_p->rx.sz_payload;
+		completion->packet.buff_lst          = (struct vma_buff_t*)tmp_p;
+		completion->packet.buff_lst->next    = (struct vma_buff_t*)tmp_p->p_next_desc;
+		completion->packet.buff_lst->payload = p_desc->rx.frag.iov_base;
+		completion->packet.buff_lst->len     = p_desc->rx.frag.iov_len;
+	}
+	completion->src = p_desc->rx.src;
+	NOTIFY_ON_EVENTS(this, VMA_POLL_PACKET);
+
+	m_vma_poll_completion = NULL;
+	m_vma_poll_last_buff_lst = NULL;
+}
+#endif //DEFINED_VMAPOLL
+
+/**
+ *	Performs packet processing for NON-VMAPOLL cases and store packet
+ *	in ready queue.
+ */
+inline void sockinfo_udp::update_ready(mem_buf_desc_t* p_desc, void* pv_fd_ready_array, vma_recv_callback_retval_t cb_ret)
+{
 	// In ZERO COPY case we let the user's application manage the ready queue
-	if (callback_retval != VMA_PACKET_HOLD) {
+	if (cb_ret != VMA_PACKET_HOLD) {
 		m_lock_rcv.lock();
 		// Save rx packet info in our ready list
 		m_rx_pkt_ready_list.push_back(p_desc);
 		m_n_rx_pkt_ready_list_count++;
-		m_rx_ready_byte_count += p_desc->path.rx.sz_payload;
+		m_rx_ready_byte_count += p_desc->rx.sz_payload;
 		m_p_socket_stats->n_rx_ready_pkt_count++;
-		m_p_socket_stats->n_rx_ready_byte_count += p_desc->path.rx.sz_payload;
-		m_p_socket_stats->counters.n_rx_ready_pkt_max = max((uint32_t)m_p_socket_stats->n_rx_ready_pkt_count, m_p_socket_stats->counters.n_rx_ready_pkt_max);
-		m_p_socket_stats->counters.n_rx_ready_byte_max = max((uint32_t)m_p_socket_stats->n_rx_ready_byte_count, m_p_socket_stats->counters.n_rx_ready_byte_max);
+		m_p_socket_stats->n_rx_ready_byte_count += p_desc->rx.sz_payload;
+		m_p_socket_stats->counters.n_rx_ready_pkt_max = max((uint32_t)m_p_socket_stats->n_rx_ready_pkt_count, 
+								    m_p_socket_stats->counters.n_rx_ready_pkt_max);
+		m_p_socket_stats->counters.n_rx_ready_byte_max = max((uint32_t)m_p_socket_stats->n_rx_ready_byte_count,
+								     m_p_socket_stats->counters.n_rx_ready_byte_max);
 		do_wakeup();
 		m_lock_rcv.unlock();
 	} else {
 		m_p_socket_stats->n_rx_zcopy_pkt_count++;
 	}
 
-	notify_epoll_context(EPOLLIN);
+	NOTIFY_ON_EVENTS(this, EPOLLIN);
 
 	// Add this fd to the ready fd list
-        io_mux_call::update_fd_array((fd_array_t*)pv_fd_ready_array, m_fd);
+	/*
+	 * Note: No issue is expected in case vma_poll() usage because 'pv_fd_ready_array' is null
+	 * in such case and as a result update_fd_array() call means nothing
+	 */
+	io_mux_call::update_fd_array((fd_array_t*)pv_fd_ready_array, m_fd);
 
 	si_udp_logfunc("rx ready count = %d packets / %d bytes", m_n_rx_pkt_ready_list_count, m_p_socket_stats->n_rx_ready_byte_count);
+}
 
-	// Yes we like this packet - keep it!
+/**
+ *	Performs full inspection and processing for generic UDP
+ *	It will be bypassing some inspections if appropriate flags were
+ *	not set.
+ */
+inline bool sockinfo_udp::rx_process_udp_packet_full(mem_buf_desc_t* p_desc, void* pv_fd_ready_array)
+{
+	if (!inspect_uc_packet(p_desc))
+		return false;
+
+	if (m_is_connected && !inspect_connected(p_desc))
+		return false;
+
+	if (m_multicast && !inspect_mc_packet(p_desc))
+		return false;
+
+	if (m_sockopt_mapped) {
+		// Check port mapping - redirecting packets to another socket
+		while (!m_port_map.empty()) {
+			m_port_map_lock.lock();
+			if (m_port_map.empty()) {
+				m_port_map_lock.unlock();
+				break;
+			}
+			m_port_map_index = ((m_port_map_index + 1) >= m_port_map.size() ? 0 : (m_port_map_index + 1));
+			int new_port = m_port_map[m_port_map_index].port;
+			socket_fd_api* sock_api = g_p_fd_collection->get_sockfd(m_port_map[m_port_map_index].fd);
+			if (!sock_api || sock_api->get_type()!=FD_TYPE_SOCKET) {
+				m_port_map.erase(std::remove(m_port_map.begin(), m_port_map.end(), m_port_map[m_port_map_index].port));
+				if (m_port_map_index)
+					m_port_map_index--;
+				m_port_map_lock.unlock();
+				continue;
+			}
+			m_port_map_lock.unlock();
+			p_desc->rx.dst.sin_port = new_port;
+			return ((sockinfo_udp*)sock_api)->rx_process_udp_packet_full(p_desc, pv_fd_ready_array);
+		}
+	}
+
+	process_timestamps(p_desc);
+
+	vma_recv_callback_retval_t cb_ret = VMA_PACKET_RECV;
+	if (m_rx_callback && ((cb_ret = inspect_by_user_cb(p_desc)) == VMA_PACKET_DROP)) {
+		si_udp_logfunc("rx packet discarded - by user callback");
+		return false;
+	}
+	// Yes, we want to keep this packet!
+	// And we must increment ref_counter before pushing this packet into the ready queue
+	//  to prevent race condition with the 'if( (--ref_count) <= 0)' in ib_comm_mgr
+	p_desc->inc_ref_count();
+
+#ifdef DEFINED_VMAPOLL
+	if (p_desc->rx.vma_polled) {
+		fill_completion(p_desc);
+		p_desc->rx.vma_polled = false;
+	} else
+#endif
+	{
+		update_ready(p_desc, pv_fd_ready_array, cb_ret);
+	}
 	return true;
+}
+
+/**
+ *	Performs inspection and processing for simple UC UDP case
+ *	bypassing all other inspections
+ */
+inline bool sockinfo_udp::rx_process_udp_packet_partial(mem_buf_desc_t* p_desc, void* pv_fd_ready_array)
+{
+	if (!inspect_uc_packet(p_desc))
+		return false;
+
+	process_timestamps(p_desc);
+
+	vma_recv_callback_retval_t cb_ret = VMA_PACKET_RECV;
+	if (m_rx_callback && ((cb_ret = inspect_by_user_cb(p_desc)) == VMA_PACKET_DROP)) {
+		si_udp_logfunc("rx packet discarded - by user callback");
+		return false;
+	}
+	// Yes, we want to keep this packet!
+	// And we must increment ref_counter before pushing this packet into the ready queue
+	//  to prevent race condition with the 'if( (--ref_count) <= 0)' in ib_comm_mgr
+	p_desc->inc_ref_count();
+
+#ifdef DEFINED_VMAPOLL
+	if (p_desc->rx.vma_polled) {
+		fill_completion(p_desc);
+		p_desc->rx.vma_polled = false;
+	} else
+#endif
+	{
+		update_ready(p_desc, pv_fd_ready_array, cb_ret);
+	}
+	return true;
+}
+
+/**
+ *	set packet inspector and processor
+ */
+inline void sockinfo_udp::set_rx_packet_processor(void)
+{
+	si_udp_logdbg("is_connected: %d mapped: %d multicast: %d",
+		      m_is_connected, m_sockopt_mapped, m_multicast);
+	// Select partial or full packet processing.
+	// Full packet processing is selected in case of:
+	// - connect() was done on the UDP socket
+	//   In this case the UDP 3-tuple is not sufficient for the packet matching.
+	// - In the case that socket mapping is enabled extra processing is required
+	// - Multicast packets
+	// For simple UC traffic reduced packet processing is selected.
+	if (m_is_connected || m_sockopt_mapped || m_multicast) {
+		m_rx_packet_processor = &sockinfo_udp::rx_process_udp_packet_full;
+	} else {
+		m_rx_packet_processor = &sockinfo_udp::rx_process_udp_packet_partial;
+	}
 }
 
 void sockinfo_udp::rx_add_ring_cb(flow_tuple_with_local_if &flow_key, ring* p_ring, bool is_migration /* = false */)
@@ -1863,61 +2317,28 @@ void sockinfo_udp::rx_add_ring_cb(flow_tuple_with_local_if &flow_key, ring* p_ri
 	m_rx_udp_poll_os_ratio_counter = m_n_sysvar_rx_udp_poll_os_ratio;
 
 	// Now that we got at least 1 CQ attached start polling the CQs
-	if (m_b_blocking)
+	if (m_b_blocking) {
         	m_loops_to_go = m_n_sysvar_rx_poll_num;
-	else
-		m_loops_to_go = 1; // Force single CQ poll in case of non-blocking socket
-
-
-	// Multicast Only:
-	// Check and Issue ADD_MEMBERSHIP to OS
-
-	if (!flow_key.is_udp_mc() || is_migration)
-		return;
-
-	// Validate that the IGMP flags in the interface is set correctly
-	validate_igmpv2(flow_key);
-
-	// Issue kernel IP_ADD_MEMBERSHIP for IGMP join etc
-	struct ip_mreq mreq;
-	mreq.imr_multiaddr.s_addr = flow_key.get_dst_ip();
-	mreq.imr_interface.s_addr = flow_key.get_local_if();
-	si_udp_logdbg("calling orig_setsockopt(ADD_MEMBERSHIP) for igmp support by OS");
-	if (orig_os_api.setsockopt(m_fd, IPPROTO_IP, IP_ADD_MEMBERSHIP, &mreq, sizeof(mreq))) {
-		si_udp_logdbg("orig setsockopt(ADD_MEMBERSHIP) failed (errno=%d %m)", errno);
 	}
-
-	// Now we're done with the IP_ADD_MEMBERSHIP
+	else {
+		m_loops_to_go = 1; // Force single CQ poll in case of non-blocking socket
+	}
 }
 
 void sockinfo_udp::rx_del_ring_cb(flow_tuple_with_local_if &flow_key, ring* p_ring, bool is_migration /* = false */)
 {
 	si_udp_logdbg("");
-	
-	// Multicast Only: 
-	// Check and Issue DROP_MEMBERSHIP to OS
-	if (flow_key.is_udp_mc() && !is_migration) {
-
-		// Issue kernel IP_DROP_MEMBERSHIP for IGMP cleanup in case this is a re-play scenario
-		struct ip_mreq mreq;
-		mreq.imr_multiaddr.s_addr = flow_key.get_dst_ip();
-		mreq.imr_interface.s_addr = flow_key.get_local_if();
-		si_udp_logdbg("calling orig_setsockopt(DROP_MEMBERSHIP) for igmp cleanup in OS");
-		BULLSEYE_EXCLUDE_BLOCK_START
-		if (orig_os_api.setsockopt(m_fd, IPPROTO_IP, IP_DROP_MEMBERSHIP, &mreq, sizeof(mreq))) {
-			si_udp_logerr("orig setsockopt(DROP_MEMBERSHIP) failed (errno=%d %m)", errno);
-		}
-		BULLSEYE_EXCLUDE_BLOCK_END
-	}
 
 	sockinfo::rx_del_ring_cb(flow_key, p_ring, is_migration);
 
 	// If no more CQ's are attached on this socket, return CQ polling loops ot init state
 	if (m_rx_ring_map.size() <= 0) {
-		if (m_b_blocking)
+		if (m_b_blocking) {
 			m_loops_to_go = safe_mce_sys().rx_poll_num_init;
-		else
+		}
+		else {
 			m_loops_to_go = 1;
+		}
 	}
 }
 
@@ -1942,11 +2363,10 @@ void sockinfo_udp::set_blocking(bool is_blocked)
 void sockinfo_udp::handle_pending_mreq()
 {
 	si_udp_logdbg("Attaching to pending multicast groups");
-
-	ip_mreq_list_t::iterator mreq_iter, mreq_iter_temp;
+	mc_pram_list_t::iterator mreq_iter, mreq_iter_temp;
 	for (mreq_iter = m_pending_mreqs.begin(); mreq_iter != m_pending_mreqs.end();) {
 		if (m_sock_offload) {
-			mc_change_membership(&(*mreq_iter), IP_ADD_MEMBERSHIP);
+			mc_change_membership(&(*mreq_iter));
 		}
 		mreq_iter_temp = mreq_iter;
 		++mreq_iter;
@@ -1954,29 +2374,34 @@ void sockinfo_udp::handle_pending_mreq()
 	}
 }
 
-int sockinfo_udp::mc_change_pending_mreq(const struct ip_mreq *p_mreq, int optname)
+int sockinfo_udp::mc_change_pending_mreq(const mc_pending_pram *p_mc_pram)
 {
-	si_udp_logdbg("setsockopt(%s) will be pending until bound to UDP port", setsockopt_ip_opt_to_str(optname));
+	si_udp_logdbg("setsockopt(%s) will be pending until bound to UDP port", setsockopt_ip_opt_to_str(p_mc_pram->optname));
 
-	ip_mreq_list_t::iterator mreq_iter, mreq_iter_temp;
-	switch (optname) {
+	mc_pram_list_t::iterator mc_pram_iter, mreq_iter_temp;
+	switch (p_mc_pram->optname) {
 	case IP_ADD_MEMBERSHIP:
-		m_pending_mreqs.push_back(*p_mreq);
+	case IP_ADD_SOURCE_MEMBERSHIP:
+		m_pending_mreqs.push_back(*p_mc_pram);
 		break;
 	case IP_DROP_MEMBERSHIP:
-		for (mreq_iter = m_pending_mreqs.begin(); mreq_iter != m_pending_mreqs.end();) {
-			if (mreq_iter->imr_multiaddr.s_addr == p_mreq->imr_multiaddr.s_addr) {
-				mreq_iter_temp = mreq_iter;
-				++mreq_iter;
+	case IP_DROP_SOURCE_MEMBERSHIP:
+		for (mc_pram_iter = m_pending_mreqs.begin(); mc_pram_iter != m_pending_mreqs.end();) {
+			if ((mc_pram_iter->imr_multiaddr.s_addr == p_mc_pram->imr_multiaddr.s_addr) &&
+				((IP_DROP_MEMBERSHIP == p_mc_pram->optname) || // In case of a IP_DROP_SOURCE_MEMBERSHIP we should check source address too
+				 (mc_pram_iter->imr_sourceaddr.s_addr == p_mc_pram->imr_sourceaddr.s_addr))) {
+				 // We found the group, erase it
+				mreq_iter_temp = mc_pram_iter;
+				++mc_pram_iter;
 				m_pending_mreqs.erase(mreq_iter_temp);
 			} else {
-				++mreq_iter;
+				++mc_pram_iter;
 			}
 		}
 		break;
 	BULLSEYE_EXCLUDE_BLOCK_START
 	default:
-		si_udp_logerr("setsockopt(%s) illegal", setsockopt_ip_opt_to_str(optname));
+		si_udp_logerr("setsockopt(%s) illegal", setsockopt_ip_opt_to_str(p_mc_pram->optname));
 		return -1;
 	BULLSEYE_EXCLUDE_BLOCK_END
 	}
@@ -1988,12 +2413,27 @@ int sockinfo_udp::mc_change_membership_start_helper(in_addr_t mc_grp, int optnam
 	switch (optname) {
 	case IP_ADD_MEMBERSHIP:
 		if (m_mc_memberships_map.find(mc_grp) == m_mc_memberships_map.end()
-				&&  m_mc_memberships_map.size() >= (size_t)g_n_os_igmp_max_membership) {
+			&&  m_mc_memberships_map.size() >= (size_t)safe_mce_sys().sysctl_reader.get_igmp_max_membership()) {
 			errno = ENOBUFS;
 			return -1;
 		}
 		break;
+	case IP_ADD_SOURCE_MEMBERSHIP:
+		if (m_mc_memberships_map.find(mc_grp) != m_mc_memberships_map.end()) {//This group is exist
+			if (m_mc_memberships_map[mc_grp].size() >= (size_t)safe_mce_sys().sysctl_reader.get_igmp_max_source_membership()) {
+				errno = ENOBUFS;
+				return -1;
+		  }
+		}
+		else {//This group is not exist
+			if (m_mc_memberships_map.size() >= (size_t)safe_mce_sys().sysctl_reader.get_igmp_max_membership()) {
+					errno = ENOBUFS;
+					return -1;
+				}
+		}
+		break;
 	case IP_DROP_MEMBERSHIP:
+	case IP_DROP_SOURCE_MEMBERSHIP:
 		break;
 		BULLSEYE_EXCLUDE_BLOCK_START
 	default:
@@ -2004,40 +2444,56 @@ int sockinfo_udp::mc_change_membership_start_helper(in_addr_t mc_grp, int optnam
 	return 0;
 }
 
-int sockinfo_udp::mc_change_membership_end_helper(in_addr_t mc_grp, int optname)
+int sockinfo_udp::mc_change_membership_end_helper(in_addr_t mc_grp, int optname, in_addr_t mc_src /*=0*/)
 {
 	switch (optname) {
 	case IP_ADD_MEMBERSHIP:
-		m_mc_memberships_map[mc_grp] = 1;
+		m_mc_memberships_map[mc_grp];
+		break;
+	case IP_ADD_SOURCE_MEMBERSHIP:
+		m_mc_memberships_map[mc_grp][mc_src] = 1;
+		if (1 == m_mc_memberships_map[mc_grp].size()) {
+			++m_mc_num_grp_with_src_filter;
+		}
 		break;
 	case IP_DROP_MEMBERSHIP:
 		m_mc_memberships_map.erase(mc_grp);
 		break;
+	case IP_DROP_SOURCE_MEMBERSHIP:
+		if ((m_mc_memberships_map.find(mc_grp) != m_mc_memberships_map.end())) {
+			m_mc_memberships_map[mc_grp].erase(mc_src);
+			if (0 == m_mc_memberships_map[mc_grp].size()) {
+				m_mc_memberships_map.erase(mc_grp);
+				--m_mc_num_grp_with_src_filter;
+			}
+		}
+		break;
 		BULLSEYE_EXCLUDE_BLOCK_START
 	default:
 		si_udp_logerr("setsockopt(%s) will be passed to OS for handling", setsockopt_ip_opt_to_str(optname));
 		return -1;
 		BULLSEYE_EXCLUDE_BLOCK_END
 	}
+
 	return 0;
 }
 
-int sockinfo_udp::mc_change_membership(const struct ip_mreq *p_mreq, int optname)
+int sockinfo_udp::mc_change_membership(const mc_pending_pram *p_mc_pram)
 {
-	in_addr_t mc_grp = p_mreq->imr_multiaddr.s_addr;
-	in_addr_t mc_if = p_mreq->imr_interface.s_addr;
+	in_addr_t mc_grp = p_mc_pram->imr_multiaddr.s_addr;
+	in_addr_t mc_if = p_mc_pram->imr_interface.s_addr;
 
 	BULLSEYE_EXCLUDE_BLOCK_START
 	if (IN_MULTICAST_N(mc_grp) == false) {
-		si_udp_logerr("%s for non multicast (%d.%d.%d.%d) %#x", setsockopt_ip_opt_to_str(optname), NIPQUAD(mc_grp), mc_grp);
+		si_udp_logerr("%s for non multicast (%d.%d.%d.%d) %#x", setsockopt_ip_opt_to_str(p_mc_pram->optname), NIPQUAD(mc_grp), mc_grp);
 		return -1;
 	}
 	BULLSEYE_EXCLUDE_BLOCK_END
 
 	sock_addr tmp_grp_addr(AF_INET, mc_grp, m_bound.get_in_port());
 	if (__vma_match_udp_receiver(TRANS_VMA, safe_mce_sys().app_id, tmp_grp_addr.get_p_sa(), tmp_grp_addr.get_socklen()) == TRANS_OS) {
-		// Break so we call orig setsockopt() and don't try to offlaod
-		si_udp_logdbg("setsockopt(%s) will be passed to OS for handling due to rule matching", setsockopt_ip_opt_to_str(optname));
+		// Break so we call orig setsockopt() and don't try to offload
+		si_udp_logdbg("setsockopt(%s) will be passed to OS for handling due to rule matching", setsockopt_ip_opt_to_str(p_mc_pram->optname));
 		return -1;
 	}
 
@@ -2052,7 +2508,9 @@ int sockinfo_udp::mc_change_membership(const struct ip_mreq *p_mreq, int optname
 			src_ip = m_so_bindtodevice_ip;
 		}
 		// Find local if for this MC ADD/DROP
-		g_p_route_table_mgr->route_resolve(route_rule_table_key(dst_ip, src_ip, tos), &mc_if);
+		route_result res;
+		g_p_route_table_mgr->route_resolve(route_rule_table_key(dst_ip, src_ip, tos), res);
+		mc_if = res.p_src;
 	}
 
 	// MNY: TODO: Check rules for local_if (blacklist interface feature)
@@ -2066,110 +2524,89 @@ int sockinfo_udp::mc_change_membership(const struct ip_mreq *p_mreq, int optname
 	// Check if local_if is offloadable
 	if (!g_p_net_device_table_mgr->get_net_device_val(mc_if)) {
 		// Break so we call orig setsockopt() and try to offlaod
-		si_udp_logdbg("setsockopt(%s) will be passed to OS for handling - not offload interface (%d.%d.%d.%d)", setsockopt_ip_opt_to_str(optname), NIPQUAD(mc_if));
+		si_udp_logdbg("setsockopt(%s) will be passed to OS for handling - not offload interface (%d.%d.%d.%d)", setsockopt_ip_opt_to_str(p_mc_pram->optname), NIPQUAD(mc_if));
 		return -1;
 	}
 
-	flow_tuple_with_local_if flow_key(mc_grp, m_bound.get_in_port(), m_connected.get_in_addr(), m_connected.get_in_port(), PROTO_UDP, mc_if);
+	int pram_size = sizeof(ip_mreq);
+	struct ip_mreq_source mreq_src;
+	mreq_src.imr_multiaddr.s_addr = p_mc_pram->imr_multiaddr.s_addr;
+	mreq_src.imr_interface.s_addr = p_mc_pram->imr_interface.s_addr;
+	mreq_src.imr_sourceaddr.s_addr = p_mc_pram->imr_sourceaddr.s_addr;
 
-	switch (optname) {
+	switch (p_mc_pram->optname) {
 	case IP_ADD_MEMBERSHIP:
+	{
+		if ((m_mc_memberships_map.find(mc_grp) != m_mc_memberships_map.end()) && (0 < m_mc_memberships_map[mc_grp].size())) {
+				return -1; // Same group with source filtering is already exist
+		}
+
+		flow_tuple_with_local_if flow_key(mc_grp, m_bound.get_in_port(), m_connected.get_in_addr(), m_connected.get_in_port(), PROTO_UDP, mc_if);
 		if (!attach_receiver(flow_key)) {
 			// we will get RX from OS
 			return -1;
 		}
 		vma_stats_mc_group_add(mc_grp, m_p_socket_stats);
+		original_os_setsockopt_helper( &mreq_src, pram_size, p_mc_pram->optname);
+		m_multicast = true;
 		break;
-
+	}
+	case IP_ADD_SOURCE_MEMBERSHIP:
+	{
+		flow_tuple_with_local_if flow_key(mc_grp, m_bound.get_in_port(), 0, 0, PROTO_UDP, mc_if);
+		if (!attach_receiver(flow_key)) {
+			// we will get RX from OS
+			return -1;
+		}
+		vma_stats_mc_group_add(mc_grp, m_p_socket_stats);
+		pram_size = sizeof(ip_mreq_source);
+		original_os_setsockopt_helper( &mreq_src, pram_size, p_mc_pram->optname);
+		m_multicast = true;
+		break;
+	}
 	case IP_DROP_MEMBERSHIP:
+	{
+		flow_tuple_with_local_if flow_key(mc_grp, m_bound.get_in_port(), m_connected.get_in_addr(), m_connected.get_in_port(), PROTO_UDP, mc_if);
+		original_os_setsockopt_helper( &mreq_src, pram_size, p_mc_pram->optname);
 		if (!detach_receiver(flow_key)) {
 			return -1;
 		}
 		vma_stats_mc_group_remove(mc_grp, m_p_socket_stats);
+		m_multicast = false;
 		break;
+	}
+	case IP_DROP_SOURCE_MEMBERSHIP:
+	{
+		flow_tuple_with_local_if flow_key(mc_grp, m_bound.get_in_port(), 0, 0, PROTO_UDP, mc_if);
+		pram_size = sizeof(ip_mreq_source);
+		original_os_setsockopt_helper( &mreq_src, pram_size, p_mc_pram->optname);
+		if (1 == m_mc_memberships_map[mc_grp].size()) { //Last source in the group
+			if (!detach_receiver(flow_key)) {
+				return -1;
+			}
+			vma_stats_mc_group_remove(mc_grp, m_p_socket_stats);
+			m_multicast = false; // get out from MC group
+		}
+		break;
+	}
 	BULLSEYE_EXCLUDE_BLOCK_START
 	default:
-		si_udp_logerr("setsockopt(%s) will be passed to OS for handling", setsockopt_ip_opt_to_str(optname));
+		si_udp_logerr("setsockopt(%s) will be passed to OS for handling", setsockopt_ip_opt_to_str(p_mc_pram->optname));
 		return -1;
 	BULLSEYE_EXCLUDE_BLOCK_END
 	}
-	return 0;
-}
-
-
-int sockinfo_udp::validate_igmpv2(char* ifname)
-{
-	char igmp_force_value = 0;
-	char igmpver_filename[256];
 	
-	char base_ifname[IFNAMSIZ];
-	if (get_base_interface_name((const char*)ifname, base_ifname, sizeof(base_ifname))) {
-		vlog_printf(VLOG_ERROR,"VMA couldn't map %s for IGMP version validation\n", ifname);
-		return 0;
-	}
-
-	// Read the value stored for FORCE IGMP VERSION flag
-
-	// IGMP_FORCE_ALL_IF_PARAM_FILE is: "/proc/sys/net/ipv4/conf/all/force_igmp_version"
-	sprintf(igmpver_filename, IGMP_FORCE_PARAM_FILE, "all");
-	if (priv_read_file(igmpver_filename, &igmp_force_value, 1) <= 0) {
-		return 1;
-	}
-	if (igmp_force_value == '0') { 
-		// Check the specific interface configuration 
-		// IGMP_FORCE_PARAM_FILE is: "/proc/sys/net/ipv4/conf/%s/force_igmp_version"
-		sprintf(igmpver_filename, IGMP_FORCE_PARAM_FILE, base_ifname);
-		if (priv_read_file(igmpver_filename, &igmp_force_value, 1) <= 0) {
-			return 1;
-		}
-	}
-	if (igmp_force_value != '2' && igmp_force_value != '1') {  
-		vlog_printf(VLOG_WARNING,"************************************************************************\n");
-		vlog_printf(VLOG_WARNING,"IGMP Version flag is not forced to IGMPv2 for interface %s!\n", base_ifname);
-		vlog_printf(VLOG_WARNING,"Working in this mode might causes VMA functionality degradation\n");
-		if (igmp_force_value != 0) {
-                	vlog_printf(VLOG_WARNING,"Please \"echo 2 > %s\"\n", igmpver_filename);
-			vlog_printf(VLOG_WARNING,"before loading your application with VMA library\n");
-		}
-		vlog_printf(VLOG_WARNING,"Please refer to the IGMP section in the VMA's User Manual for more information\n");
-		vlog_printf(VLOG_WARNING,"************************************************************************\n");
-	}
+	// set full versus partial RX UDP handling due to potential updates in m_multicast
+	set_rx_packet_processor();
 	return 0;
 }
 
-// This function will validate that IGMP is forced to V2
-// on the interface (IPR only supports IGMP V2)
-// If not correct (or any failure) it will log warning message
-void sockinfo_udp::validate_igmpv2(flow_tuple_with_local_if& flow_key)
+void sockinfo_udp::original_os_setsockopt_helper( void* pram, int pram_size, int optname)
 {
-	int found = 1;
-	int igmp_ret = -1;
-	char ifname[IFNAMSIZ] = "\0";
-	unsigned int ifflags; /* Flags as from SIOCGIFFLAGS ioctl. */
-
-	if (!get_local_if_info(flow_key.get_local_if(), ifname, ifflags)) {
-		found = 0;
-		goto clean_and_exit;
+	si_udp_logdbg("calling orig_setsockopt(%s) for igmp support by OS", setsockopt_ip_opt_to_str(optname));
+	if (orig_os_api.setsockopt(m_fd, IPPROTO_IP, optname, pram, pram_size)) {
+		si_udp_logdbg("orig setsockopt(%s) failed (errno=%d %m)",setsockopt_ip_opt_to_str(optname), errno);
 	}
-
-	if (get_iftype_from_ifname(ifname) == ARPHRD_INFINIBAND && !safe_mce_sys().suppress_igmp_warning) {
-		igmp_ret = validate_igmpv2(ifname); // Extract IGMP version flag
-	}
-	else {
-		si_udp_logdbg("Skipping igmpv2 validation check");
-		igmp_ret = 0;
-	}
-
-clean_and_exit:
-	if (!found || !ifname[0] || igmp_ret) {
-		vlog_printf(VLOG_WARNING,"************************************************************************\n");
-		vlog_printf(VLOG_WARNING,"Error in reading IGMP Version flags for interface %d.%d.%d.%d! \n", NIPQUAD(flow_key.get_dst_ip()));
-		vlog_printf(VLOG_WARNING,"Working in this mode most probably causes VMA performance degradation\n");
-		vlog_printf(VLOG_WARNING,"Please refer to the IGMP section in the VMA's User Manual for more information\n");
-		vlog_printf(VLOG_WARNING,"************************************************************************\n");
-	}
-
-	return;
 }
 
 void sockinfo_udp::statistics_print(vlog_levels_t log_level /* = VLOG_DEBUG */)
@@ -2217,21 +2654,21 @@ void sockinfo_udp::save_stats_rx_offload(int bytes)
     #pragma BullseyeCoverage on
 #endif
 
-void sockinfo_udp::save_stats_tx_offload(int bytes, bool is_dropped)
+void sockinfo_udp::save_stats_tx_offload(int bytes, bool is_dummy)
 {
-	if (bytes >= 0) {
-		m_p_socket_stats->counters.n_tx_sent_byte_count += bytes;
-		m_p_socket_stats->counters.n_tx_sent_pkt_count++;
-	}
-	else if (errno == EAGAIN) {
-		m_p_socket_stats->counters.n_rx_os_eagain++;
-	}
-	else {
-		m_p_socket_stats->counters.n_tx_errors++;
-	}
-
-	if (is_dropped) {
-		m_p_socket_stats->counters.n_tx_drops++;
+	if (unlikely(is_dummy)) {
+		m_p_socket_stats->counters.n_tx_dummy++;
+	} else {
+		if (bytes >= 0) {
+			m_p_socket_stats->counters.n_tx_sent_byte_count += bytes;
+			m_p_socket_stats->counters.n_tx_sent_pkt_count++;
+		}
+		else if (errno == EAGAIN) {
+			m_p_socket_stats->counters.n_rx_os_eagain++;
+		}
+		else {
+			m_p_socket_stats->counters.n_tx_errors++;
+		}
 	}
 }
 
@@ -2269,8 +2706,7 @@ mem_buf_desc_t* sockinfo_udp::get_next_desc_peek(mem_buf_desc_t *p_desc, int& rx
 
 void sockinfo_udp::post_deqeue(bool release_buff)
 {
-	mem_buf_desc_t *to_resue = m_rx_pkt_ready_list.front();
-	m_rx_pkt_ready_list.pop_front();
+	mem_buf_desc_t *to_resue = m_rx_pkt_ready_list.get_and_pop_front();
 	m_p_socket_stats->n_rx_ready_pkt_count--;
 	m_n_rx_pkt_ready_list_count--;
 	if (release_buff)
@@ -2301,8 +2737,8 @@ int sockinfo_udp::zero_copy_rx(iovec *p_iov, mem_buf_desc_t *p_desc, int *p_flag
 			*p_flags = MSG_TRUNC;
 			break;
 		}
-		p_packets->pkts[0].iov[p_packets->pkts[0].sz_iov++] = p_desc_iter->path.rx.frag;
-		total_rx += p_desc_iter->path.rx.frag.iov_len;
+		p_packets->pkts[0].iov[p_packets->pkts[0].sz_iov++] = p_desc_iter->rx.frag;
+		total_rx += p_desc_iter->rx.frag.iov_len;
 	}
 
 	m_p_socket_stats->n_rx_zcopy_pkt_count++;

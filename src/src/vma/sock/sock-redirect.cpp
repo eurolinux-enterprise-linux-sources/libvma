@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2001-2016 Mellanox Technologies, Ltd. All rights reserved.
+ * Copyright (c) 2001-2017 Mellanox Technologies, Ltd. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -40,6 +40,8 @@
 #include "utils/lock_wrapper.h"
 #include <vma/proto/ip_frag.h>
 #include <vma/dev/buffer_pool.h>
+#include <vma/dev/ring_eth_cb.h>
+#include <vma/dev/ring_profile.h>
 #include <vma/event/event_handler_manager.h>
 #include <vma/event/vlogger_timer_handler.h>
 #include <vma/iomux/poll_call.h>
@@ -50,10 +52,12 @@
 #include <vma/proto/route_table_mgr.h>
 #include <vma/proto/vma_lwip.h>
 #include <vma/main.h>
-#include <vma/vma_extra.h>
+#include "vma/vma_extra.h"
+
 #include <vma/sock/sockinfo_tcp.h>
 
 #include "fd_collection.h"
+#include "vma/util/instrumentation.h"
 
 using namespace std;
 
@@ -75,6 +79,7 @@ using namespace std;
 #define srdr_logdbg_exit	__log_exit_dbg
 #define srdr_logfunc_exit	__log_exit_func
 
+#define EP_MAX_EVENTS (int)((INT_MAX / sizeof(struct epoll_event)))
 
 struct os_api orig_os_api;
 struct sigaction g_act_prev;
@@ -84,13 +89,19 @@ void assign_dlsym(T &ptr, const char *name) {
 	ptr = reinterpret_cast<T>(dlsym(RTLD_NEXT, name));
 }
 
-#if defined(__INTEL_COMPILER) || (__clang__)
-#define VMA_THROW
-#else
-#define VMA_THROW	throw(vma_error)
-#endif
-
 #define FD_MAP_SIZE 		(g_p_fd_collection ? g_p_fd_collection->get_fd_map_size() : 1024)
+
+#define DO_GLOBAL_CTORS() do { \
+	int __res = do_global_ctors(); \
+	if (__res) { \
+		vlog_printf(VLOG_ERROR, "%s vma failed to start errno: %m\n", \
+			__FUNCTION__, errno); \
+		if (safe_mce_sys().exception_handling == vma_exception_handling::MODE_EXIT) { \
+			exit(-1); \
+		} \
+		return -1; \
+	} \
+} while (0)
 
 #define GET_ORIG_FUNC(__name) \
 	if (!orig_os_api.__name) { \
@@ -327,10 +338,6 @@ extern "C"
 int vma_recvfrom_zcopy(int __fd, void *__buf, size_t __nbytes, int *__flags,
 	               struct sockaddr *__from, socklen_t *__fromlen)
 {
-	BULLSEYE_EXCLUDE_BLOCK_START
-	if (!orig_os_api.recvfrom) get_orig_funcs();
-	BULLSEYE_EXCLUDE_BLOCK_END
-
 	srdr_logfuncall_entry("fd=%d", __fd);
 
 	socket_fd_api* p_socket_object = NULL;
@@ -343,6 +350,9 @@ int vma_recvfrom_zcopy(int __fd, void *__buf, size_t __nbytes, int *__flags,
 		return p_socket_object->rx(RX_RECVFROM, piov, 1, __flags, __from, __fromlen);
 
 	}
+	BULLSEYE_EXCLUDE_BLOCK_START
+	if (!orig_os_api.recvfrom) get_orig_funcs();
+	BULLSEYE_EXCLUDE_BLOCK_END
 	return orig_os_api.recvfrom(__fd, __buf, __nbytes, *__flags, __from, __fromlen);
 }
 
@@ -359,11 +369,158 @@ int vma_free_packets(int __fd, struct vma_packet_t *pkts, size_t count)
 	return -1;
 }
 
+#ifdef DEFINED_VMAPOLL
+extern "C"
+int vma_poll(int fd, struct vma_completion_t* completions, unsigned int ncompletions, int flags)
+{
+	int ret_val = -1;
+	cq_channel_info* cq_ch_info = NULL;
+
+	cq_ch_info = g_p_fd_collection->get_cq_channel_fd(fd);
+
+	if (likely(cq_ch_info)) {
+		ring* p_ring = cq_ch_info->get_ring();
+
+		ret_val = p_ring->vma_poll(completions, ncompletions, flags);
+#ifdef RDTSC_MEASURE_RX_PROCCESS_BUFFER_TO_RECIVEFROM
+	RDTSC_TAKE_END(g_rdtsc_instr_info_arr[RDTSC_FLOW_PROCCESS_RX_BUFFER_TO_RECIVEFROM]);
+#endif //RDTSC_MEASURE_RX_PROCCESS_BUFFER_TO_RECIVEFROM
+
+#ifdef RDTSC_MEASURE_RX_LWIP_TO_RECEVEFROM
+	RDTSC_TAKE_END(g_rdtsc_instr_info_arr[RDTSC_FLOW_RX_LWIP_TO_RECEVEFROM]);
+#endif //RDTSC_MEASURE_RX_LWIP_TO_RECEVEFROM
+
+#ifdef RDTSC_MEASURE_RX_CQE_RECEIVEFROM
+	RDTSC_TAKE_END(g_rdtsc_instr_info_arr[RDTSC_FLOW_RX_CQE_TO_RECEIVEFROM]);
+#endif //RDTSC_MEASURE_RX_CQE_RECEIVEFROM
+
+#ifdef RDTSC_MEASURE_RECEIVEFROM_TO_SENDTO
+	RDTSC_TAKE_START(g_rdtsc_instr_info_arr[RDTSC_FLOW_RECEIVEFROM_TO_SENDTO]);
+#endif //RDTSC_MEASURE_RECEIVEFROM_TO_SENDTO
+	return ret_val;
+	}
+	else {
+		errno = EBADFD;
+		return ret_val;
+	}
+}
+#endif // DEFINED_VMAPOLL
+
+#ifdef DEFINED_VMAPOLL
+extern "C"
+int vma_free_vma_packets(struct vma_packet_desc_t *packets, int num)
+{
+	mem_buf_desc_t* desc = NULL;
+	socket_fd_api* p_socket_object = NULL;
+
+	if (likely(packets)) {
+		for (int i = 0; i < num; i++) {
+			desc = (mem_buf_desc_t*)packets[i].buff_lst;
+			if (desc) {
+				p_socket_object = (socket_fd_api*)desc->rx.context;
+				ring* rng = (ring*)desc->p_desc_owner;
+				if (p_socket_object) {
+					p_socket_object->free_buffs(packets[i].total_len);
+				}
+				if (rng) {
+					rng->vma_poll_reclaim_recv_buffers(desc);
+				} else {
+					goto err;
+				}
+			} else {
+				goto err;
+			}
+		}
+	}
+	else {
+		goto err;
+	}
+
+	return 0;
+
+err:
+	errno = EINVAL;
+	return -1;
+}
+#endif // DEFINED_VMAPOLL
+
+#ifdef DEFINED_VMAPOLL
+extern "C"
+int vma_buff_ref(vma_buff_t *buff)
+{
+	int ret_val = 0;
+	mem_buf_desc_t* desc = NULL;
+
+	if (likely(buff)) {
+		desc = (mem_buf_desc_t*)buff;
+		ret_val = desc->lwip_pbuf_inc_ref_count();
+	}
+	else {
+		errno = EINVAL;
+		ret_val = -1;
+	}
+	return ret_val;
+}
+#endif // DEFINED_VMAPOLL
+
+#ifdef DEFINED_VMAPOLL
+extern "C"
+int vma_buff_free(vma_buff_t *buff)
+{
+	int ret_val = 0;
+	mem_buf_desc_t* desc = NULL;
+
+	if (likely(buff)) {
+		desc = (mem_buf_desc_t*)buff;
+		ring* rng = (ring*)desc->p_desc_owner;
+		ret_val = rng->vma_poll_reclaim_single_recv_buffer(desc);
+	}
+	else {
+		errno = EINVAL;
+		ret_val = -1;
+	}
+	return ret_val;
+}
+#endif // DEFINED_VMAPOLL
+
+extern "C"
+int vma_get_socket_rings_num(int fd)
+{
+	socket_fd_api* p_socket_object = NULL;
+	p_socket_object = fd_collection_get_sockfd(fd);
+	if (p_socket_object && p_socket_object->check_rings()) {
+		return p_socket_object->get_rings_num();
+	}
+
+	return 0;
+}
+
+
+extern "C"
+int vma_get_socket_rings_fds(int fd, int *ring_fds, int ring_fds_sz)
+{
+	int* p_rings_fds = NULL;
+	socket_fd_api* p_socket_object = NULL;
+	int rings_num = 0;
+	
+	if (ring_fds_sz <= 0 || ring_fds == NULL) {
+        	errno = EINVAL;
+        	return -1;
+	}
+	p_socket_object = fd_collection_get_sockfd(fd);
+	if (p_socket_object && p_socket_object->check_rings()) {
+		p_rings_fds = p_socket_object->get_rings_fds(rings_num);
+		for (int i = 0; i < min(ring_fds_sz, rings_num); i++) {
+			ring_fds[i] = p_rings_fds[i];
+		}
+	}
+
+	return min(ring_fds_sz, rings_num);
+}
+
 extern "C"
 int vma_add_conf_rule(char *config_line)
 {
-	do_global_ctors();
-
 	srdr_logdbg("adding conf rule: %s", config_line);
 
 	int ret = __vma_parse_config_line(config_line);
@@ -377,8 +534,6 @@ int vma_add_conf_rule(char *config_line)
 extern "C"
 int vma_thread_offload(int offload, pthread_t tid)
 {
-	do_global_ctors();
-
 	if (g_p_fd_collection) {
 		g_p_fd_collection->offloading_rule_change_thread(offload, tid);
 	} else {
@@ -389,15 +544,54 @@ int vma_thread_offload(int offload, pthread_t tid)
 }
 
 extern "C"
-int vma_dump_fd_stats(int fd, vlog_levels_t log_level)
+int vma_dump_fd_stats(int fd, int log_level)
 {
-	do_global_ctors();
-
+#ifdef DEFINED_VMAPOLL
+NOT_IN_USE(fd);
+NOT_IN_USE(log_level);
+	return 0;
+#else
 	if (g_p_fd_collection) {
-		g_p_fd_collection->statistics_print(fd, log_level);
+		g_p_fd_collection->statistics_print(fd, log_level::from_int(log_level));
 		return 0;
 	}
 	return -1;
+#endif // DEFINED_VMAPOLL
+}
+
+#ifdef HAVE_MP_RQ
+extern "C"
+int vma_cyclic_buffer_read(int fd, struct vma_completion_cb_t *completion,
+			   size_t min, size_t max, int flags)
+{
+	cq_channel_info* p_cq_ch_info = g_p_fd_collection->get_cq_channel_fd(fd);
+	if (p_cq_ch_info) {
+		ring_eth_cb* p_ring = (ring_eth_cb *)p_cq_ch_info->get_ring();
+		if (likely(p_ring && p_ring->is_mp_ring())) {
+			return p_ring->cyclic_buffer_read(*completion, min, max,
+					flags);
+		} else {
+			vlog_printf(VLOG_ERROR, "could not find ring, got fd "
+					"%d\n", fd);
+			return -1;
+		}
+	} else {
+		vlog_printf(VLOG_ERROR, "could not find p_cq_ch_info, got fd "
+							"%d\n", fd);
+		return -1;
+	}
+}
+
+#endif // HAVE_MP_RQ
+
+int vma_add_ring_profile(vma_ring_type_attr *profile, vma_ring_profile_key *res)
+{
+	if (!g_p_ring_profile) {
+		vlog_printf(VLOG_DEBUG, "%s g_p_ring_profile is null\n",__func__);
+		return -1;
+	}
+	*res = g_p_ring_profile->add_profile(profile);
+	return 0;
 }
 
 //-----------------------------------------------------------------------------
@@ -418,16 +612,16 @@ int socket(int __domain, int __type, int __protocol)
 // TODO: look for additional such functions/calls
 int socket_internal(int __domain, int __type, int __protocol, bool check_offload /*= false*/)
 {
-	BULLSEYE_EXCLUDE_BLOCK_START
-	if (!orig_os_api.socket) get_orig_funcs();
-	BULLSEYE_EXCLUDE_BLOCK_END
-
 	bool offload_sockets = (__type & 0xf) == SOCK_DGRAM || (__type & 0xf) == SOCK_STREAM;
 
 	if (offload_sockets)
-		do_global_ctors();
+		DO_GLOBAL_CTORS();
 
 	dbg_check_if_need_to_send_mcpkt();
+
+	BULLSEYE_EXCLUDE_BLOCK_START
+	if (!orig_os_api.socket) get_orig_funcs();
+	BULLSEYE_EXCLUDE_BLOCK_END
 
 	int fd = orig_os_api.socket(__domain, __type, __protocol);
 	vlog_printf(VLOG_DEBUG, "ENTER: %s(domain=%s(%d), type=%s(%d), protocol=%d) = %d\n",__func__, socket_get_domain_str(__domain), __domain, socket_get_type_str(__type), __type, __protocol, fd);
@@ -474,12 +668,12 @@ void __res_iclose(res_state statp, bool free_addr)
 	BULLSEYE_EXCLUDE_BLOCK_END
 
 	srdr_logdbg_entry("");
-        for (int ns = 0; ns < statp->_u._ext.nscount; ns++) {
-        	int sock = statp->_u._ext.nssocks[ns];
-                if (sock != -1) {
-                	handle_close(sock);
-                }
-        }
+	for (int ns = 0; ns < statp->_u._ext.nscount; ns++) {
+		int sock = statp->_u._ext.nssocks[ns];
+		if (sock != -1) {
+			handle_close(sock);
+		}
+	}
 	orig_os_api.__res_iclose(statp, free_addr);
 }
 
@@ -492,10 +686,6 @@ void __res_iclose(res_state statp, bool free_addr)
 extern "C"
 int shutdown(int __fd, int __how)
 {
-	BULLSEYE_EXCLUDE_BLOCK_START
-	if (!orig_os_api.shutdown) get_orig_funcs();
-	BULLSEYE_EXCLUDE_BLOCK_END
-
 	srdr_logdbg_entry("fd=%d, how=%d", __fd, __how);
 
 	socket_fd_api* p_socket_object = NULL;
@@ -503,59 +693,67 @@ int shutdown(int __fd, int __how)
 	if (p_socket_object)
 		return p_socket_object->shutdown(__how);
 
+	BULLSEYE_EXCLUDE_BLOCK_START
+	if (!orig_os_api.shutdown) get_orig_funcs();
+	BULLSEYE_EXCLUDE_BLOCK_END
+
 	return orig_os_api.shutdown(__fd, __how);
 }
 
 extern "C"
 int listen(int __fd, int backlog)
 {
+	srdr_logdbg_entry("fd=%d, backlog=%d", __fd, backlog);
+
+	socket_fd_api* p_socket_object = NULL;
+	p_socket_object = fd_collection_get_sockfd(__fd);
+
+	if (p_socket_object) {
+		int ret = p_socket_object->prepareListen(); // for verifying that the socket is really offloaded
+		if (ret < 0)
+			return ret; //error
+		if (ret > 0) { //Passthrough
+			handle_close(__fd, false, true);
+			p_socket_object = NULL;
+		}
+	}
+	if (p_socket_object) {
+		return p_socket_object->listen(backlog);
+	}
+
 	BULLSEYE_EXCLUDE_BLOCK_START
-       if (!orig_os_api.listen) get_orig_funcs();
+	if (!orig_os_api.listen) get_orig_funcs();
 	BULLSEYE_EXCLUDE_BLOCK_END
 
-       srdr_logdbg_entry("fd=%d, backlog=%d", __fd, backlog);
-
-       socket_fd_api* p_socket_object = NULL;
-       p_socket_object = fd_collection_get_sockfd(__fd);
-
-       if (p_socket_object) {
-    	   int ret = p_socket_object->prepareListen(); // for verifying that the socket is really offloaded
-    	   if (ret < 0) return ret; //error
-    	   if (ret > 0) { //Passthrough
-    		   handle_close(__fd, false, true);
-    		   p_socket_object = NULL;
-    	   }
-       }
-
-       return p_socket_object ? p_socket_object->listen(backlog) : orig_os_api.listen(__fd, backlog);
+	return orig_os_api.listen(__fd, backlog);
 }
 
 extern "C"
 int accept(int __fd, struct sockaddr *__addr, socklen_t *__addrlen)
 {
+	socket_fd_api* p_socket_object = NULL;
+	p_socket_object = fd_collection_get_sockfd(__fd);
+	if (p_socket_object)
+		return p_socket_object->accept(__addr, __addrlen);
+
 	BULLSEYE_EXCLUDE_BLOCK_START
-       if (!orig_os_api.accept) get_orig_funcs();
+	if (!orig_os_api.accept) get_orig_funcs();
 	BULLSEYE_EXCLUDE_BLOCK_END
 
-       socket_fd_api* p_socket_object = NULL;
-       p_socket_object = fd_collection_get_sockfd(__fd);
-       if (p_socket_object)
-               return p_socket_object->accept(__addr, __addrlen);
-
-       return orig_os_api.accept(__fd, __addr, __addrlen);
+	return orig_os_api.accept(__fd, __addr, __addrlen);
 }
 
 extern "C"
 int accept4(int __fd, struct sockaddr *__addr, socklen_t *__addrlen, int __flags)
 {
-	BULLSEYE_EXCLUDE_BLOCK_START
-	if (!orig_os_api.accept4) get_orig_funcs();
-	BULLSEYE_EXCLUDE_BLOCK_END
-
 	socket_fd_api* p_socket_object = NULL;
 	p_socket_object = fd_collection_get_sockfd(__fd);
 	if (p_socket_object)
 		return p_socket_object->accept4(__addr, __addrlen, __flags);
+
+	BULLSEYE_EXCLUDE_BLOCK_START
+	if (!orig_os_api.accept4) get_orig_funcs();
+	BULLSEYE_EXCLUDE_BLOCK_END
 
 	return orig_os_api.accept4(__fd, __addr, __addrlen, __flags);
 }
@@ -569,7 +767,7 @@ int bind(int __fd, const struct sockaddr *__addr, socklen_t __addrlen)
 	BULLSEYE_EXCLUDE_BLOCK_END
 
 	char buf[256];
-	NOT_IN_USE(buf); /* to suppress warning in case VMA_OPTIMIZE_LOG */
+	NOT_IN_USE(buf); /* to suppress warning in case VMA_MAX_DEFINED_LOG_LEVEL */
 	srdr_logdbg_entry("fd=%d, %s", __fd, sprintf_sockaddr(buf, 256, __addr, __addrlen));
 
 	int ret = 0;
@@ -610,7 +808,7 @@ int connect(int __fd, const struct sockaddr *__to, socklen_t __tolen)
 	BULLSEYE_EXCLUDE_BLOCK_END
 
 	char buf[256];
-	NOT_IN_USE(buf); /* to suppress warning in case VMA_OPTIMIZE_LOG */
+	NOT_IN_USE(buf); /* to suppress warning in case VMA_MAX_DEFINED_LOG_LEVEL */
 	srdr_logdbg_entry("fd=%d, %s", __fd, sprintf_sockaddr(buf, 256, __to, __tolen));
 
 	int ret = 0;
@@ -644,12 +842,8 @@ int connect(int __fd, const struct sockaddr *__to, socklen_t __tolen)
    Returns 0 on success, -1 for errors.  */
 extern "C"
 int setsockopt(int __fd, int __level, int __optname,
-	       __const void *__optval, socklen_t __optlen) VMA_THROW
+	       __const void *__optval, socklen_t __optlen)
 {
-	BULLSEYE_EXCLUDE_BLOCK_START
-	if (!orig_os_api.setsockopt) get_orig_funcs();
-	BULLSEYE_EXCLUDE_BLOCK_END
-
 	srdr_logdbg_entry("fd=%d, level=%d, optname=%d", __fd, __level, __optname);
         
         if (NULL == __optval) {
@@ -665,6 +859,9 @@ int setsockopt(int __fd, int __level, int __optname,
 		ret = p_socket_object->setsockopt(__level, __optname, __optval, __optlen);
 	}
 	else {
+		BULLSEYE_EXCLUDE_BLOCK_START
+		if (!orig_os_api.setsockopt) get_orig_funcs();
+		BULLSEYE_EXCLUDE_BLOCK_END
 		ret = orig_os_api.setsockopt(__fd, __level, __optname, __optval, __optlen);
 	}
 
@@ -680,24 +877,37 @@ int setsockopt(int __fd, int __level, int __optname,
    Returns 0 on success, -1 for errors.  */
 extern "C"
 int getsockopt(int __fd, int __level, int __optname,
-	       void *__optval, socklen_t *__optlen) VMA_THROW
+	       void *__optval, socklen_t *__optlen)
 {
-	BULLSEYE_EXCLUDE_BLOCK_START
-	if (!orig_os_api.getsockopt) get_orig_funcs();
-	BULLSEYE_EXCLUDE_BLOCK_END
-
 	srdr_logdbg_entry("fd=%d, level=%d, optname=%d", __fd, __level, __optname);
 
 	if (__fd == -1 && __level == SOL_SOCKET && __optname == SO_VMA_GET_API &&
 	    __optlen && *__optlen >= sizeof(struct vma_api_t*)) {
+		DO_GLOBAL_CTORS();
 		srdr_logdbg("User request for VMA Extra API pointers");
 		struct vma_api_t *vma_api = new struct vma_api_t();
+
 		vma_api->register_recv_callback = vma_register_recv_callback;
 		vma_api->recvfrom_zcopy = vma_recvfrom_zcopy;
 		vma_api->free_packets = vma_free_packets;
 		vma_api->add_conf_rule = vma_add_conf_rule;
 		vma_api->thread_offload = vma_thread_offload;
+
+		vma_api->get_socket_rings_num = vma_get_socket_rings_num;
+		vma_api->get_socket_rings_fds = vma_get_socket_rings_fds;
+		vma_api->vma_add_ring_profile = vma_add_ring_profile;
+#ifdef DEFINED_VMAPOLL
+		vma_api->free_vma_packets = vma_free_vma_packets;
+		vma_api->vma_poll = vma_poll;
+		vma_api->ref_vma_buff = vma_buff_ref;
+		vma_api->free_vma_buff = vma_buff_free;
+#else
 		vma_api->dump_fd_stats = vma_dump_fd_stats;
+#endif // DEFINED_VMAPOLL
+
+#ifdef HAVE_MP_RQ
+		vma_api->vma_cyclic_buffer_read = vma_cyclic_buffer_read;
+#endif // HAVE_MP_RQ
 		*((vma_api_t**)__optval) = vma_api;
 		return 0;
 	}
@@ -705,10 +915,14 @@ int getsockopt(int __fd, int __level, int __optname,
 	int ret = 0;
 	socket_fd_api* p_socket_object = NULL;
 	p_socket_object = fd_collection_get_sockfd(__fd);
-	if (p_socket_object)
+	if (p_socket_object) {
 		ret = p_socket_object->getsockopt(__level, __optname, __optval, __optlen);
-	else
+	} else {
+		BULLSEYE_EXCLUDE_BLOCK_START
+		if (!orig_os_api.getsockopt) get_orig_funcs();
+		BULLSEYE_EXCLUDE_BLOCK_END
 		ret = orig_os_api.getsockopt(__fd, __level, __optname, __optval, __optlen);
+	}
 
 	if (ret >= 0)
 		srdr_logdbg_exit("returned with %d", ret);
@@ -722,18 +936,14 @@ int getsockopt(int __fd, int __level, int __optname,
 
    This function is a cancellation point and therefore not marked with
    __THROW.
-   NOTE: in VMA this function is marked as throw (vma_error); however, throw will never occur during
-   handling of any command.  VMA will only throw in case VMA doesn't know to handle a command and the
-   user requested explicitly that VMA will throw an exception in such a case by setting VMA_EXCEPTION_HANDLING
-   accordingly (see README.txt)
+   NOTE: VMA throw will never occur during handling of any command.
+   VMA will only throw in case VMA doesn't know to handle a command and the
+   user requested explicitly that VMA will throw an exception in such a case
+   by setting VMA_EXCEPTION_HANDLING accordingly (see README.txt)
    */
 extern "C"
-int fcntl(int __fd, int __cmd, ...) VMA_THROW
+int fcntl(int __fd, int __cmd, ...)
 {
-	BULLSEYE_EXCLUDE_BLOCK_START
-	if (!orig_os_api.fcntl) get_orig_funcs();
-	BULLSEYE_EXCLUDE_BLOCK_END
-
 	srdr_logfunc_entry("fd=%d, cmd=%d", __fd, __cmd);
 
 	int res = -1;
@@ -745,10 +955,14 @@ int fcntl(int __fd, int __cmd, ...) VMA_THROW
 	int ret = 0;
 	socket_fd_api* p_socket_object = NULL;
 	p_socket_object = fd_collection_get_sockfd(__fd);
-	if (p_socket_object)
+	if (p_socket_object) {
 		res = p_socket_object->fcntl(__cmd, arg);
-	else
+	} else {
+		BULLSEYE_EXCLUDE_BLOCK_START
+		if (!orig_os_api.fcntl) get_orig_funcs();
+		BULLSEYE_EXCLUDE_BLOCK_END
 		res = orig_os_api.fcntl(__fd, __cmd, arg);
+	}
 
 	if (__cmd == F_DUPFD) {
 		handle_close(__fd);
@@ -765,12 +979,8 @@ int fcntl(int __fd, int __cmd, ...) VMA_THROW
    One argument may follow; its presence and type depend on REQUEST.
    Return value depends on REQUEST.  Usually -1 indicates error. */
 extern "C"
-int ioctl (int __fd, unsigned long int __request, ...) VMA_THROW
+int ioctl (int __fd, unsigned long int __request, ...)
 {
-	BULLSEYE_EXCLUDE_BLOCK_START
-	if (!orig_os_api.fcntl) get_orig_funcs();
-	BULLSEYE_EXCLUDE_BLOCK_END
-
 	srdr_logfunc_entry("fd=%d, request=%d", __fd, __request);
 
 	int res = -1;
@@ -783,10 +993,14 @@ int ioctl (int __fd, unsigned long int __request, ...) VMA_THROW
 
 	socket_fd_api* p_socket_object = NULL;
 	p_socket_object = fd_collection_get_sockfd(__fd);
-	if (p_socket_object && arg)
+	if (p_socket_object && arg) {
 		res = p_socket_object->ioctl(__request, arg);
-	else
+	} else {
+		BULLSEYE_EXCLUDE_BLOCK_START
+		if (!orig_os_api.ioctl) get_orig_funcs();
+		BULLSEYE_EXCLUDE_BLOCK_END
 		res = orig_os_api.ioctl(__fd, __request, arg);
+	}
 
 	if (ret >= 0)
 		srdr_logfunc_exit("returned with %d", ret);
@@ -798,10 +1012,6 @@ int ioctl (int __fd, unsigned long int __request, ...) VMA_THROW
 extern "C"
 int getsockname(int __fd, struct sockaddr *__name, socklen_t *__namelen)
 {
-	BULLSEYE_EXCLUDE_BLOCK_START
-	if (!orig_os_api.getsockname) get_orig_funcs();
-	BULLSEYE_EXCLUDE_BLOCK_END
-
 	srdr_logdbg_entry("fd=%d", __fd);
 
 	int ret = 0;
@@ -809,8 +1019,20 @@ int getsockname(int __fd, struct sockaddr *__name, socklen_t *__namelen)
 	p_socket_object = fd_collection_get_sockfd(__fd);
 	if (p_socket_object) {
 		ret = p_socket_object->getsockname(__name, __namelen);
+
+		if (safe_mce_sys().trigger_dummy_send_getsockname) {
+			char buf[264] = {0};
+			struct iovec msg_iov = {&buf, sizeof(buf)};
+			struct msghdr msg = {NULL, 0, &msg_iov, 1, NULL, 0, 0};
+			int ret_send = sendmsg(__fd, &msg, VMA_SND_FLAGS_DUMMY);
+			srdr_logdbg("Triggered dummy message for socket fd=%d (ret_send=%d)", __fd, ret_send);
+			NOT_IN_USE(ret_send);
+		}
 	}
 	else {
+		BULLSEYE_EXCLUDE_BLOCK_START
+		if (!orig_os_api.getsockname) get_orig_funcs();
+		BULLSEYE_EXCLUDE_BLOCK_END
 		ret = orig_os_api.getsockname(__fd, __name, __namelen);
 	}
 
@@ -824,10 +1046,6 @@ int getsockname(int __fd, struct sockaddr *__name, socklen_t *__namelen)
 extern "C"
 int getpeername(int __fd, struct sockaddr *__name, socklen_t *__namelen)
 {
-	BULLSEYE_EXCLUDE_BLOCK_START
-	if (!orig_os_api.getpeername) get_orig_funcs();
-	BULLSEYE_EXCLUDE_BLOCK_END
-
 	srdr_logdbg_entry("fd=%d", __fd);
 
 	int ret = 0;
@@ -837,6 +1055,9 @@ int getpeername(int __fd, struct sockaddr *__name, socklen_t *__namelen)
 		ret = p_socket_object->getpeername(__name, __namelen);
 	}
 	else {
+		BULLSEYE_EXCLUDE_BLOCK_START
+		if (!orig_os_api.getpeername) get_orig_funcs();
+		BULLSEYE_EXCLUDE_BLOCK_END
 		ret = orig_os_api.getpeername(__fd, __name, __namelen);
 	}
 
@@ -856,10 +1077,6 @@ int getpeername(int __fd, struct sockaddr *__name, socklen_t *__namelen)
 extern "C"
 ssize_t read(int __fd, void *__buf, size_t __nbytes)
 {
-	BULLSEYE_EXCLUDE_BLOCK_START
-	if (!orig_os_api.read) get_orig_funcs();
-	BULLSEYE_EXCLUDE_BLOCK_END
-
 	srdr_logfuncall_entry("fd=%d", __fd);
 
 	socket_fd_api* p_socket_object = NULL;
@@ -871,6 +1088,10 @@ ssize_t read(int __fd, void *__buf, size_t __nbytes)
 		int dummy_flags = 0;
 		return p_socket_object->rx(RX_READ, piov, 1, &dummy_flags);
 	}
+
+	BULLSEYE_EXCLUDE_BLOCK_START
+	if (!orig_os_api.read) get_orig_funcs();
+	BULLSEYE_EXCLUDE_BLOCK_END
 
 	return orig_os_api.read(__fd, __buf, __nbytes);
 }
@@ -885,10 +1106,6 @@ ssize_t read(int __fd, void *__buf, size_t __nbytes)
 extern "C"
 ssize_t __read_chk(int __fd, void *__buf, size_t __nbytes, size_t __buflen)
 {
-	BULLSEYE_EXCLUDE_BLOCK_START
-	if (!orig_os_api.__read_chk) get_orig_funcs();
-	BULLSEYE_EXCLUDE_BLOCK_END
-
 	srdr_logfuncall_entry("fd=%d", __fd);
 
 	socket_fd_api* p_socket_object = NULL;
@@ -906,6 +1123,9 @@ ssize_t __read_chk(int __fd, void *__buf, size_t __nbytes, size_t __buflen)
 		int dummy_flags = 0;
 		return p_socket_object->rx(RX_READ, piov, 1, &dummy_flags);
 	}
+	BULLSEYE_EXCLUDE_BLOCK_START
+	if (!orig_os_api.__read_chk) get_orig_funcs();
+	BULLSEYE_EXCLUDE_BLOCK_END
 
 	return orig_os_api.__read_chk(__fd, __buf, __nbytes, __buflen);
 }
@@ -919,10 +1139,6 @@ ssize_t __read_chk(int __fd, void *__buf, size_t __nbytes, size_t __buflen)
 extern "C"
 ssize_t readv(int __fd, const struct iovec *iov, int iovcnt)
 {
-	BULLSEYE_EXCLUDE_BLOCK_START
-	if (!orig_os_api.readv) get_orig_funcs();
-	BULLSEYE_EXCLUDE_BLOCK_END
-
 	srdr_logfuncall_entry("fd=%d", __fd);
 
 	socket_fd_api* p_socket_object = NULL;
@@ -932,6 +1148,9 @@ ssize_t readv(int __fd, const struct iovec *iov, int iovcnt)
 		int dummy_flags = 0;
 		return p_socket_object->rx(RX_READV, piov, iovcnt, &dummy_flags);
 	}
+	BULLSEYE_EXCLUDE_BLOCK_START
+	if (!orig_os_api.readv) get_orig_funcs();
+	BULLSEYE_EXCLUDE_BLOCK_END
 
 	return orig_os_api.readv(__fd, iov, iovcnt);
 }
@@ -944,10 +1163,6 @@ ssize_t readv(int __fd, const struct iovec *iov, int iovcnt)
 extern "C"
 ssize_t recv(int __fd, void *__buf, size_t __nbytes, int __flags)
 {
-	BULLSEYE_EXCLUDE_BLOCK_START
-	if (!orig_os_api.recv)	get_orig_funcs();
-	BULLSEYE_EXCLUDE_BLOCK_END
-
 	srdr_logfuncall_entry("fd=%d", __fd);
 
 	socket_fd_api* p_socket_object = NULL;
@@ -958,6 +1173,9 @@ ssize_t recv(int __fd, void *__buf, size_t __nbytes, int __flags)
 		piov[0].iov_len = __nbytes;
 		return p_socket_object->rx(RX_RECV, piov, 1, &__flags);
 	}
+	BULLSEYE_EXCLUDE_BLOCK_START
+	if (!orig_os_api.recv) get_orig_funcs();
+	BULLSEYE_EXCLUDE_BLOCK_END
 
 	return orig_os_api.recv(__fd, __buf, __nbytes, __flags);
 }
@@ -972,30 +1190,27 @@ ssize_t recv(int __fd, void *__buf, size_t __nbytes, int __flags)
 extern "C"
 ssize_t __recv_chk(int __fd, void *__buf, size_t __nbytes, size_t __buflen, int __flags)
 {
-	{
+	srdr_logfuncall_entry("fd=%d", __fd);
+
+	socket_fd_api* p_socket_object = NULL;
+	p_socket_object = fd_collection_get_sockfd(__fd);
+	if (p_socket_object) {
 		BULLSEYE_EXCLUDE_BLOCK_START
-		if (!orig_os_api.__recv_chk)	get_orig_funcs();
+		if (__nbytes > __buflen) {
+			srdr_logpanic("buffer overflow detected");
+		}
 		BULLSEYE_EXCLUDE_BLOCK_END
 
-		srdr_logfuncall_entry("fd=%d", __fd);
-
-		socket_fd_api* p_socket_object = NULL;
-		p_socket_object = fd_collection_get_sockfd(__fd);
-		if (p_socket_object) {
-			BULLSEYE_EXCLUDE_BLOCK_START
-			if (__nbytes > __buflen) {
-			    srdr_logpanic("buffer overflow detected");
-			}
-			BULLSEYE_EXCLUDE_BLOCK_END
-
-			struct iovec piov[1];
-			piov[0].iov_base = __buf;
-			piov[0].iov_len = __nbytes;
-			return p_socket_object->rx(RX_RECV, piov, 1, &__flags);
-		}
-
-		return orig_os_api.__recv_chk(__fd, __buf, __nbytes, __buflen, __flags);
+		struct iovec piov[1];
+		piov[0].iov_base = __buf;
+		piov[0].iov_len = __nbytes;
+		return p_socket_object->rx(RX_RECV, piov, 1, &__flags);
 	}
+	BULLSEYE_EXCLUDE_BLOCK_START
+	if (!orig_os_api.__recv_chk) get_orig_funcs();
+	BULLSEYE_EXCLUDE_BLOCK_END
+
+	return orig_os_api.__recv_chk(__fd, __buf, __nbytes, __buflen, __flags);
 }
 
 /* Receive a message as described by MESSAGE from socket FD.
@@ -1006,10 +1221,6 @@ ssize_t __recv_chk(int __fd, void *__buf, size_t __nbytes, size_t __buflen, int 
 extern "C"
 ssize_t recvmsg(int __fd, struct msghdr *__msg, int __flags)
 {
-	BULLSEYE_EXCLUDE_BLOCK_START
-	if (!orig_os_api.recvmsg) get_orig_funcs();
-	BULLSEYE_EXCLUDE_BLOCK_END
-
 	srdr_logfuncall_entry("fd=%d", __fd);
 
 	if (__msg == NULL) {
@@ -1021,8 +1232,12 @@ ssize_t recvmsg(int __fd, struct msghdr *__msg, int __flags)
 	socket_fd_api* p_socket_object = NULL;
 	p_socket_object = fd_collection_get_sockfd(__fd);
 	if (p_socket_object) {
+		__msg->msg_flags = 0;
 		return p_socket_object->rx(RX_RECVMSG, __msg->msg_iov, __msg->msg_iovlen, &__flags, (__SOCKADDR_ARG)__msg->msg_name, (socklen_t*)&__msg->msg_namelen, __msg);
 	}
+	BULLSEYE_EXCLUDE_BLOCK_START
+	if (!orig_os_api.recvmsg) get_orig_funcs();
+	BULLSEYE_EXCLUDE_BLOCK_END
 
 	return orig_os_api.recvmsg(__fd, __msg, __flags);
 }
@@ -1056,10 +1271,6 @@ int recvmmsg(int __fd, struct mmsghdr *__mmsghdr, unsigned int __vlen, int __fla
         int num_of_msg=0;
         struct timespec start_time = TIMESPEC_INITIALIZER, current_time = TIMESPEC_INITIALIZER, delta_time = TIMESPEC_INITIALIZER;
 
-        BULLSEYE_EXCLUDE_BLOCK_START
-        if (!orig_os_api.recvmmsg) get_orig_funcs();
-        BULLSEYE_EXCLUDE_BLOCK_END
-
         srdr_logfuncall_entry("fd=%d, mmsghdr length=%d flags=%x", __fd, __vlen, __flags);
 
         if (__mmsghdr == NULL) {
@@ -1077,6 +1288,7 @@ int recvmmsg(int __fd, struct mmsghdr *__mmsghdr, unsigned int __vlen, int __fla
         	int ret = 0;
                 for (unsigned int i=0; i<__vlen; i++) {
                        int flags = __flags;
+                       __mmsghdr[i].msg_hdr.msg_flags = 0;
                        ret = p_socket_object->rx(RX_RECVMSG, __mmsghdr[i].msg_hdr.msg_iov, __mmsghdr[i].msg_hdr.msg_iovlen, &flags,
                                                          (__SOCKADDR_ARG)__mmsghdr[i].msg_hdr.msg_name, (socklen_t*)&__mmsghdr[i].msg_hdr.msg_namelen,  &__mmsghdr[i].msg_hdr);
                        if (ret < 0){
@@ -1102,7 +1314,10 @@ int recvmmsg(int __fd, struct mmsghdr *__mmsghdr, unsigned int __vlen, int __fla
                 	return ret;
                 }
         }
-        
+        BULLSEYE_EXCLUDE_BLOCK_START
+        if (!orig_os_api.recvmmsg) get_orig_funcs();
+        BULLSEYE_EXCLUDE_BLOCK_END
+
         return orig_os_api.recvmmsg(__fd, __mmsghdr, __vlen, __flags, __timeout);
 }
 
@@ -1118,9 +1333,7 @@ extern "C"
 ssize_t recvfrom(int __fd, void *__buf, size_t __nbytes, int __flags,
 		 struct sockaddr *__from, socklen_t *__fromlen)
 {
-	BULLSEYE_EXCLUDE_BLOCK_START
-	if (!orig_os_api.recvfrom) get_orig_funcs();
-	BULLSEYE_EXCLUDE_BLOCK_END
+	ssize_t ret_val = 0;
 
 	srdr_logfuncall_entry("fd=%d", __fd);
 
@@ -1130,10 +1343,32 @@ ssize_t recvfrom(int __fd, void *__buf, size_t __nbytes, int __flags,
 		struct iovec piov[1];
 		piov[0].iov_base = __buf;
 		piov[0].iov_len = __nbytes;
-		return p_socket_object->rx(RX_RECVFROM, piov, 1, &__flags, __from, __fromlen);
+		ret_val = p_socket_object->rx(RX_RECVFROM, piov, 1, &__flags, __from, __fromlen);
 	}
+	else {
+		BULLSEYE_EXCLUDE_BLOCK_START
+		if (!orig_os_api.recvfrom) get_orig_funcs();
+		BULLSEYE_EXCLUDE_BLOCK_END
+		ret_val = orig_os_api.recvfrom(__fd, __buf, __nbytes, __flags, __from, __fromlen);
+	}
+#ifdef DEFINED_VMAPOLL
+#ifdef RDTSC_MEASURE_RX_PROCCESS_BUFFER_TO_RECIVEFROM
+	RDTSC_TAKE_END(g_rdtsc_instr_info_arr[RDTSC_FLOW_PROCCESS_RX_BUFFER_TO_RECIVEFROM]);
+#endif //RDTSC_MEASURE_RX_PROCCESS_BUFFER_TO_RECIVEFROM
 
-	return orig_os_api.recvfrom(__fd, __buf, __nbytes, __flags, __from, __fromlen);
+#ifdef RDTSC_MEASURE_RX_LWIP_TO_RECEVEFROM
+	RDTSC_TAKE_END(g_rdtsc_instr_info_arr[RDTSC_FLOW_RX_LWIP_TO_RECEVEFROM]);
+#endif //RDTSC_MEASURE_RX_LWIP_TO_RECEVEFROM
+
+#ifdef RDTSC_MEASURE_RX_CQE_RECEIVEFROM
+	RDTSC_TAKE_END(g_rdtsc_instr_info_arr[RDTSC_FLOW_RX_CQE_TO_RECEIVEFROM]);
+#endif //RDTSC_MEASURE_RX_CQE_RECEIVEFROM
+
+#ifdef RDTSC_MEASURE_RECEIVEFROM_TO_SENDTO
+	RDTSC_TAKE_START(g_rdtsc_instr_info_arr[RDTSC_FLOW_RECEIVEFROM_TO_SENDTO]);
+#endif //RDTSC_MEASURE_RECEIVEFROM_TO_SENDTO
+#endif // DEFINED_VMAPOLL
+	return ret_val;
 }
 
 /* Checks that the buffer is big enough to contain the number of bytes
@@ -1149,10 +1384,6 @@ extern "C"
 ssize_t __recvfrom_chk(int __fd, void *__buf, size_t __nbytes, size_t __buflen, int __flags,
 		 struct sockaddr *__from, socklen_t *__fromlen)
 {
-	BULLSEYE_EXCLUDE_BLOCK_START
-	if (!orig_os_api.__recvfrom_chk) get_orig_funcs();
-	BULLSEYE_EXCLUDE_BLOCK_END
-
 	srdr_logfuncall_entry("fd=%d", __fd);
 
 	socket_fd_api* p_socket_object = NULL;
@@ -1169,6 +1400,9 @@ ssize_t __recvfrom_chk(int __fd, void *__buf, size_t __nbytes, size_t __buflen, 
 		piov[0].iov_len = __nbytes;
 		return p_socket_object->rx(RX_RECVFROM, piov, 1, &__flags, __from, __fromlen);
 	}
+	BULLSEYE_EXCLUDE_BLOCK_START
+	if (!orig_os_api.__recvfrom_chk) get_orig_funcs();
+	BULLSEYE_EXCLUDE_BLOCK_END
 
 	return orig_os_api.__recvfrom_chk(__fd, __buf, __nbytes, __buflen, __flags, __from, __fromlen);
 }
@@ -1180,10 +1414,6 @@ ssize_t __recvfrom_chk(int __fd, void *__buf, size_t __nbytes, size_t __buflen, 
 extern "C"
 ssize_t write(int __fd, __const void *__buf, size_t __nbytes)
 {
-	BULLSEYE_EXCLUDE_BLOCK_START
-	if (!orig_os_api.write) get_orig_funcs();
-	BULLSEYE_EXCLUDE_BLOCK_END
-
 	srdr_logfuncall_entry("fd=%d, nbytes=%d", __fd, __nbytes);
 
 	socket_fd_api* p_socket_object = NULL;
@@ -1194,6 +1424,9 @@ ssize_t write(int __fd, __const void *__buf, size_t __nbytes)
 		piov[0].iov_len = __nbytes;
 		return p_socket_object->tx(TX_WRITE, piov, 1);
 	}
+	BULLSEYE_EXCLUDE_BLOCK_START
+	if (!orig_os_api.write) get_orig_funcs();
+	BULLSEYE_EXCLUDE_BLOCK_END
 
 	return orig_os_api.write(__fd, __buf, __nbytes);
 }
@@ -1205,10 +1438,6 @@ ssize_t write(int __fd, __const void *__buf, size_t __nbytes)
 extern "C"
 ssize_t writev(int __fd, const struct iovec *iov, int iovcnt)
 {
-	BULLSEYE_EXCLUDE_BLOCK_START
-	if (!orig_os_api.writev) get_orig_funcs();
-	BULLSEYE_EXCLUDE_BLOCK_END
-
 	srdr_logfuncall_entry("fd=%d, %d iov blocks", __fd, iovcnt);
 
 	socket_fd_api* p_socket_object = NULL;
@@ -1216,6 +1445,10 @@ ssize_t writev(int __fd, const struct iovec *iov, int iovcnt)
 	if (p_socket_object) {
 		return p_socket_object->tx(TX_WRITEV, iov, iovcnt);
 	}
+	BULLSEYE_EXCLUDE_BLOCK_START
+	if (!orig_os_api.writev) get_orig_funcs();
+	BULLSEYE_EXCLUDE_BLOCK_END
+
 	return orig_os_api.writev(__fd, iov, iovcnt);
 }
 
@@ -1227,10 +1460,6 @@ ssize_t writev(int __fd, const struct iovec *iov, int iovcnt)
 extern "C"
 ssize_t send(int __fd, __const void *__buf, size_t __nbytes, int __flags)
 {
-	BULLSEYE_EXCLUDE_BLOCK_START
-	if (!orig_os_api.send)	get_orig_funcs();
-	BULLSEYE_EXCLUDE_BLOCK_END
-
 	srdr_logfuncall_entry("fd=%d, nbytes=%d", __fd, __nbytes);
 
 	socket_fd_api* p_socket_object = NULL;
@@ -1241,6 +1470,15 @@ ssize_t send(int __fd, __const void *__buf, size_t __nbytes, int __flags)
 		piov[0].iov_len = __nbytes;
 		return p_socket_object->tx(TX_SEND, piov, 1, __flags);
 	}
+
+	// Ignore dummy messages for OS
+	if (unlikely(IS_DUMMY_PACKET(__flags))) {
+		errno = EINVAL;
+		return -1;
+	}
+	BULLSEYE_EXCLUDE_BLOCK_START
+	if (!orig_os_api.send) get_orig_funcs();
+	BULLSEYE_EXCLUDE_BLOCK_END
 
 	return orig_os_api.send(__fd, __buf, __nbytes, __flags);
 }
@@ -1253,11 +1491,6 @@ ssize_t send(int __fd, __const void *__buf, size_t __nbytes, int __flags)
 extern "C"
 ssize_t sendmsg(int __fd, __const struct msghdr *__msg, int __flags)
 {
-	BULLSEYE_EXCLUDE_BLOCK_START
-	if (!orig_os_api.sendmsg) get_orig_funcs();
-	BULLSEYE_EXCLUDE_BLOCK_END
-
-
 	srdr_logfuncall_entry("fd=%d", __fd);
 
 	socket_fd_api* p_socket_object = NULL;
@@ -1266,7 +1499,17 @@ ssize_t sendmsg(int __fd, __const struct msghdr *__msg, int __flags)
 		return p_socket_object->tx(TX_SENDMSG, __msg->msg_iov, __msg->msg_iovlen, __flags, (__CONST_SOCKADDR_ARG)__msg->msg_name, (socklen_t)__msg->msg_namelen);
 	}
 
+	// Ignore dummy messages for OS
+	if (unlikely(IS_DUMMY_PACKET(__flags))) {
+		errno = EINVAL;
+		return -1;
+	}
+	BULLSEYE_EXCLUDE_BLOCK_START
+	if (!orig_os_api.sendmsg) get_orig_funcs();
+	BULLSEYE_EXCLUDE_BLOCK_END
+
 	return orig_os_api.sendmsg(__fd, __msg, __flags);
+
 }
 
 /* Send multiple messages as described by MESSAGE from socket FD.
@@ -1278,10 +1521,6 @@ extern "C"
 int sendmmsg(int __fd, struct mmsghdr *__mmsghdr, unsigned int __vlen, int __flags)
 {
 	int num_of_msg=0;
-
-	BULLSEYE_EXCLUDE_BLOCK_START
-	if (!orig_os_api.sendmmsg) get_orig_funcs();
-	BULLSEYE_EXCLUDE_BLOCK_END
 
 	srdr_logfuncall_entry("fd=%d, mmsghdr length=%d flags=%x", __fd, __vlen, __flags);
 
@@ -1309,6 +1548,15 @@ int sendmmsg(int __fd, struct mmsghdr *__mmsghdr, unsigned int __vlen, int __fla
 		return num_of_msg;
 	}
 
+	// Ignore dummy messages for OS
+	if (unlikely(IS_DUMMY_PACKET(__flags))) {
+		errno = EINVAL;
+		return -1;
+	}
+	BULLSEYE_EXCLUDE_BLOCK_START
+	if (!orig_os_api.sendmmsg) get_orig_funcs();
+	BULLSEYE_EXCLUDE_BLOCK_END
+
 	return orig_os_api.sendmmsg(__fd, __mmsghdr, __vlen, __flags);
 }
 
@@ -1321,10 +1569,15 @@ extern "C"
 ssize_t sendto(int __fd, __const void *__buf, size_t __nbytes, int __flags,
 	       const struct sockaddr *__to, socklen_t __tolen)
 {
-	BULLSEYE_EXCLUDE_BLOCK_START
-	if (!orig_os_api.sendto) get_orig_funcs();
-	BULLSEYE_EXCLUDE_BLOCK_END
+#ifdef DEFINED_VMAPOLL	
+#ifdef RDTSC_MEASURE_TX_SENDTO_TO_AFTER_POST_SEND
+	RDTSC_TAKE_START(g_rdtsc_instr_info_arr[RDTSC_FLOW_SENDTO_TO_AFTER_POST_SEND]);
+#endif //RDTSC_MEASURE_TX_SENDTO_TO_AFTER_POST_SEND
 
+#ifdef RDTSC_MEASURE_RECEIVEFROM_TO_SENDTO
+	RDTSC_TAKE_END(g_rdtsc_instr_info_arr[RDTSC_FLOW_RECEIVEFROM_TO_SENDTO]);
+#endif //RDTSC_MEASURE_TX_SENDTO_TO_AFTER_POST_SEND
+#endif // DEFINED_VMAPOLL
 	srdr_logfuncall_entry("fd=%d, nbytes=%d", __fd, __nbytes);
 
 	socket_fd_api* p_socket_object = NULL;
@@ -1335,6 +1588,15 @@ ssize_t sendto(int __fd, __const void *__buf, size_t __nbytes, int __flags,
 		piov[0].iov_len = __nbytes;
 		return p_socket_object->tx(TX_SENDTO, piov, 1, __flags, __to, __tolen);
 	}
+
+	// Ignore dummy messages for OS
+	if (unlikely(IS_DUMMY_PACKET(__flags))) {
+		errno = EINVAL;
+		return -1;
+	}
+	BULLSEYE_EXCLUDE_BLOCK_START
+	if (!orig_os_api.sendto) get_orig_funcs();
+	BULLSEYE_EXCLUDE_BLOCK_END
 
 	return orig_os_api.sendto(__fd, __buf, __nbytes, __flags, __to, __tolen);
 }
@@ -1400,9 +1662,9 @@ int select_helper(int __nfds,
 	if (g_vlogger_level >= VLOG_FUNC) {
 		const int tmpbufsize = 256;
 		char tmpbuf[tmpbufsize], tmpbuf2[tmpbufsize];
-		NOT_IN_USE(tmpbufsize); /* to suppress warning in case VMA_OPTIMIZE_LOG */
-		NOT_IN_USE(tmpbuf); /* to suppress warning in case VMA_OPTIMIZE_LOG */
-		NOT_IN_USE(tmpbuf2); /* to suppress warning in case VMA_OPTIMIZE_LOG */
+		NOT_IN_USE(tmpbufsize); /* to suppress warning in case VMA_MAX_DEFINED_LOG_LEVEL */
+		NOT_IN_USE(tmpbuf); /* to suppress warning in case VMA_MAX_DEFINED_LOG_LEVEL */
+		NOT_IN_USE(tmpbuf2); /* to suppress warning in case VMA_MAX_DEFINED_LOG_LEVEL */
 		srdr_logfunc("readfds: %s, writefds: %s",
 			   sprintf_fdset(tmpbuf, tmpbufsize, __nfds, __readfds), 
 			   sprintf_fdset(tmpbuf2, tmpbufsize, __nfds, __writefds));
@@ -1416,9 +1678,9 @@ int select_helper(int __nfds,
 		if (g_vlogger_level >= VLOG_FUNC) {
 			const int tmpbufsize = 256;
 			char tmpbuf[tmpbufsize], tmpbuf2[tmpbufsize];
-			NOT_IN_USE(tmpbufsize); /* to suppress warning in case VMA_OPTIMIZE_LOG */
-			NOT_IN_USE(tmpbuf); /* to suppress warning in case VMA_OPTIMIZE_LOG */
-			NOT_IN_USE(tmpbuf2); /* to suppress warning in case VMA_OPTIMIZE_LOG */
+			NOT_IN_USE(tmpbufsize); /* to suppress warning in case VMA_MAX_DEFINED_LOG_LEVEL */
+			NOT_IN_USE(tmpbuf); /* to suppress warning in case VMA_MAX_DEFINED_LOG_LEVEL */
+			NOT_IN_USE(tmpbuf2); /* to suppress warning in case VMA_MAX_DEFINED_LOG_LEVEL */
 			srdr_logfunc_exit("readfds: %s, writefds: %s",
 				   sprintf_fdset(tmpbuf, tmpbufsize, __nfds, __readfds),
 				   sprintf_fdset(tmpbuf2, tmpbufsize, __nfds, __writefds));
@@ -1439,12 +1701,12 @@ int select(int __nfds,
 	   fd_set * __exceptfds,
 	   struct timeval * __timeout)
 {
-	BULLSEYE_EXCLUDE_BLOCK_START
-	if (!orig_os_api.select)	get_orig_funcs();
-	BULLSEYE_EXCLUDE_BLOCK_END
-
-	if (!g_p_fd_collection)
+	if (!g_p_fd_collection) {
+		BULLSEYE_EXCLUDE_BLOCK_START
+		if (!orig_os_api.select) get_orig_funcs();
+		BULLSEYE_EXCLUDE_BLOCK_END
 		return orig_os_api.select(__nfds, __readfds, __writefds, __exceptfds, __timeout);
+	}
 
 	if (__timeout) {
 		srdr_logfunc_entry("nfds=%d, timeout=(%d sec, %d usec)",
@@ -1464,12 +1726,12 @@ int pselect(int __nfds,
 	    const struct timespec *__timeout,
 	    const sigset_t *__sigmask)
 {
-	BULLSEYE_EXCLUDE_BLOCK_START
-	if (!orig_os_api.pselect) get_orig_funcs();
-	BULLSEYE_EXCLUDE_BLOCK_END
-
-	if (!g_p_fd_collection)
+	if (!g_p_fd_collection) {
+		BULLSEYE_EXCLUDE_BLOCK_START
+		if (!orig_os_api.pselect) get_orig_funcs();
+		BULLSEYE_EXCLUDE_BLOCK_END
 		return orig_os_api.pselect(__nfds, __readfds, __writefds, __errorfds, __timeout, __sigmask);
+	}
 
 	struct timeval select_time;
 	if (__timeout) {
@@ -1513,17 +1775,14 @@ int poll_helper(struct pollfd *__fds, nfds_t __nfds, int __timeout, const sigset
 extern "C"
 int poll(struct pollfd *__fds, nfds_t __nfds, int __timeout)
 {
-	BULLSEYE_EXCLUDE_BLOCK_START
-	if (!orig_os_api.poll)	get_orig_funcs();
-	BULLSEYE_EXCLUDE_BLOCK_END
-
-	if (!g_p_fd_collection)
+	if (!g_p_fd_collection) {
+		BULLSEYE_EXCLUDE_BLOCK_START
+		if (!orig_os_api.poll) get_orig_funcs();
+		BULLSEYE_EXCLUDE_BLOCK_END
 		return orig_os_api.poll(__fds, __nfds, __timeout);
+	}
 
-	if (__timeout == -1)
-		srdr_logfunc_entry("nfds=%d, timeout=(infinite)", __nfds);
-	else
-		srdr_logfunc_entry("nfds=%d, timeout=(%d milli-sec)", __nfds, __timeout);
+	srdr_logfunc_entry("nfds=%d, timeout=(%d milli-sec)", __nfds, __timeout);
 
 	return poll_helper(__fds, __nfds, __timeout);
 }
@@ -1531,20 +1790,17 @@ int poll(struct pollfd *__fds, nfds_t __nfds, int __timeout)
 extern "C"
 int ppoll(struct pollfd *__fds, nfds_t __nfds, const struct timespec *__timeout, const sigset_t *__sigmask)
 {
-	BULLSEYE_EXCLUDE_BLOCK_START
-	if (!orig_os_api.ppoll)	get_orig_funcs();
-	BULLSEYE_EXCLUDE_BLOCK_END
-
-	if (!g_p_fd_collection)
+	if (!g_p_fd_collection) {
+		BULLSEYE_EXCLUDE_BLOCK_START
+		if (!orig_os_api.ppoll) get_orig_funcs();
+		BULLSEYE_EXCLUDE_BLOCK_END
 		return orig_os_api.ppoll(__fds, __nfds, __timeout, __sigmask);
+	}
 
 	int timeout = (__timeout == NULL) ? -1 :
 	           (__timeout->tv_sec * 1000 + __timeout->tv_nsec / 1000000);
 
-	if (timeout == -1)
-		srdr_logfunc_entry("nfds=%d, timeout=(infinite)", __nfds);
-	else
-		srdr_logfunc_entry("nfds=%d, timeout=(%d milli-sec)", __nfds, timeout);
+	srdr_logfunc_entry("nfds=%d, timeout=(%d milli-sec)", __nfds, timeout);
 
 	return poll_helper(__fds, __nfds, timeout, __sigmask);
 }
@@ -1567,14 +1823,20 @@ void vma_epoll_create(int epfd, int size)
 extern "C"
 int epoll_create(int __size)
 {
+	DO_GLOBAL_CTORS();
+
+	if (__size <= 0 ) {
+		srdr_logdbg("invalid size (size=%d) - must be a positive integer\n", __size);
+		errno = EINVAL;
+		return -1;
+	}
+
 	BULLSEYE_EXCLUDE_BLOCK_START
-	if (!orig_os_api.epoll_create)	get_orig_funcs();
+	if (!orig_os_api.epoll_create) get_orig_funcs();
 	BULLSEYE_EXCLUDE_BLOCK_END
 
-	do_global_ctors();
-
 	int epfd = orig_os_api.epoll_create(__size + 1);  // +1 for the cq epfd
-	vlog_printf(VLOG_DEBUG, "ENTER: %s(size=%d) = %d\n",__func__, __size, epfd);
+	srdr_logdbg("ENTER: (size=%d) = %d\n", __size, epfd);
 
 	if (epfd <=0)
 		return epfd;
@@ -1587,14 +1849,14 @@ int epoll_create(int __size)
 extern "C"
 int epoll_create1(int __flags)
 {
+	DO_GLOBAL_CTORS();
+
 	BULLSEYE_EXCLUDE_BLOCK_START
 	if (!orig_os_api.epoll_create1) get_orig_funcs();
 	BULLSEYE_EXCLUDE_BLOCK_END
 
-	do_global_ctors();
-
 	int epfd = orig_os_api.epoll_create1(__flags);
-	vlog_printf(VLOG_DEBUG, "ENTER: %s(flags=%d) = %d\n",__func__, __flags, epfd);
+	srdr_logdbg("ENTER: (flags=%d) = %d\n", __flags, epfd);
 
 	if (epfd <=0)
 		return epfd;
@@ -1613,17 +1875,13 @@ int epoll_create1(int __flags)
 extern "C"
 int epoll_ctl(int __epfd, int __op, int __fd, struct epoll_event *__event)
 {
-	BULLSEYE_EXCLUDE_BLOCK_START
-	if (!orig_os_api.epoll_ctl) get_orig_funcs();
-	BULLSEYE_EXCLUDE_BLOCK_END
-
 	const static char * op_names[] = {
 	     "<null>",
 	     "ADD",
 	     "DEL",
 	     "MOD"
 	};
-	NOT_IN_USE(op_names); /* to suppress warning in case VMA_OPTIMIZE_LOG */
+	NOT_IN_USE(op_names); /* to suppress warning in case VMA_MAX_DEFINED_LOG_LEVEL */
 	if (__event) {
 		srdr_logfunc_entry("epfd=%d, op=%s, fd=%d, events=%#x, data=%x", 
 			__epfd, op_names[__op], __fd, __event->events, __event->data.u64);
@@ -1686,14 +1944,7 @@ inline int epoll_wait_helper(int __epfd, struct epoll_event *__events, int __max
 extern "C"
 int epoll_wait(int __epfd, struct epoll_event *__events, int __maxevents, int __timeout)
 {
-	BULLSEYE_EXCLUDE_BLOCK_START
-	if (!orig_os_api.epoll_wait) get_orig_funcs();
-	BULLSEYE_EXCLUDE_BLOCK_END
-
-	if (__timeout == -1)
-		srdr_logfunc_entry("epfd=%d, maxevents=%d, timeout=(infinite)", __epfd, __maxevents);
-	else
-		srdr_logfunc_entry("epfd=%d, maxevents=%d, timeout=(%d milli-sec)", __epfd, __maxevents, __timeout);
+	srdr_logfunc_entry("epfd=%d, maxevents=%d, timeout=(%d milli-sec)", __epfd, __maxevents, __timeout);
 
 	return epoll_wait_helper(__epfd, __events, __maxevents, __timeout);
 }
@@ -1701,14 +1952,7 @@ int epoll_wait(int __epfd, struct epoll_event *__events, int __maxevents, int __
 extern "C"
 int epoll_pwait(int __epfd, struct epoll_event *__events, int __maxevents, int __timeout, const sigset_t *__sigmask)
 {
-	BULLSEYE_EXCLUDE_BLOCK_START
-	if (!orig_os_api.epoll_pwait) get_orig_funcs();
-	BULLSEYE_EXCLUDE_BLOCK_END
-
-	if (__timeout == -1)
-		srdr_logfunc_entry("epfd=%d, maxevents=%d, timeout=(infinite)", __epfd, __maxevents);
-	else
-		srdr_logfunc_entry("epfd=%d, maxevents=%d, timeout=(%d milli-sec)", __epfd, __maxevents, __timeout);
+	srdr_logfunc_entry("epfd=%d, maxevents=%d, timeout=(%d milli-sec)", __epfd, __maxevents, __timeout);
 
 	return epoll_wait_helper(__epfd, __events, __maxevents, __timeout, __sigmask);
 }
@@ -1726,7 +1970,7 @@ int socketpair(int __domain, int __type, int __protocol, int __sv[2])
 
 	int ret = orig_os_api.socketpair(__domain, __type, __protocol, __sv);
 
-	vlog_printf(VLOG_DEBUG, MODULE_HDR_ENTRY "%s(domain=%s(%d) type=%s(%d) protocol=%d, fd[%d,%d]) = %d\n", __func__, socket_get_domain_str(__domain), __domain, socket_get_type_str(__type), __type, __protocol, __sv[0], __sv[1], ret);
+	srdr_logdbg("(domain=%s(%d) type=%s(%d) protocol=%d, fd[%d,%d]) = %d\n", socket_get_domain_str(__domain), __domain, socket_get_type_str(__type), __type, __protocol, __sv[0], __sv[1], ret);
 
 	// Sanity check to remove any old sockinfo object using the same fd!!
 	if (ret == 0 && g_p_fd_collection) {
@@ -1744,17 +1988,17 @@ int socketpair(int __domain, int __type, int __protocol, int __sv[2])
 extern "C"
 int pipe(int __filedes[2])
 {
+	bool offload_pipe = safe_mce_sys().mce_spec == MCE_SPEC_29WEST_LBM_29 ||
+			    safe_mce_sys().mce_spec == MCE_SPEC_WOMBAT_FH_LBM_554;
+	if (offload_pipe)
+		DO_GLOBAL_CTORS();
+
 	BULLSEYE_EXCLUDE_BLOCK_START
 	if (!orig_os_api.pipe) get_orig_funcs();
 	BULLSEYE_EXCLUDE_BLOCK_END
 
-	bool offload_pipe = safe_mce_sys().mce_spec == MCE_SPEC_29WEST_LBM_29 ||
-			    safe_mce_sys().mce_spec == MCE_SPEC_WOMBAT_FH_LBM_554;
-	if (offload_pipe)
-		do_global_ctors();
-
 	int ret = orig_os_api.pipe(__filedes);
-	vlog_printf(VLOG_DEBUG, MODULE_HDR_ENTRY "%s(fd[%d,%d]) = %d\n", __func__, __filedes[0], __filedes[1], ret);
+	srdr_logdbg("(fd[%d,%d]) = %d\n", __filedes[0], __filedes[1], ret);
 
 	if (ret == 0 && g_p_fd_collection) {
 		// Sanity check to remove any old sockinfo object using the same fd!!
@@ -1774,17 +2018,18 @@ int pipe(int __filedes[2])
 extern "C"
 int open(__const char *__file, int __oflag, ...)
 {
+	va_list va;
+	va_start(va, __oflag);
+	mode_t mode = va_arg(va, mode_t);
+
 	BULLSEYE_EXCLUDE_BLOCK_START
 	if (!orig_os_api.open) get_orig_funcs();
 	BULLSEYE_EXCLUDE_BLOCK_END
 
-	va_list va;
-	va_start(va, __oflag);
-	mode_t mode = va_arg(va, mode_t);
 	int fd = orig_os_api.open(__file, __oflag, mode);
 	va_end(va);
 
-	vlog_printf(VLOG_DEBUG, MODULE_HDR_ENTRY "%s(file=%s, flags=%#x, mode=%#x) = %d\n", __func__, __file, __oflag, mode, fd);
+	srdr_logdbg("(file=%s, flags=%#x, mode=%#x) = %d\n", __file, __oflag, mode, fd);
 
 	// Sanity check to remove any old sockinfo object using the same fd!!
 	handle_close(fd, true);
@@ -1801,7 +2046,7 @@ int creat(const char *__pathname, mode_t __mode)
 
 	int fd = orig_os_api.creat(__pathname, __mode);
 
-	vlog_printf(VLOG_DEBUG, MODULE_HDR_ENTRY "%s(pathname=%s, mode=%#x) = %d\n", __func__, __pathname, __mode, fd);
+	srdr_logdbg("(pathname=%s, mode=%#x) = %d\n", __pathname, __mode, fd);
 
 	// Sanity check to remove any old sockinfo object using the same fd!!
 	handle_close(fd, true);
@@ -1819,7 +2064,7 @@ int dup(int __fd)
 
 	int fid = orig_os_api.dup(__fd);
 
-	vlog_printf(VLOG_DEBUG, MODULE_HDR_ENTRY "%s(fd=%d) = %d\n", __func__, __fd, fid);
+	srdr_logdbg("(fd=%d) = %d\n", __fd, fid);
 
 	// Sanity check to remove any old sockinfo object using the same fd!!
 	handle_close(fid, true);
@@ -1831,18 +2076,18 @@ int dup(int __fd)
 extern "C"
 int dup2(int __fd, int __fd2)
 {
-	BULLSEYE_EXCLUDE_BLOCK_START
-	if (!orig_os_api.dup2) get_orig_funcs();
-	BULLSEYE_EXCLUDE_BLOCK_END
-
 	if (safe_mce_sys().close_on_dup2 && __fd != __fd2) {
 		srdr_logdbg("oldfd=%d, newfd=%d. Closing %d in VMA.\n", __fd, __fd2, __fd2);
 		handle_close(__fd2);
 	}
 
+	BULLSEYE_EXCLUDE_BLOCK_START
+	if (!orig_os_api.dup2) get_orig_funcs();
+	BULLSEYE_EXCLUDE_BLOCK_END
+
 	int fid = orig_os_api.dup2(__fd, __fd2);
 
-	vlog_printf(VLOG_DEBUG, MODULE_HDR_ENTRY "%s(fd=%d, fd2=%d) = %d\n", __func__, __fd, __fd2, fid);
+	srdr_logdbg("(fd=%d, fd2=%d) = %d\n",  __fd, __fd2, fid);
 
 	// Sanity check to remove any old sockinfo object using the same fd!!
 	handle_close(fid, true);
@@ -1854,8 +2099,12 @@ int dup2(int __fd, int __fd2)
 extern "C"
 int clone(int (*__fn)(void *), void *__child_stack, int __flags, void *__arg)
 {
-	if (!orig_os_api.clone) get_orig_funcs();
 	srdr_logfunc_entry("flags=%#x", __flags);
+
+	BULLSEYE_EXCLUDE_BLOCK_START
+	if (!orig_os_api.clone) get_orig_funcs();
+	BULLSEYE_EXCLUDE_BLOCK_END
+
 	return orig_os_api.clone(__fn, __child_stack, __flags, __arg);
 }
 #endif
@@ -1867,11 +2116,7 @@ int clone(int (*__fn)(void *), void *__child_stack, int __flags, void *__arg)
 extern "C"
 pid_t fork(void)
 {
-	BULLSEYE_EXCLUDE_BLOCK_START
-	if (!orig_os_api.fork) get_orig_funcs();
-	BULLSEYE_EXCLUDE_BLOCK_END
-
-	vlog_printf(VLOG_DEBUG, "ENTER: ***** %s *****\n", __func__);
+	srdr_logdbg("ENTER: **********\n");
 
 	if (!g_init_global_ctors_done) {
 		set_env_params();
@@ -1879,7 +2124,11 @@ pid_t fork(void)
 	}
 
 	if (!g_init_ibv_fork_done)
-		vlog_printf(VLOG_DEBUG, "ERROR: ibv_fork_init failed, the effect of an application calling fork() is undefined!!\n");
+		srdr_logdbg("ERROR: ibv_fork_init failed, the effect of an application calling fork() is undefined!!\n");
+
+	BULLSEYE_EXCLUDE_BLOCK_START
+	if (!orig_os_api.fork) get_orig_funcs();
+	BULLSEYE_EXCLUDE_BLOCK_END
 
 	pid_t pid = orig_os_api.fork();
 	if (pid == 0) {
@@ -1897,6 +2146,10 @@ pid_t fork(void)
 
 		safe_mce_sys().get_env_params();
 		vlog_start("VMA", safe_mce_sys().log_level, safe_mce_sys().log_filename, safe_mce_sys().log_details, safe_mce_sys().log_colors);
+		if (vma_rdma_lib_reset()) {
+			srdr_logerr("Child Process: rdma_lib_reset failed %m",
+					errno);
+		}
 		srdr_logdbg_exit("Child Process: starting with %d", getpid());
 		g_is_forked_child = false;
 		sock_redirect_main();
@@ -1924,15 +2177,16 @@ pid_t vfork(void)
 extern "C"
 int daemon(int __nochdir, int __noclose)
 {
-	BULLSEYE_EXCLUDE_BLOCK_START
-	if (!orig_os_api.daemon) get_orig_funcs();
-	BULLSEYE_EXCLUDE_BLOCK_END
-	vlog_printf(VLOG_DEBUG, "ENTER: ***** %s(%d, %d) *****\n", __func__, __nochdir, __noclose);
+	srdr_logdbg("ENTER: ***** (%d, %d) *****\n", __nochdir, __noclose);
 
 	if (!g_init_global_ctors_done) {
 		set_env_params();
 		prepare_fork();
 	}
+
+	BULLSEYE_EXCLUDE_BLOCK_START
+	if (!orig_os_api.daemon) get_orig_funcs();
+	BULLSEYE_EXCLUDE_BLOCK_END
 
 	int ret = orig_os_api.daemon(__nochdir, __noclose);
 	if (ret == 0) {
@@ -1950,6 +2204,10 @@ int daemon(int __nochdir, int __noclose)
 
 		safe_mce_sys().get_env_params();
 		vlog_start("VMA", safe_mce_sys().log_level, safe_mce_sys().log_filename, safe_mce_sys().log_details, safe_mce_sys().log_colors);
+		if (vma_rdma_lib_reset()) {
+			srdr_logerr("Child Process: rdma_lib_reset failed %m",
+					errno);
+		}
 		srdr_logdbg_exit("Child Process: starting with %d", getpid());
 		g_is_forked_child = false;
 		sock_redirect_main();
@@ -1965,10 +2223,10 @@ static void handler_intr(int sig)
 	switch (sig) {
 	case SIGINT:
 		g_b_exit = true;
-		vlog_printf(VLOG_DEBUG, "Catch Signal: SIGINT (%d)\n", sig);
+		srdr_logdbg("Catch Signal: SIGINT (%d)\n", sig);
 		break;
 	default:
-		vlog_printf(VLOG_DEBUG, "Catch Signal: %d\n", sig);
+		srdr_logdbg("Catch Signal: %d\n", sig);
 		break;
 	}
 
@@ -1981,7 +2239,9 @@ int sigaction(int signum, const struct sigaction *act, struct sigaction *oldact)
 {
 	int ret = 0;
 
+	BULLSEYE_EXCLUDE_BLOCK_START
 	if (!orig_os_api.sigaction) get_orig_funcs();
+	BULLSEYE_EXCLUDE_BLOCK_END
 
 	if (safe_mce_sys().handle_sigintr) {
 		srdr_logdbg_entry("signum=%d, act=%p, oldact=%p", signum, act, oldact);
@@ -2000,10 +2260,10 @@ int sigaction(int signum, const struct sigaction *act, struct sigaction *oldact)
 				ret = orig_os_api.sigaction(SIGINT, &vma_action, NULL);
 
 				if (ret < 0) {
-					vlog_printf(VLOG_DEBUG, "Failed to register VMA SIGINT handler, calling to original sigaction handler\n");
+					srdr_logdbg("Failed to register VMA SIGINT handler, calling to original sigaction handler\n");
 					break;
 				}
-				vlog_printf(VLOG_DEBUG, "Registered VMA SIGINT handler\n");
+				srdr_logdbg("Registered VMA SIGINT handler\n");
 				g_act_prev = *act;
 			}
 			if (ret >= 0)

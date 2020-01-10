@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2001-2016 Mellanox Technologies, Ltd. All rights reserved.
+ * Copyright (c) 2001-2017 Mellanox Technologies, Ltd. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -103,7 +103,7 @@ public:
 	/**
 	 * Prepare to poll on fds
 	 */
-	virtual void prepare_to_poll() = 0;
+	virtual void prepare_to_poll() {};
 
 	/**
 	 * Prepare to block on fds.
@@ -173,7 +173,7 @@ public:
 
 	virtual void check_offloaded_rsockets(uint64_t *p_poll_sn);
 
-	virtual bool immidiate_return();
+	virtual bool immidiate_return(int &poll_os_countdown);
 	/**
 	 * @class io_error
 	 * Exception by OS IO functions.
@@ -252,6 +252,8 @@ protected:
 	virtual int ring_request_notification(uint64_t poll_sn);
 
 	virtual int ring_wait_for_notification_and_process_element(uint64_t *p_poll_sn, void* pv_fd_ready_array = NULL);
+
+	virtual bool handle_os_countdown(int &poll_os_countdown);
 
 	/// Pointer to an array of all offloaded fd's
 	int	*m_p_all_offloaded_fds;

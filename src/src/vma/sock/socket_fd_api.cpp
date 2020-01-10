@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2001-2016 Mellanox Technologies, Ltd. All rights reserved.
+ * Copyright (c) 2001-2017 Mellanox Technologies, Ltd. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -31,12 +31,14 @@
  */
 
 
-#include "socket_fd_api.h"
-#include "sock-redirect.h"
+#include <sys/epoll.h>
 
 #include <vma/iomux/epfd_info.h>
 #include <vlogger/vlogger.h>
-#include <sys/epoll.h>
+#include "utils/bullseye.h"
+#include "sock-redirect.h"
+
+#include "socket_fd_api.h"
 
 #define MODULE_NAME 		"sapi"
 #undef  MODULE_HDR_INFO
@@ -155,7 +157,7 @@ int socket_fd_api::getpeername(sockaddr *__name, socklen_t *__namelen)
 }
 
 int socket_fd_api::setsockopt(int __level, int __optname,
-			      __const void *__optval, socklen_t __optlen) throw (vma_error)
+			      __const void *__optval, socklen_t __optlen)
 {
 	__log_info_func("");
 	int ret = orig_os_api.setsockopt(m_fd, __level, __optname, __optval, __optlen);
@@ -166,7 +168,7 @@ int socket_fd_api::setsockopt(int __level, int __optname,
 }
 
 int socket_fd_api::getsockopt(int __level, int __optname, void *__optval,
-			      socklen_t *__optlen) throw (vma_error)
+			      socklen_t *__optlen)
 {
 	__log_info_func("");
 	int ret = orig_os_api.getsockopt(m_fd, __level, __optname, __optval, __optlen);
@@ -227,33 +229,21 @@ bool socket_fd_api::is_errorable(int *errors)
 	return false;
 }
 
-#if _BullseyeCoverage
-    #pragma BullseyeCoverage off
-#endif
 void socket_fd_api::statistics_print(vlog_levels_t log_level /* = VLOG_DEBUG */)
 {
-	int epoll_fd;
-	epoll_fd_rec epoll_fd_rec;
-
-	// Prepare data
-	if ((epoll_fd = socket_fd_api::get_epoll_context_fd())) {
-		m_econtext->get_fd_rec_by_fd(m_fd, epoll_fd_rec);
-	}
+	int epoll_fd = get_epoll_context_fd();
 
 	// Socket data
 	vlog_printf(log_level, "Fd number : %d\n", m_fd);
 	if (epoll_fd) {
 		vlog_printf(log_level, "Socket epoll Fd : %d\n", epoll_fd);
-		vlog_printf(log_level, "Socket epoll flags : 0x%x\n", epoll_fd_rec.events);
+		vlog_printf(log_level, "Socket epoll flags : 0x%x\n", m_fd_rec.events);
 	}
 
 }
-#if _BullseyeCoverage
-    #pragma BullseyeCoverage on
-#endif
 
 ssize_t socket_fd_api::rx_os(const rx_call_t call_type, iovec* p_iov,
-			     ssize_t sz_iov, int* p_flags, sockaddr *__from,
+			     ssize_t sz_iov, const int flags, sockaddr *__from,
 			     socklen_t *__fromlen, struct msghdr *__msg)
 {
 	errno = 0;
@@ -269,16 +259,16 @@ ssize_t socket_fd_api::rx_os(const rx_call_t call_type, iovec* p_iov,
 	case RX_RECV:
 		__log_info_func("calling os receive with orig recv");
 		return orig_os_api.recv(m_fd, p_iov[0].iov_base, p_iov[0].iov_len,
-		                        *p_flags);
+		                        flags);
 
 	case RX_RECVFROM:
 		__log_info_func("calling os receive with orig recvfrom");
 		return orig_os_api.recvfrom(m_fd, p_iov[0].iov_base, p_iov[0].iov_len,
-		                            *p_flags, __from, __fromlen);
+		                            flags, __from, __fromlen);
 
 	case RX_RECVMSG: {
 		__log_info_func("calling os receive with orig recvmsg");
-		return orig_os_api.recvmsg(m_fd, __msg, *p_flags);
+		return orig_os_api.recvmsg(m_fd, __msg, flags);
 		}
 	}
 	return (ssize_t) -1;
@@ -290,6 +280,13 @@ ssize_t socket_fd_api::tx_os(const tx_call_t call_type,
 			     const socklen_t __tolen)
 {
 	errno = 0;
+
+	// Ignore dummy messages for OS
+	if (unlikely(IS_DUMMY_PACKET(__flags))) {
+		errno = EINVAL;
+		return -1;
+	}
+
 	switch (call_type) {
 	case TX_WRITE:
 		__log_info_func("calling os transmit with orig write");
@@ -345,13 +342,29 @@ int socket_fd_api::free_packets(struct vma_packet_t *pkts, size_t count)
 	return -1;
 }
 
+#ifdef DEFINED_VMAPOLL 
+int socket_fd_api::free_buffs(uint16_t len)
+{
+	NOT_IN_USE(len);
+	return -1;
+}
+#endif // DEFINED_VMAPOLL 
+
 #if _BullseyeCoverage
     #pragma BullseyeCoverage on
 #endif
 
-void socket_fd_api::add_epoll_context(epfd_info *epfd)
+int socket_fd_api::add_epoll_context(epfd_info *epfd)
 {
-	if(!m_econtext) m_econtext = epfd;
+	if (!m_econtext) {
+		// This socket is not registered to any epfd
+		m_econtext = epfd;
+		return 0;
+	} else {
+		// Currently VMA does not support more then 1 epfd listed
+		errno = (m_econtext == epfd) ? EEXIST : ENOMEM;
+		return -1;
+	}
 }
 
 void socket_fd_api::remove_epoll_context(epfd_info *epfd)
@@ -363,7 +376,7 @@ void socket_fd_api::remove_epoll_context(epfd_info *epfd)
 void socket_fd_api::notify_epoll_context(uint32_t events)
 {
 	if (m_econtext) {
-		m_econtext->insert_epoll_event_cb(m_fd, events);
+		m_econtext->insert_epoll_event_cb(this, events);
 	}
 }
 
@@ -389,7 +402,7 @@ bool socket_fd_api::notify_epoll_context_verify(epfd_info *epfd)
 void socket_fd_api::notify_epoll_context_fd_is_offloaded()
 {
 	if (m_econtext) {
-		m_econtext->set_fd_as_offloaded_only(m_fd);
+		m_econtext->remove_fd_from_epoll_os(m_fd);
 	}
 }
 

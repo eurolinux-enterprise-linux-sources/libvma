@@ -51,12 +51,9 @@ void register_sys_now(sys_now_fn fn);
 extern u16_t lwip_tcp_mss;
 
 #if LWIP_3RD_PARTY_L3
-typedef err_t (*ip_output_fn)(struct pbuf *p, void* p_conn, int is_rexmit);
+typedef err_t (*ip_output_fn)(struct pbuf *p, void* p_conn, int is_rexmit, u8_t is_dummy);
           
 void register_ip_output(ip_output_fn fn);
-
-typedef u16_t (*ip_route_mtu_fn)(ip_addr_t *dest);
-void register_ip_route_mtu(ip_route_mtu_fn fn);
 
 #endif
 
@@ -364,12 +361,14 @@ struct tcp_pcb {
   struct tcp_seg *unsent;   /* Unsent (queued) segments. */
   struct tcp_seg *last_unsent;   /* Last unsent (queued) segment. */
   struct tcp_seg *unacked;  /* Sent but unacknowledged segments. */
-  struct tcp_seg *last_unacked;  /* Lase element in unacknowledged segments list. */
+  struct tcp_seg *last_unacked;  /* Last element in unacknowledged segments list. */
 #if TCP_QUEUE_OOSEQ  
   struct tcp_seg *ooseq;    /* Received out of sequence segments. */
 #endif /* TCP_QUEUE_OOSEQ */
 
   struct pbuf *refused_data; /* Data previously received but not yet taken by upper layer */
+  struct tcp_seg *seg_alloc; /* Available tcp_seg element for use */
+  struct pbuf *pbuf_alloc; /* Available pbuf element for use */
 
 #if LWIP_CALLBACK_API
   /* Function to be called when more send buffer space is available. */
@@ -416,7 +415,13 @@ struct tcp_pcb {
   u8_t accepts_pending;
 #endif /* TCP_LISTEN_BACKLOG */
 #endif /* VMA_NO_TCP_PCB_LISTEN_STRUCT */
+
+  /* Delayed ACK control: number of quick acks */
+  u8_t quickack;
 };
+
+typedef u16_t (*ip_route_mtu_fn)(struct tcp_pcb *pcb);
+void register_ip_route_mtu(ip_route_mtu_fn fn);
 
 #ifdef VMA_NO_TCP_PCB_LISTEN_STRUCT
 #define tcp_pcb_listen tcp_pcb
@@ -506,7 +511,7 @@ err_t            tcp_shutdown(struct tcp_pcb *pcb, int shut_rx, int shut_tx);
 #define TCP_WRITE_FLAG_MORE 0x02
 
 err_t            tcp_write   (struct tcp_pcb *pcb, const void *dataptr, u32_t len,
-                              u8_t apiflags);
+                              u8_t is_dummy);
 
 void             tcp_setprio (struct tcp_pcb *pcb, u8_t prio);
 
@@ -516,6 +521,7 @@ void             tcp_setprio (struct tcp_pcb *pcb, u8_t prio);
 
 err_t            tcp_output  (struct tcp_pcb *pcb);
 
+s32_t            tcp_is_wnd_available(struct tcp_pcb *pcb, u32_t data_len);
 
 #define get_tcp_state(pcb) ((pcb)->private_state)
 #define set_tcp_state(pcb, state) external_tcp_state_observer((pcb)->my_container, (pcb)->private_state = state)

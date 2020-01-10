@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2001-2016 Mellanox Technologies, Ltd. All rights reserved.
+ * Copyright (c) 2001-2017 Mellanox Technologies, Ltd. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -34,6 +34,7 @@
 #include "vma/dev/rfs_uc_tcp_gro.h"
 #include "vma/dev/gro_mgr.h"
 #include "vma/dev/ring_simple.h"
+#include "vma/proto/route_rule_table_key.h"
 
 #define MODULE_NAME 		"rfs_uc_tcp_gro"
 
@@ -42,17 +43,20 @@
 #define TCP_H_LEN_TIMESTAMP 8
 
 
-rfs_uc_tcp_gro::rfs_uc_tcp_gro(flow_tuple *flow_spec_5t, ring_simple *p_ring, rfs_rule_filter* rule_filter /*= NULL*/) : rfs_uc(flow_spec_5t, p_ring, rule_filter), m_p_gro_mgr(&(p_ring->m_gro_mgr)), m_b_active(false), m_b_reserved(false)
+rfs_uc_tcp_gro::rfs_uc_tcp_gro(flow_tuple *flow_spec_5t, ring_simple *p_ring, rfs_rule_filter* rule_filter, uint32_t flow_tag_id) :
+	rfs_uc(flow_spec_5t, p_ring, rule_filter, flow_tag_id),
+	m_p_gro_mgr(&(p_ring->m_gro_mgr)), m_b_active(false), m_b_reserved(false)
 {
 	m_n_buf_max = m_p_gro_mgr->get_buf_max();
-	m_n_byte_max = m_p_gro_mgr->get_byte_max() - p_ring->get_mtu(); 
+	uint32_t mtu = p_ring->get_mtu(route_rule_table_key(flow_spec_5t->get_dst_ip(), flow_spec_5t->get_src_ip(), 0));
+	m_n_byte_max = m_p_gro_mgr->get_byte_max() - mtu;
 	memset(&m_gro_desc, 0, sizeof(m_gro_desc));
 }
 
 bool rfs_uc_tcp_gro::rx_dispatch_packet(mem_buf_desc_t* p_rx_pkt_mem_buf_desc_info, void* pv_fd_ready_array /* = NULL */)
 {
-	struct iphdr* p_ip_h = p_rx_pkt_mem_buf_desc_info->path.rx.p_ip_h;
-	struct tcphdr* p_tcp_h = p_rx_pkt_mem_buf_desc_info->path.rx.p_tcp_h;
+	struct iphdr* p_ip_h = p_rx_pkt_mem_buf_desc_info->rx.tcp.p_ip_h;
+	struct tcphdr* p_tcp_h = p_rx_pkt_mem_buf_desc_info->rx.tcp.p_tcp_h;
 
 	if (!m_b_active) {
 		if (!m_b_reserved && m_p_gro_mgr->is_stream_max()) {
@@ -100,8 +104,8 @@ out:
 void rfs_uc_tcp_gro::add_packet(mem_buf_desc_t* mem_buf_desc, struct iphdr* p_ip_h, tcphdr* p_tcp_h)
 {
 	m_gro_desc.buf_count++;
-	m_gro_desc.ip_tot_len += mem_buf_desc->path.rx.sz_payload;
-	m_gro_desc.next_seq += mem_buf_desc->path.rx.sz_payload;
+	m_gro_desc.ip_tot_len += mem_buf_desc->rx.sz_payload;
+	m_gro_desc.next_seq += mem_buf_desc->rx.sz_payload;
 	m_gro_desc.wnd = p_tcp_h->window;
 	m_gro_desc.ack = p_tcp_h->ack_seq;
 
@@ -114,11 +118,11 @@ void rfs_uc_tcp_gro::add_packet(mem_buf_desc_t* mem_buf_desc, struct iphdr* p_ip
 	mem_buf_desc->reset_ref_count();
 
 	mem_buf_desc->lwip_pbuf.pbuf.flags = PBUF_FLAG_IS_CUSTOM;
-	mem_buf_desc->lwip_pbuf.pbuf.len = mem_buf_desc->lwip_pbuf.pbuf.tot_len = mem_buf_desc->path.rx.sz_payload;
+	mem_buf_desc->lwip_pbuf.pbuf.len = mem_buf_desc->lwip_pbuf.pbuf.tot_len = mem_buf_desc->rx.sz_payload;
 	mem_buf_desc->lwip_pbuf.pbuf.ref = 1;
 	mem_buf_desc->lwip_pbuf.pbuf.type = PBUF_REF;
 	mem_buf_desc->lwip_pbuf.pbuf.next = NULL;
-	mem_buf_desc->lwip_pbuf.pbuf.payload = (u8_t *)mem_buf_desc->p_buffer + mem_buf_desc->transport_header_len + ntohs(p_ip_h->tot_len) - mem_buf_desc->path.rx.sz_payload;
+	mem_buf_desc->lwip_pbuf.pbuf.payload = (u8_t *)mem_buf_desc->p_buffer + mem_buf_desc->rx.tcp.n_transport_header_len + ntohs(p_ip_h->tot_len) - mem_buf_desc->rx.sz_payload;
 
 
 	m_gro_desc.p_last->lwip_pbuf.pbuf.next = &(mem_buf_desc->lwip_pbuf.pbuf);
@@ -153,14 +157,14 @@ void rfs_uc_tcp_gro::flush_gro_desc(void* pv_fd_ready_array)
 			p_tcp_ts_h->popts[2] = m_gro_desc.tsecr;
 		}
 
-		m_gro_desc.p_first->path.rx.gro = 1;
+		m_gro_desc.p_first->rx.tcp.gro = 1;
 
 		m_gro_desc.p_first->lwip_pbuf.pbuf.flags = PBUF_FLAG_IS_CUSTOM;
-		m_gro_desc.p_first->lwip_pbuf.pbuf.tot_len = m_gro_desc.p_first->lwip_pbuf.pbuf.len = (m_gro_desc.p_first->sz_data - m_gro_desc.p_first->transport_header_len);
+		m_gro_desc.p_first->lwip_pbuf.pbuf.tot_len = m_gro_desc.p_first->lwip_pbuf.pbuf.len = (m_gro_desc.p_first->sz_data - m_gro_desc.p_first->rx.tcp.n_transport_header_len);
 		m_gro_desc.p_first->lwip_pbuf.pbuf.ref = 1;
 		m_gro_desc.p_first->lwip_pbuf.pbuf.type = PBUF_REF;
-		m_gro_desc.p_first->lwip_pbuf.pbuf.payload = (u8_t *)(m_gro_desc.p_first->p_buffer + m_gro_desc.p_first->transport_header_len);
-		m_gro_desc.p_first->path.rx.is_vma_thr = m_gro_desc.p_last->path.rx.is_vma_thr;
+		m_gro_desc.p_first->lwip_pbuf.pbuf.payload = (u8_t *)(m_gro_desc.p_first->p_buffer + m_gro_desc.p_first->rx.tcp.n_transport_header_len);
+		m_gro_desc.p_first->rx.is_vma_thr = m_gro_desc.p_last->rx.is_vma_thr;
 
 		for (mem_buf_desc_t* p_desc = m_gro_desc.p_last; p_desc != m_gro_desc.p_first; p_desc = p_desc->p_prev_desc) {
 			p_desc->p_prev_desc->lwip_pbuf.pbuf.tot_len += p_desc->lwip_pbuf.pbuf.tot_len;
@@ -189,7 +193,7 @@ void rfs_uc_tcp_gro::init_gro_desc(mem_buf_desc_t* mem_buf_desc, iphdr* p_ip_h, 
 	m_gro_desc.p_tcp_h = p_tcp_h;
 	m_gro_desc.ip_tot_len = ntohs(p_ip_h->tot_len);
 	m_gro_desc.ack = p_tcp_h->ack_seq;
-	m_gro_desc.next_seq = ntohl(p_tcp_h->seq) + mem_buf_desc->path.rx.sz_payload;
+	m_gro_desc.next_seq = ntohl(p_tcp_h->seq) + mem_buf_desc->rx.sz_payload;
 	m_gro_desc.wnd = p_tcp_h->window;
 	m_gro_desc.ts_present = 0;
 	if (p_tcp_h->doff == TCP_H_LEN_TIMESTAMP) {
@@ -203,7 +207,7 @@ void rfs_uc_tcp_gro::init_gro_desc(mem_buf_desc_t* mem_buf_desc, iphdr* p_ip_h, 
 bool rfs_uc_tcp_gro::tcp_ip_check(mem_buf_desc_t* mem_buf_desc, iphdr* p_ip_h, tcphdr* p_tcp_h)
 {
 
-	if (mem_buf_desc->path.rx.sz_payload == 0) {
+	if (mem_buf_desc->rx.sz_payload == 0) {
 		return false;
 	}
 

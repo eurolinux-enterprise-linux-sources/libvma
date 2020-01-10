@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2001-2016 Mellanox Technologies, Ltd. All rights reserved.
+ * Copyright (c) 2001-2017 Mellanox Technologies, Ltd. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -47,8 +47,8 @@ public:
 
 	virtual void clean_obj();
 
-	int	fcntl(int __cmd, unsigned long int __arg) throw (vma_error);
-	int 	ioctl(unsigned long int __request, unsigned long int __arg) throw (vma_error);
+	int	fcntl(int __cmd, unsigned long int __arg);
+	int 	ioctl(unsigned long int __request, unsigned long int __arg);
 
 	// Process a Rx request, we might have a ready packet, or we might block until
 	// we have one (if sockinfo::m_b_blocking == true)

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2001-2016 Mellanox Technologies, Ltd. All rights reserved.
+ * Copyright (c) 2001-2017 Mellanox Technologies, Ltd. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -121,10 +121,6 @@ int get_base_interface_name(const char *if_name, char *base_ifname, size_t sz_ba
 			if (!strcmp(ifa->ifa_name, if_name)) {
 				continue;
 			}
-			if (ifa->ifa_flags & IFF_SLAVE) {
-				//bond slave
-				continue;
-			}
 
 			if (strstr(ifa->ifa_name, ":")) {
 				//alias
@@ -144,7 +140,8 @@ int get_base_interface_name(const char *if_name, char *base_ifname, size_t sz_ba
 				if (ADDR_LEN == ETH_ALEN) size_to_compare = ETH_ALEN;
 				else size_to_compare = IPOIB_HW_ADDR_GID_LEN;
 				int offset = ADDR_LEN - size_to_compare;
-				if (0 == memcmp(vlan_if_address + offset, tmp_mac + offset, size_to_compare)) {
+				if (0 == memcmp(vlan_if_address + offset, tmp_mac + offset, size_to_compare) && 0 == (ifa->ifa_flags & IFF_MASTER)) {
+					// A bond name cannot be a base name of an interface even if both have the same MAC(ethernet) or GID(IB) addresses
 					snprintf(base_ifname, sz_base_ifname, "%s" ,ifa->ifa_name);
 					freeifaddrs(ifaddr);
 					__log_dbg("Found base_ifname %s for interface %s", base_ifname, if_name);
@@ -218,13 +215,17 @@ unsigned short compute_tcp_checksum(const struct iphdr *p_iphdr, const uint16_t 
  *
  * (assume checksum field in UDP header contains zero)
  * This code borrows from other places and their ideas.
+ * Although according to rfc 768, If the computed checksum is zero, it is transmitted as all ones -
+ * this method will return the original value.
  */
-
-unsigned short compute_udp_checksum(const struct iphdr *p_iphdr, const uint16_t *p_ip_payload)
+unsigned short compute_udp_checksum_rx(const struct iphdr *p_iphdr, const struct udphdr *udphdrp, mem_buf_desc_t* p_rx_wc_buf_desc)
 {
     register unsigned long sum = 0;
-    struct udphdr *udphdrp = (struct udphdr*)(p_ip_payload);
     unsigned short udp_len = htons(udphdrp->len);
+    const uint16_t *p_ip_payload = (const uint16_t *) udphdrp;
+    mem_buf_desc_t *p_ip_frag = p_rx_wc_buf_desc;
+    unsigned short ip_frag_len = p_ip_frag->rx.frag.iov_len + sizeof(struct udphdr);
+    unsigned short ip_frag_remainder = ip_frag_len;
 
     //add the pseudo header
     sum += (p_iphdr->saddr >> 16) & 0xFFFF;
@@ -239,21 +240,34 @@ unsigned short compute_udp_checksum(const struct iphdr *p_iphdr, const uint16_t 
 
     //add the IP payload
     while (udp_len > 1) {
-        sum += * p_ip_payload++;
-        udp_len -= 2;
+        // Each packet but the last must contain a payload length that is a multiple of 8
+        if (!ip_frag_remainder && p_ip_frag->p_next_desc) {
+            p_ip_frag = p_ip_frag->p_next_desc;
+            p_ip_payload = (const uint16_t *) p_ip_frag->rx.frag.iov_base;
+            ip_frag_remainder = ip_frag_len = p_ip_frag->rx.frag.iov_len;
+        }
+
+        while (ip_frag_remainder > 1) {
+            sum += * p_ip_payload++;
+            ip_frag_remainder -= 2;
+        }
+
+        udp_len -= (ip_frag_len - ip_frag_remainder);
     }
+
     //if any bytes left, pad the bytes and add
     if(udp_len > 0) {
         sum += ((*p_ip_payload)&htons(0xFF00));
     }
-      //Fold sum to 16 bits: add carrier to result
-      while (sum>>16) {
-          sum = (sum & 0xffff) + (sum >> 16);
-      }
 
-      sum = ~sum;
+    //Fold sum to 16 bits: add carrier to result
+    while (sum >> 16) {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+
+    sum = ~sum;
     //computation result
-    return (unsigned short)sum == 0x0000 ? 0xFFFF :(unsigned short)sum;
+    return (unsigned short)sum;
 }
 
 /**
@@ -490,21 +504,6 @@ int get_if_mtu_from_ifname(const char* ifname)
 	return if_mtu_value;
 }
 
-int get_igmp_max_membership()
-{
-	__log_func("find OS igmp_max_membership");
-
-	char igmp_max_membership_str[32];
-	int igmp_max_membership_value = 0;
-
-	BULLSEYE_EXCLUDE_BLOCK_START
-	if (priv_read_file(IGMP_MAX_MEMBERSHIP_FILE, igmp_max_membership_str, sizeof(igmp_max_membership_str)) > 0) {
-		igmp_max_membership_value = atoi(igmp_max_membership_str);
-	}
-	BULLSEYE_EXCLUDE_BLOCK_END
-	return igmp_max_membership_value;
-}
-
 int get_window_scaling_factor(int tcp_rmem_max, int core_rmem_max)
 {
 	__log_func("calculate OS tcp scaling window factor");
@@ -580,6 +579,10 @@ uint16_t get_vlan_id_from_ifname(const char* ifname)
         struct vlan_ioctl_args ifr;
         int fd = orig_os_api.socket(AF_INET, SOCK_DGRAM, 0);
 
+        if (fd < 0) {
+            __log_err("ERROR from socket() (errno=%d %m)", errno);
+            return -1;
+        }
         memset(&ifr, 0, sizeof(ifr));
         ifr.cmd = GET_VLAN_VID_CMD;
         strncpy(ifr.device1, ifname, sizeof(ifr.device1) - 1);
@@ -603,7 +606,10 @@ size_t get_vlan_base_name_from_ifname(const char* ifname, char* base_ifname, siz
         // find vlan base name from interface name
         struct vlan_ioctl_args ifr;
         int fd = orig_os_api.socket(AF_INET, SOCK_DGRAM, 0);
-
+        if (fd < 0) {
+            __log_err("ERROR from socket() (errno=%d %m)", errno);
+            return -1;
+        }
         memset(&ifr,0, sizeof(ifr));
         ifr.cmd = GET_VLAN_REALDEV_NAME_CMD;
         strncpy(ifr.device1, ifname, sizeof(ifr.device1) - 1);
@@ -635,7 +641,7 @@ int run_and_retreive_system_command(const char* cmd_line, char* return_str, int 
 
 	BULLSEYE_EXCLUDE_BLOCK_START
 	if (!cmd_line) return -1;
-	if (return_str_len < 0) return_str_len = 0;
+	if (return_str_len <= 0) return -1;
 	BULLSEYE_EXCLUDE_BLOCK_END
 
 	// 29West may load vma dynamically (like sockperf with --load-vma)
@@ -652,9 +658,12 @@ int run_and_retreive_system_command(const char* cmd_line, char* return_str, int 
 	if (file) {
 		int fd = fileno(file);
 		if (fd > 0) {
-			int actual_len = read(fd, return_str, return_str_len);
-			if (actual_len)
-				return_str[min(return_str_len - 1, actual_len)] = '\0';
+			int actual_len = read(fd, return_str, return_str_len - 1);
+			if (actual_len > 0) {
+				return_str[actual_len] = '\0';
+			} else {
+				return_str[0] = '\0';
+			}
 		}
 		// Check exit status code
 		rc = pclose(file);
@@ -666,27 +675,6 @@ int run_and_retreive_system_command(const char* cmd_line, char* return_str, int 
 		}
 	}
 	return ((!rc && return_str) ? 0 : -1);
-}
-
-bool get_local_if_info(in_addr_t local_if, char* ifname, unsigned int &ifflags)
-{
-	bool ret_val = true;
-
-	sock_addr sa_if(AF_INET, local_if, INPORT_ANY);
-	__log_dbg("checking local interface: %s", sa_if.to_str_in_addr());
-	BULLSEYE_EXCLUDE_BLOCK_START
-	if (get_ifinfo_from_ip(*sa_if.get_p_sa(), ifname, ifflags)) {
-		__log_dbg("ERROR from get_ifaddrs_from_ip() (errno=%d %m)", errno);
-		ret_val = false;
-	}
-	BULLSEYE_EXCLUDE_BLOCK_END
-	if (ifflags & IFF_MASTER) {
-		__log_dbg("matching ip found on local device '%s' acting as bonding master", ifname);
-	}
-	else {
-		__log_dbg("matching ip found on local device '%s'", ifname);
-	}
-	return ret_val;
 }
 
 size_t get_local_ll_addr(IN const char * ifname, OUT unsigned char* addr, IN int addr_len, bool is_broadcast)
@@ -772,7 +760,8 @@ bool check_device_exist(const char* ifname, const char *path)
 	char device_path[256] = {0};
 	sprintf(device_path, path, ifname);
 	int fd = orig_os_api.open(device_path, O_RDONLY);
-	orig_os_api.close(fd);
+	if (fd >= 0)
+		orig_os_api.close(fd);
 	if (fd < 0 && errno == EMFILE) {
 		__log_warn("There are no free fds in the system. This may cause unexpected behavior");
 	}

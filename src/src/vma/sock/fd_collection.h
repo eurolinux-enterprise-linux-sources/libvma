@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2001-2016 Mellanox Technologies, Ltd. All rights reserved.
+ * Copyright (c) 2001-2017 Mellanox Technologies, Ltd. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -50,8 +50,11 @@ typedef vma_list_t<epfd_info, epfd_info::epfd_info_node_offset> epfd_info_list_t
 
 typedef std::tr1::unordered_map<pthread_t, int> offload_thread_rule_t;
 
+#if (VMA_MAX_DEFINED_LOG_LEVEL < DEFINED_VLOG_FINER)
+#define fdcoll_logfuncall(log_fmt, log_args...)         ((void)0)
+#else
 #define fdcoll_logfuncall(log_fmt, log_args...)		do { if (g_vlogger_level >= VLOG_FUNC_ALL) vlog_printf(VLOG_FUNC_ALL, "fdc:%d:%s() " log_fmt "\n", __LINE__, __FUNCTION__, ##log_args); } while (0)
-
+#endif /* VMA_MAX_DEFINED_LOG_LEVEL */
 
 class cq_channel_info: public cleanable_obj
 {
@@ -118,6 +121,11 @@ public:
 	 * Remove cq_channel_info.
 	 */
 	int			del_cq_channel_fd(int fd, bool b_cleanup = false);
+
+	/**
+	 * Call set_immediate_os_sample of the input fd.
+	 */
+	inline bool set_immediate_os_sample(int fd);
 
 	/**
 	 * Get sock_fd_api (sockinfo or pipeinfo) by fd.
@@ -208,8 +216,21 @@ inline cls* fd_collection::get(int fd, cls **map_type)
 		return NULL;
 
 	cls* obj = map_type[fd];
-	fdcoll_logfuncall("fd=%d %sFound", fd, (obj ? "" : "Not "));
 	return obj;
+}
+
+inline bool fd_collection::set_immediate_os_sample(int fd)
+{
+	epfd_info* epfd_fd;
+
+	auto_unlocker locker(*this);
+
+	if ((epfd_fd = get_epfd(fd))){
+		epfd_fd->set_os_data_available();
+		return true;
+	}
+
+	return false;
 }
 
 inline socket_fd_api* fd_collection::get_sockfd(int fd)

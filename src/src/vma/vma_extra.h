@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2001-2016 Mellanox Technologies, Ltd. All rights reserved.
+ * Copyright (c) 2001-2017 Mellanox Technologies, Ltd. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -36,13 +36,24 @@
 
 #include <stddef.h>
 #include <stdint.h>
-#include "vlogger/vlogger.h"
+#include <netinet/in.h>
+
 /*
  * Flags for recvfrom_zcopy()
  */
 #define MSG_VMA_ZCOPY_FORCE	0x01000000 // don't fallback to bcopy
 #define	MSG_VMA_ZCOPY		0x00040000 // return: zero copy was done
 
+/*
+ * Options for setsockopt()/getsockopt()
+ */
+#define SO_VMA_GET_API       2800
+#define SO_VMA_USER_DATA     2801
+
+/*
+ * Flags for Dummy send API
+ */
+#define VMA_SND_FLAGS_DUMMY MSG_SYN // equals to 0x400
 
 /* 
  * Return values for the receive packet notify callback function
@@ -58,6 +69,63 @@ typedef enum {
 	                        must return the descriptor to VMA using the free_packet function
 				But not in the context of VMA's callback itself. */
 } vma_recv_callback_retval_t;
+
+
+/************ vma_poll() API types definition start***************/
+
+typedef enum {
+    VMA_POLL_PACKET 			= (1ULL << 32), /* New packet is available */
+    VMA_POLL_NEW_CONNECTION_ACCEPTED	= (1ULL << 33)  /* New connection is auto accepted by server */
+} vma_poll_events_t;
+
+/*
+ * Represents  VMA buffer
+ * Used in vma_poll() extended API.
+ */
+struct vma_buff_t {
+	struct vma_buff_t*	next;		/* next buffer (for last buffer next == NULL) */
+	void*		payload;		/* pointer to data */
+	uint16_t	len;			/* data length */
+};
+
+/**
+ * Represents one VMA packet
+ * Used in vma_poll() extended API.
+ */
+struct vma_packet_desc_t {
+	size_t			num_bufs;	/* number of packet's buffers */
+	uint16_t		total_len;	/* total data length */
+	struct vma_buff_t*	buff_lst;	/* list of packet's buffers */
+};
+
+/*
+ * Represents VMA Completion.
+ * Used in vma_poll() extended API.
+ */
+struct vma_completion_t {
+	/* Packet is valid in case VMA_POLL_PACKET event is set
+         */
+	struct vma_packet_desc_t packet;
+	/* Set of events
+         */
+	uint64_t                 events;
+	/* User provided data.
+         * By default this field has FD of the socket
+         * User is able to change the content using setsockopt()
+         * with level argument SOL_SOCKET and opname as SO_VMA_USER_DATA
+         */ 
+	uint64_t                 user_data;
+	/* Source address (in network byte order) set for:
+	 * VMA_POLL_PACKET and VMA_POLL_NEW_CONNECTION_ACCEPTED events
+	 */
+	struct sockaddr_in       src;
+	/* Connected socket's parent/listen socket fd number.
+	 * Valid in case VMA_POLL_NEW_CONNECTION_ACCEPTED event is set.
+	*/
+	int 			listen_fd;
+};
+
+/************ vma_poll() API types definition end ***************/
 
 /**
  * Represents one VMA packets 
@@ -97,8 +165,147 @@ struct __attribute__ ((packed)) vma_info_t {
 	/* Socket's information */
 	uint32_t		socket_ready_queue_pkt_count;	/* Current count of packets waiting to be read from the socket */
 	uint32_t		socket_ready_queue_byte_count;	/* Current count of bytes waiting to be read from the socket */
+
+	/* Packet timestamping information */
+	struct timespec		hw_timestamp;
+	struct timespec		sw_timestamp;
 };
 
+typedef enum {
+	VMA_MP_MASK_HDR_PTR = (1 << 0),
+	VMA_MP_MASK_TIMESTAMP = (1 << 1),
+} vma_completion_mp_mask;
+
+/**
+ * @param comp_mask attributes you want to get from @ref vma_cyclic_buffer_read.
+ * 	see @ref vma_completion_mp_mask
+ * @param payload_ptr pointer to user data not including user header
+ * @param payload_length size of payload_ptr
+ * @param packets how many packets arrived
+ * @param headers_ptr points to the user header section within the payload defined when creating the ring
+ * 	@note currently same as @param payload_ptr
+ * @param headers_ptr_length headers_ptr length
+ *  	@note currently same as @param payload_length
+ * @param hw_timestamp the HW time stamp of the first packet arrived within the batch
+ */
+struct vma_completion_cb_t {
+	uint32_t	comp_mask;
+	void*		payload_ptr;
+	size_t		payload_length;
+	size_t		packets;
+	void*		headers_ptr;
+	size_t		headers_ptr_length;
+	struct timespec	hw_timestamp;
+};
+
+/**
+ * use this in setsockopt for the ring creation
+ */
+#define SO_VMA_RING_ALLOC_LOGIC		2810
+
+typedef int vma_ring_profile_key;
+
+typedef enum {
+	RING_LOGIC_PER_INTERFACE = 0,           //!< RING_LOGIC_PER_INTERFACE
+	RING_LOGIC_PER_SOCKET = 10,             //!< RING_LOGIC_PER_SOCKET
+	RING_LOGIC_PER_USER_ID = 11,             //!< RING_LOGIC_PER_USER_ID
+	RING_LOGIC_PER_THREAD = 20,             //!< RING_LOGIC_PER_THREAD
+	RING_LOGIC_PER_CORE = 30,               //!< RING_LOGIC_PER_CORE
+	RING_LOGIC_PER_CORE_ATTACH_THREADS = 31,//!< RING_LOGIC_PER_CORE_ATTACH_THREADS
+	RING_LOGIC_LAST                         //!< RING_LOGIC_LAST
+} ring_logic_t;
+
+typedef enum {
+	VMA_RING_ALLOC_MASK_RING_PROFILE_KEY = (1 << 0),
+	VMA_RING_ALLOC_MASK_RING_USER_ID = (1 << 1),
+	VMA_RING_ALLOC_MASK_RING_INGRESS = (1 << 2),
+	VMA_RING_ALLOC_MASK_RING_ENGRESS = (1 << 3),
+} vma_ring_alloc_logic_attr_comp_mask;
+
+/**
+ * @brief pass this struct to vma using setsockopt with @ref SO_VMA_RING_ALLOC_LOGIC
+ * 	to set the allocation logic of this FD when he requests a ring.
+ * 	@note ring_alloc_logic is a mandatory
+ * @param comp_mask - what fields are read when processing this sturct
+ * 	see @ref vma_ring_alloc_logic_attr_comp_mask
+ * @param ring_alloc_logic- allocation ratio to use
+ * @param ring_profile_key - what ring profile to use - get the profile when
+ * 	creating ring using @ref vma_add_ring_profile in extra_api
+ * 	can only be set once
+ * @param user_idx - when used RING_LOGIC_PER_USER_ID int @ref ring_alloc_logic
+ * 	this is the user id to define. This lets you define the same ring for
+ * 	few FD's regardless the interface\thread\core.
+ * @param ingress - RX ring
+ * @param engress - TX ring
+ */
+struct vma_ring_alloc_logic_attr {
+	uint32_t	comp_mask;
+	ring_logic_t	ring_alloc_logic;
+	uint32_t	ring_profile_key;
+	uint32_t	user_id;
+	uint32_t	ingress:1;
+	uint32_t	engress:1;
+	uint32_t	reserved:30;
+};
+
+typedef enum {
+	CB_COMP_HDR_BYTE = (1 << 0),
+} vma_cyclic_buffer_ring_attr_comp_mask;
+
+/**
+ * @param comp_mask - what fields are read when processing this sturct
+ * 	see @ref vma_cyclic_buffer_ring_attr_comp_mask
+ * @param num - Minimum number of elements allocated in the circular buffer
+ * @param hdr_bytes - Bytes separated from UDP payload which are
+ * 	part of the application header
+ * 	@note this will be accesable from headers_ptr in @ref vma_completion_cb_t
+ * @param stride_bytes - Bytes separated for each ingress payload for alignment
+ * 	control (does not include the hdr_bytes). Should be smaller
+ * 	than MTU.
+ *
+ * @note general packet structure
+ * +--------------------------------------------------------------------------+
+ * |   mac+ip+udp   |           datagram payload                 |  alignment |
+ * +--------------------------------------------------------------------------+
+ * | Header to drop |       hdr_bytes    | stride_bytes                       |
+ * |                | e.g. RTP header    | e.g. RTP payload      | alignment  |
+ * +--------------------------------------------------------------------------+
+ */
+struct vma_cyclic_buffer_ring_attr {
+	uint32_t	comp_mask;
+	uint32_t	num;
+	uint16_t	stride_bytes;
+	uint16_t	hdr_bytes;
+};
+
+struct vma_packet_queue_ring_attr {
+	uint32_t	comp_mask;
+};
+
+typedef enum {
+	// for future use
+	VMA_RING_ATTR_LAST
+} vma_ring_type_attr_mask;
+
+typedef enum {
+	VMA_RING_PACKET,
+	VMA_RING_CYCLIC_BUFFER
+} vma_ring_type;
+
+/**
+ * @param comp_mask - what fields are read when processing this sturct
+ * 	see @ref vma_ring_type_attr_mask
+ * @param ring_type - use cyclic buffer ring or default packets ring
+ *
+ */
+struct vma_ring_type_attr {
+	uint32_t	comp_mask;
+	vma_ring_type	ring_type;
+	union {
+		struct vma_cyclic_buffer_ring_attr	ring_cyclicb;
+		struct vma_packet_queue_ring_attr	ring_pktq;
+	};
+};
 
 /** 
  *  
@@ -212,21 +419,170 @@ struct __attribute__ ((packed)) vma_api_t {
 	 */
 	int (*thread_offload)(int offload, pthread_t tid);
 
+
+	/**
+	 * vma_poll() polls for VMA completions
+	 *
+	 * @param fd File descriptor.
+	 * @param completions VMA completions array.
+	 * @param ncompletions Maximum number of completion to return.
+	 * @param flags Flags.
+	 * @return On success, return the number of ready completions.
+	 * 	   On error, -1 is returned, and TBD:errno is set?.
+	 *
+	 * This function polls the `fd` for VMA completions and returns maximum `ncompletions` ready
+	 * completions via `completions` array.
+	 * The `fd` can represent a ring, socket or epoll file descriptor.
+	 *
+	 * VMA completions are indicated for incoming packets and/or for other events.
+	 * If VMA_POLL_PACKET flag is enabled in vma_completion_t.events field
+	 * the completion points to incoming packet descriptor that can be accesses
+	 * via vma_completion_t.packet field.
+	 * Packet descriptor points to VMA buffers that contain data scattered
+	 * by HW, so the data is deliver to application with zero copy.
+	 * Notice: after application finished using the returned packets
+	 * and their buffers it must free them using free_vma_packets()/free_vma_buff()
+	 * functions.
+	 * If VMA_POLL_PACKET flag is disabled vma_completion_t.packet field is
+	 * reserved.
+	 *
+	 * In addition to packet arrival event (indicated by VMA_POLL_PACKET flag)
+	 * VMA also reports VMA_POLL_NEW_CONNECTION_ACCEPTED event and standard
+	 * epoll events via vma_completion_t.events field.
+	 * VMA_POLL_NEW_CONNECTION_ACCEPTED event is reported when new connection is
+	 * accepted by the server.
+	 * When working with vma_poll() new connections are accepted
+	 * automatically and accept(listen_socket) must not be called.
+	 * VMA_POLL_NEW_CONNECTION_ACCEPTED event is reported for the new
+	 * connected/child socket (vma_completion_t.user_data refers to child socket)
+	 * and EPOLLIN event is not generated for the listen socket.
+	 * For events other than packet arrival and new connection acceptance
+	 * vma_completion_t.events bitmask composed using standard epoll API
+	 * events types.
+	 * Notice: the same completion can report multiple events, for example
+	 * VMA_POLL_PACKET flag can be enabled together with EPOLLOUT event,
+	 * etc...
+	 *
+	 * * errno is set to: TBD...
+	 */
+	 int (*vma_poll)(int fd, struct vma_completion_t* completions, unsigned int ncompletions, int flags);
+
+	 /**
+	 * Returns the amount of rings that are associated with socket.
+	 *
+	 * @param fd File Descriptor number of the socket.
+	 * @return On success, return the amount of rings.
+	 * 	   On error, -1 is returned.
+	 *
+	 * errno is set to: EINVAL - not a VMA offloaded fd
+	 */
+	 int (*get_socket_rings_num)(int fd);
+
+	 /**
+	 * Returns FDs of the rings that are associated with the socket.
+	 *
+	 * This function gets socket FD + int array + array size and populates
+	 * the array with FD numbers of the rings that are associated
+	 * with the socket.
+	 *
+	 * @param fd File Descriptor number.
+	 * @param ring_fds Int array of ring fds
+	 * @param ring_fds_sz Size of the array
+	 * @return On success, return the number populated array entries.
+	 * 	   On error, -1 is returned.
+	 *
+	 * errno is set to: EINVAL - not a VMA offloaded fd + TBD
+	 */
+	 int (*get_socket_rings_fds)(int fd, int *ring_fds, int ring_fds_sz);
+
+	/**
+	 * Frees packets received by vma_poll().
+	 *
+	 * @param packets Packets to free.
+	 * @param num Number of packets in `packets` array
+	 * @return 0 on success, -1 on failure
+	 *
+	 * For each packet in `packet` array this function:
+	 * - Updates receive queue size and the advertised TCP
+	 *   window size, if needed, for the socket that received
+	 *   the packet.
+	 * - Frees vma buffer list that is associated with the packet.
+	 *   Notice: for each buffer in buffer list VMA decreases buffer's
+	 *   ref count and only buffers with ref count zero are deallocated.
+	 *   Notice:
+	 *   - Application can increase buffer reference count,
+	 *     in order to hold the buffer even after free_vma_packets()
+	 *     was called for the buffer, using vma_buff_ref().
+	 *   - Application is responsible to free buffers, that
+	 *     couldn't be deallocated during free_vma_packets() due to
+	 *     non zero reference count, using free_vma_buff() function.
+	 *
+	 * errno is set to: EINVAL if NULL pointer is provided.
+	 */
+	int (*free_vma_packets)(struct vma_packet_desc_t *packets, int num);
+
+	/* This function increments the reference count of the buffer.
+	 * This function should be used in order to hold the buffer
+	 * even after vma_free_packets() call.
+	 * When buffer is not needed any more it should be freed via
+	 * vma_buff_free().
+	 *
+	 * @param buff Buffer to update.
+	 * @return On success, return buffer's reference count after the change
+	 * 	   On errors -1 is returned
+	 *
+	 * errno is set to EINVAL if NULL pointer is provided.
+	 */
+	int (*ref_vma_buff)(struct vma_buff_t *buff);
+
+	/* This function decrements the buff reference count.
+	 * When buff's reference count reaches zero, the buff is
+	 * deallocated.
+	 *
+	 * @param buff Buffer to free.
+	 * @return On success, return buffer's reference count after the change
+	 * 	   On error -1 is returned
+	 *
+	 * Notice: return value zero means that buffer was deallocated.
+	 *
+	 * errno is set to EINVAL if NULL pointer is provided.
+	 */
+	int (*free_vma_buff)(struct vma_buff_t *buff);
+
 	/*
 	 * Dump fd statistics using VMA logger.
 	 * @param fd to dump, 0 for all open fds.
-	 * @param log_level dumping level.
+	 * @param log_level dumping level corresponding vlog_levels_t enum (vlogger.h).
 	 * @return 0 on success, or error code on failure.
 	 */
-	int (*dump_fd_stats) (int fd, vlog_levels_t log_level);
+	int (*dump_fd_stats) (int fd, int log_level);
+
+	/**
+	 * Get data from the MP_RQ cyclic buffer
+	 * @param fd - the fd of the ring to query - get it using @ref get_socket_rings_fds
+	 * @param completion results see @ref struct vma_completion_cb_t
+	 * @param min min number of packet to return, if not available
+	 * 	will return 0 packets
+	 * @param max max packets to return
+	 * @param flags can be MSG_DONTWAIT, MSG_WAITALL (not yet supported), MSG_PEEK (not yet supported)
+	 * @return 0 on success -1 on failure
+	 */
+	int (*vma_cyclic_buffer_read)(int fd,
+				      struct vma_completion_cb_t *completion,
+				      size_t min, size_t max, int flags);
+
+	/**
+	 * add a ring profile to VMA ring profile list. you can use this
+	 * to create advacned rings like MP_RQ ring
+	 * the need to pass vma the ring profile using the fd's setsockopt
+	 * @param profile the profile to add to the list
+	 * @param key - the profile key
+	 * @return 0 on success -1 on failure
+	 */
+	int (*vma_add_ring_profile)(struct vma_ring_type_attr *profile, int *key);
 };
 
 
-#define SO_VMA_GET_API				2800
-
-#if _BullseyeCoverage
-    #pragma BullseyeCoverage off
-#endif
 
 /**
  * Retrieve VMA extended API.
@@ -246,13 +602,222 @@ static inline struct vma_api_t* vma_get_api()
 	return api_ptr;
 }
 
-#if _BullseyeCoverage
-    #pragma BullseyeCoverage on
-#endif
 
 /* 
- * Demo Usage
+ ********************************
+ * vma_poll() Demo Usage
+ ********************************
+
+
+struct vma_api_t* vma_api = NULL;
+
+
  *
+ * Main loop
+ *
+myapp_socket_main_loop()
+{
+	int flags = 0;
+	char buf[256];
+	int rings;
+	vma_completion_t comp;
+	int ready_comp = 0;
+	bool to_exit = false;
+
+
+	// Try to find if VMA is loaded and the Extra API is available
+	vma_api = vma_get_api();
+
+	// Create my application's  socket
+	int fd = socket(AF_INET, SOCK_STREAM, IPPROTO_IP)
+
+	//Configure/connect the socket
+	setsockopt()
+	connect()
+	...
+
+	//Get socket's ring, we skip reading the number of rings
+	//since connected TCP socket is associated with a single ring
+	if (vma_api) {
+		vma_api->get_socket_rings_fds(fd, &ring, 1);
+	}
+	else {
+		exit...
+	}
+
+	// Main traffic processing loop going into VMA engine
+	while (!to_exit) {
+
+		ready_comp = vma_api->vma_poll(ring_fd, &comp, 1, flags);
+
+		// recv path socket API...
+		if (ready_comp > 0) {
+			if (comp.events & VMA_COMPLETION_TYPE_PACKET) {
+				myapp_processes_packet_func(comp.user_data, &comp.packet);
+
+				//Hold the buffers
+				vma_buff_t curr_buff = comp.packet.buff_lst;
+				while (curr_buff) {
+					vma_api->vma_buff_ref(curr_buff);
+					curr_buff = curr_buff->next;
+				}
+				//Update socket's TCP window size
+				vma_api->free_vma_packets(socket_fd, &comp.packet, 1);
+			}
+			myapp_processes_events_func(comp.user_data,comp.events);
+
+			//The buffers are not needed any more, deallocate them
+			vma_buff_t curr_buff = comp.packet.buff_lst;
+			while (curr_buff) {
+				//Free the buffer
+				vma_api->vma_buff_ref(curr_buff);
+				curr_buff = curr_buff->next;
+			}
+		}
+		else if (ready_comp < 0) {
+			to_exit = true;
+		}
+	}
+}
+
+ *
+ * Process VMA buffer
+ *
+myapp_processes_packet_func(
+	int socket,
+	vma_packet_t* packet)
+{
+	vma_buff_t* curr_buff = packet->buff_lst;
+
+	printf("[fd=%d] Received packet from: %s:%d \n", socket, inet_ntoa(packet->src.sin_addr), ntohs(packet->src.sin_port));
+	printf("Packet total length is: %u\n", packet->total_len);
+	printf("Packet's buffers: \n");
+	while (curr_buff) {
+		printf("Address: %p, Length: %u\n", curr_buff->payload, curr_buff->len);
+		curr_buff = curr_buff->next;
+	}
+
+}
+
+ *
+ * Process VMA event
+ *
+myapp_processes_events_func(
+	int socket,
+	uint64_t events)
+{
+	if (comp.events & EPOLLHUP){
+		printf("[fd=%d] EPOLLHUP event occurred\n", socket);
+	}
+}
+
+
+ *
+ * vma_poll() UDP Demo Usage
+ *
+
+
+struct vma_api_t* vma_api = NULL;
+
+
+ *
+ * Main loop
+ *
+myapp_socket_main_loop()
+{
+	int flags = 0;
+	char buf[256];
+	int rings;
+	vma_completion_t comp;
+	int ready_comp = 0;
+	bool to_exit = false;
+
+
+	// Try to find if VMA is loaded and the Extra API is available
+	vma_api = vma_get_api();
+
+	// Create my application's  socket
+	int fd = socket(AF_INET, SOCK_DGRAM, 0)
+
+	//Bind the socket
+	...
+
+	//Get socket's ring, we skip reading the number of rings
+	//since connected UDP socket is associated with a single ring
+	if (vma_api) {
+		vma_api->get_socket_rings_fds(fd, &ring, 1);
+	}
+	else {
+		exit...
+	}
+
+	// Main traffic processing loop going into VMA engine
+	while (!to_exit) {
+
+		ready_comp = vma_api->vma_poll(ring_fd, &comp, 1, flags);
+
+		// recv path socket API...
+		if (ready_comp > 0) {
+			if (comp.events & VMA_POLL_PACKET) {
+				myapp_processes_packet_func(comp.user_data, &comp.packet);
+
+				//Hold the buffers
+				vma_buff_t curr_buff = comp.packet.buff_lst;
+				while (curr_buff) {
+					vma_api->vma_buff_ref(curr_buff);
+					curr_buff = curr_buff->next;
+				}
+			}
+			myapp_processes_events_func(comp.user_data,comp.events);
+
+			//The buffers are not needed any more, deallocate them
+			vma_buff_t curr_buff = comp.packet.buff_lst;
+			while (curr_buff) {
+				//Free the buffer
+				vma_api->vma_buff_ref(curr_buff);
+				curr_buff = curr_buff->next;
+			}
+		}
+		else if (ready_comp < 0) {
+			to_exit = true;
+		}
+	}
+}
+
+ *
+ * Process VMA buffer
+ *
+myapp_processes_packet_func(
+	int socket,
+	vma_packet_t* packet)
+{
+	vma_buff_t* curr_buff = packet->buff_lst;
+
+	printf("[fd=%d] Received packet from: %s:%d \n", socket, inet_ntoa(packet->src.sin_addr), ntohs(packet->src.sin_port));
+	printf("Packet total length is: %u\n", packet->total_len);
+	printf("Packet's buffers: \n");
+	while (curr_buff) {
+		printf("Address: %p, Length: %u\n", curr_buff->payload, curr_buff->len);
+		curr_buff = curr_buff->next;
+	}
+}
+
+ *
+ * Process VMA event
+ *
+myapp_processes_events_func(
+	int socket,
+	uint64_t events)
+{
+	if (comp.events){
+		printf("[fd=%d] event occurred\n", socket);
+	}
+}
+
+
+ *********************************************
+ * VMA callback + recvfrom_zcopy Demo Usage
+ *********************************************
 
 
 struct vma_api_t* vma_api = NULL;
@@ -346,10 +911,10 @@ myapp_processes_packet_func(
 {
 	myapp_processes_packet_func(.....);
 
-	// Return zero copied datagram buffer back to VMA
+	// Return zero copied packet buffer back to VMA
 	// Would be better to collect a bunch of buffers and return them all at once
 	// which will save locks inside VMA
-	vma_api->free_datagrams(s, &packet_id, 1);
+	vma_api->free_packets(s, &packet_id, 1);
 }
 
 

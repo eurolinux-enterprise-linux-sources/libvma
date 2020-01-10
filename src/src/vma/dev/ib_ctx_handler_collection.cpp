@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2001-2016 Mellanox Technologies, Ltd. All rights reserved.
+ * Copyright (c) 2001-2017 Mellanox Technologies, Ltd. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -93,12 +93,18 @@ void ib_ctx_handler_collection::map_ib_devices() //return num_devices, can use r
 	}
 	BULLSEYE_EXCLUDE_BLOCK_END
 
-	m_ctx_time_conversion_mode = ib_ctx_time_converter::get_devices_convertor_status(pp_ibv_context_list, m_n_num_devices);
+	m_ctx_time_conversion_mode = time_converter::get_devices_converter_status(pp_ibv_context_list, m_n_num_devices);
 	ibchc_logdbg("TS converter status was set to %d", m_ctx_time_conversion_mode);
 
 	ibchc_logdbg("Mapping %d ibv devices", m_n_num_devices);
 	for (int i = 0; i < m_n_num_devices; i++) {
 		m_ib_ctx_map[pp_ibv_context_list[i]] = new ib_ctx_handler(pp_ibv_context_list[i], m_ctx_time_conversion_mode);
+		BULLSEYE_EXCLUDE_BLOCK_START
+		if (!m_ib_ctx_map[pp_ibv_context_list[i]]) {
+			ibchc_logdbg("failed to allocate ib context map");
+			throw_vma_exception("failed to allocate ib context map");
+		}
+		BULLSEYE_EXCLUDE_BLOCK_END
 	}
 
 	rdma_free_devices(pp_ibv_context_list);
@@ -125,7 +131,7 @@ size_t ib_ctx_handler_collection::mem_reg_on_all_devices(void* addr, size_t leng
 		if (mr_array[mr_pos] == NULL) {
 			ibchc_logwarn("Failure in mem_reg: addr=%p, length=%d, mr_pos=%d, mr_array[mr_pos]=%d, dev=%p, ibv_dev=%s", 
 				    addr, length, mr_pos, mr_array[mr_pos], p_ib_ctx_handler, p_ib_ctx_handler->get_ibv_device()->name);
-			return (size_t)-1;
+			break;
 		}
 		BULLSEYE_EXCLUDE_BLOCK_END
 		errno = 0; //ibv_reg_mr() set errno=12 despite successful returning

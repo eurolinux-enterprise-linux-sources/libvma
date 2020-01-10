@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2001-2016 Mellanox Technologies, Ltd. All rights reserved.
+ * Copyright (c) 2001-2017 Mellanox Technologies, Ltd. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -38,6 +38,7 @@
 #define MODULE_NAME 		"nl_wrapper:"
 #define nl_logerr		__log_err
 #define nl_logwarn		__log_warn
+#define nl_logdbg		__log_dbg
 
 
 extern void link_event_callback(nl_object* obj);
@@ -106,32 +107,48 @@ int nl_cache_mngr_compatible_add(struct nl_cache_mngr*	mngr, const char* name, c
 	int err = nl_cache_mngr_add(mngr, name, cb, data, result);
 	BULLSEYE_EXCLUDE_BLOCK_START
 	if (err) {
+		errno = ELIBEXEC;
 		nl_logerr("Fail to add to cache manager, error=%s", nl_geterror(err));
 	}
 	BULLSEYE_EXCLUDE_BLOCK_END
 	return err;
 }
 
-int nl_object_get_compatible_msgtype(const struct nl_object* obj) {
-	return nl_object_get_msgtype(obj);
+in_addr_t nl_object_get_compatible_gateway(struct rtnl_route* nl_route_obj) {
+	struct rtnl_nexthop *nh;
+	nh = rtnl_route_nexthop_n(nl_route_obj, 0);
+	if (nh) {
+		struct nl_addr * addr;
+		addr = rtnl_route_nh_get_gateway(nh);
+		if (addr) {
+			return *(in_addr_t *) nl_addr_get_binary_addr(addr);
+		}
+	}
+	return INADDR_ANY;
 }
 
-const char*	get_rtnl_route_iif_name(struct rtnl_route* route) {
-	static char iifstr[IFNAMSIZ];
-	return if_indextoname(rtnl_route_get_iif(route), iifstr);
+int nl_object_get_compatible_oif(struct rtnl_route* nl_route_obj) {
+	struct rtnl_nexthop *nh;
+	nh = rtnl_route_nexthop_n(nl_route_obj, 0);
+	if (nh) {
+		return rtnl_route_nh_get_ifindex(nh);
+	}
+	return -1;
+}
+
+int nl_object_get_compatible_metric(struct rtnl_route* nl_route_obj, int attr) {
+	uint32_t val;
+
+	int rc = rtnl_route_get_metric(nl_route_obj, attr, &val);
+	if (rc == 0) {
+		return val;
+	}
+	nl_logdbg("Fail parsing route metric %d error=%d\n", attr, rc);
+	return 0;
 }
 
 
 #else //HAVE_LIBNL1
-
-// structure to pass arguments on internal netlink callbacks handling
-typedef struct rcv_msg_arg
-{
-	netlink_wrapper* netlink;
-	struct nl_handle* socket_handle;
-	map<e_netlink_event_type, subject*>* subjects_map;
-	nlmsghdr* msghdr;
-} rcv_msg_arg_t;
 
 nl_handle* nl_socket_handle_alloc() {
 	return nl_handle_alloc();
@@ -176,16 +193,34 @@ nl_cache_mngr* nl_cache_mngr_compatible_alloc(nl_socket_handle* handle, int prot
 
 int nl_cache_mngr_compatible_add(struct nl_cache_mngr*	mngr, const char* name, change_func_t cb, void*	, struct nl_cache** result){
 	*result = nl_cache_mngr_add(mngr, name, cb);
+	if (*result == NULL) {
+		errno = ELIBEXEC;
+		nl_logerr("Fail adding to cache manager, error=%d %s\n",
+			nl_get_errno(), nl_geterror());
+		return -1;
+	}
 	return 0;
 }
 
-int nl_object_get_compatible_msgtype(const struct nl_object* obj) {
-	_nl_object* _obj = (_nl_object*)obj;
-	return _obj->ce_msgtype;
+in_addr_t nl_object_get_compatible_gateway(struct rtnl_route* nl_route_obj) {
+	struct nl_addr * addr;
+	addr = rtnl_route_get_gateway(nl_route_obj);
+	if (addr) {
+		return *(in_addr_t *) nl_addr_get_binary_addr(addr);
+	}
+	return INADDR_ANY;
 }
 
-const char*	get_rtnl_route_iif_name(struct rtnl_route* route) {
-	return rtnl_route_get_iif(route);
+int nl_object_get_compatible_oif(struct rtnl_route* nl_route_obj) {
+	return rtnl_route_get_oif(nl_route_obj);
 }
 
+int nl_object_get_compatible_metric(struct rtnl_route* nl_route_obj, int attr) {
+	uint32_t val = rtnl_route_get_metric(nl_route_obj, attr);
+	if (val == UINT_MAX) {
+		nl_logdbg("Fail parsing route metric %d error=%d\n", attr, val);
+		return 0;
+	}
+	return val;
+}
 #endif

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2001-2016 Mellanox Technologies, Ltd. All rights reserved.
+ * Copyright (c) 2001-2017 Mellanox Technologies, Ltd. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -46,12 +46,13 @@ typedef struct tcp_iovec
 class dst_entry_tcp : public dst_entry
 {
 public:
-	dst_entry_tcp(in_addr_t dst_ip, uint16_t dst_port, uint16_t src_port, int owner_fd);
+	dst_entry_tcp(in_addr_t dst_ip, uint16_t dst_port, uint16_t src_port,
+		      int owner_fd, resource_allocation_key &ring_alloc_logic);
 	virtual ~dst_entry_tcp();
 
-	virtual ssize_t fast_send(const struct iovec* p_iov, const ssize_t sz_iov, bool b_blocked = true, bool is_rexmit = false, bool dont_inline = false);
-	ssize_t slow_send(const iovec* p_iov, size_t sz_iov, bool b_blocked = true, bool is_rexmit = false, int flags = 0, socket_fd_api* sock = 0, tx_call_t call_type = TX_UNDEF);
-	ssize_t slow_send_neigh(const iovec* p_iov, size_t sz_iov);
+	virtual ssize_t fast_send(const iovec* p_iov, const ssize_t sz_iov, bool is_dummy, bool b_blocked = true, bool is_rexmit = false);
+	ssize_t slow_send(const iovec* p_iov, size_t sz_iov, bool is_dummy, const int ratelimit_kbps, bool b_blocked = true, bool is_rexmit = false, int flags = 0, socket_fd_api* sock = 0, tx_call_t call_type = TX_UNDEF);
+	ssize_t slow_send_neigh(const iovec* p_iov, size_t sz_iov, const int ratelimit_kbps);
 
 	mem_buf_desc_t* get_buffer(bool b_blocked = false);
 	void put_buffer(mem_buf_desc_t * p_desc);
@@ -64,11 +65,28 @@ protected:
 	virtual ibv_sge*	get_sge_lst_4_not_inline_send() { return m_sge; };
 
 	virtual void		configure_headers();
-	virtual bool		conf_hdrs_and_snd_wqe();
 	virtual ssize_t 	pass_buff_to_neigh(const iovec *p_iov, size_t & sz_iov, uint16_t packet_id = 0);
 
 private:
 	const uint32_t       m_n_sysvar_tx_bufs_batch_tcp;
+
+	inline void		send_lwip_buffer(ring_user_id_t id, vma_ibv_send_wr* p_send_wqe, bool b_block, bool b_dummy)
+	{
+		if (unlikely(b_dummy)) {
+			if (m_p_ring->get_hw_dummy_send_support(id, p_send_wqe)) {
+				vma_ibv_wr_opcode last_opcode = m_p_send_wqe_handler->set_opcode(*p_send_wqe, VMA_IBV_WR_NOP);
+				m_p_ring->send_lwip_buffer(id, p_send_wqe, b_block);
+				m_p_send_wqe_handler->set_opcode(*p_send_wqe, last_opcode);
+			}
+			/* no need to free the buffer if dummy send is not supported, as for lwip buffers we have 2 ref counts, */
+			/* one for caller, and one for completion. for completion, we ref count in    */
+			/* send_lwip_buffer(). Since we are not going in, the caller will free the    */
+			/* buffer. */
+		} else {
+			m_p_ring->send_lwip_buffer(id, p_send_wqe, b_block);
+		}
+	}
+
 };
 
 #endif /* DST_ENTRY_TCP_H */

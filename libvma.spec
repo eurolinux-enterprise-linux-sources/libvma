@@ -1,5 +1,5 @@
 Name: libvma
-Version: 8.1.4
+Version: 8.4.10
 Release: 1%{?dist}
 Summary: A library for boosting TCP and UDP traffic (over RDMA hardware)
 
@@ -8,7 +8,6 @@ Url: https://github.com/Mellanox/libvma
 # Source: http://github.com/Mellanox/%{name}/archive/%{version}.tar.gz
 # Upstream tarballs have no package name in them, locally renaming
 Source: %{name}-%{version}.tar.gz
-Patch0: util-asm-dot-h.patch
 #arm is excluded since libvma fails to compile on arm. 
 # utils are only built for x86_64, ppc64/ppc64le, & arm64/aarch64
 #Reason: libvma uses assembly commands that are not supported by arm.
@@ -49,8 +48,6 @@ Tools for collecting and analyzing libvma statistic.
 
 %prep
 %setup -q
-# exclude arch's and fix include file to catch invalid builds
-%patch0 -p1
 
 %build
 ./autogen.sh
@@ -69,6 +66,8 @@ rm -f $RPM_BUILD_ROOT%{_libdir}/*.la
 #libvma.so in needed in the main package so that 
 #'LD_PRELOAD=libvma.so <command>' works.
 %{_libdir}/%{name}.so
+%{_sysconfdir}/init.d/vma
+%{_sbindir}/vmad
 %license COPYING LICENSE
 %doc README.txt journal.txt VMA_VERSION
 %config(noreplace) %{_sysconfdir}/libvma.conf
@@ -81,6 +80,10 @@ rm -f $RPM_BUILD_ROOT%{_libdir}/*.la
 %{_bindir}/vma_stats
 
 %changelog
+* Tue Dec 05 2017 Jarod Wilson <jarod@redhat.com> - 8.4.10-1
+- Rebase to upstream v8.4.10 release
+- Resolves: rhbz#1456519
+
 * Wed Aug 24 2016 Jarod Wilson <jarod@redhat.com> - 8.1.4-1
 - Rebase to 8.1.4 after latest round of coverity fixes upstream
   reduced reported defects to 0

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2001-2016 Mellanox Technologies, Ltd. All rights reserved.
+ * Copyright (c) 2001-2017 Mellanox Technologies, Ltd. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -114,8 +114,11 @@ public:
 
 	virtual neigh_val & operator=(const neigh_val & val)
 	{
-		*this = val;
-		return * this;
+		if (this != &val) {
+			m_l2_address = val.m_l2_address;
+			m_trans_type = val.m_trans_type;
+		}
+		return *this;
 	}
 
 protected:
@@ -138,8 +141,7 @@ public:
 
 	neigh_val & operator=(const neigh_val & val)
 	{
-		m_l2_address = new ETH_addr((val.get_l2_address())->get_address());
-		return *this;
+		return neigh_val::operator=(val);
 	}
 
 private:
@@ -352,6 +354,7 @@ private:
 	const uint32_t		m_n_sysvar_neigh_wait_till_send_arp_msec;
 	const uint32_t		m_n_sysvar_neigh_uc_arp_quata;
 	const uint32_t		m_n_sysvar_neigh_num_err_retries;
+	resource_allocation_key	*m_res_key;
 	event_t 		rdma_event_mapping(struct rdma_cm_event* p_event);
 	void 			empty_unsent_queue();
 	bool 			post_send_packet(uint8_t protocol, iovec * iov, header *h);

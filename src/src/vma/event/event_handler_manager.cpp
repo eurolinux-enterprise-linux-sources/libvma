@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2001-2016 Mellanox Technologies, Ltd. All rights reserved.
+ * Copyright (c) 2001-2017 Mellanox Technologies, Ltd. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -37,6 +37,7 @@
 #include <rdma/rdma_cma.h>
 #include <vma/dev/net_device_table_mgr.h>
 #include "vma/dev/ring_allocation_logic.h"
+#include "vma/sock/fd_collection.h"
 #include "vma/sock/sock-redirect.h" // calling orig_os_api.epoll()
 #include "vma/util/verbs_extra.h"
 
@@ -59,9 +60,17 @@
 #undef  VLOG_PRINTF_ENTRY
 #define VLOG_PRINTF_ENTRY(log_level, log_fmt, log_args...) 	vlog_printf(log_level, MODULE_NAME "%d:%s(" log_fmt ")\n", __LINE__, __FUNCTION__, ##log_args)
 
-#define evh_logdbg_entry(log_fmt, log_args...)			do { if (g_vlogger_level >= VLOG_DEBUG)	VLOG_PRINTF_ENTRY(VLOG_DEBUG, log_fmt, ##log_args); } while (0)
+#if (VMA_MAX_DEFINED_LOG_LEVEL < DEFINED_VLOG_DEBUG)
+#define evh_logdbg_entry(log_fmt, log_args...)                  ((void)0)
+#else
+#define evh_logdbg_entry(log_fmt, log_args...)                  do { if (g_vlogger_level >= VLOG_DEBUG) VLOG_PRINTF_ENTRY(VLOG_DEBUG, log_fmt, ##log_args); } while (0)
+#endif
+
+#if (VMA_MAX_DEFINED_LOG_LEVEL < DEFINED_VLOG_FINE)
+#define evh_logfunc_entry(log_fmt, log_args...)                 ((void)0)
+#else
 #define evh_logfunc_entry(log_fmt, log_args...)			do { if (g_vlogger_level >= VLOG_FUNC)	VLOG_PRINTF_ENTRY(VLOG_FUNC, log_fmt, ##log_args); } while (0)
-#define evh_logfuncall_entry(log_fmt, log_args...)		do { if (g_vlogger_level >= VLOG_FUNC_ALL) VLOG_PRINTF_ENTRY(VLOG_FUNC_ALL, log_fmt, ##log_args); } while (0)
+#endif /* VMA_MAX_DEFINED_LOG_LEVEL */
 
 
 #define INITIAL_EVENTS_NUM      64
@@ -387,10 +396,11 @@ void event_handler_manager::stop_thread()
 	m_epfd = -1;
 }
 
-void event_handler_manager::update_epfd(int fd, int operation)
+void event_handler_manager::update_epfd(int fd, int operation, int events)
 {
-	struct epoll_event ev;
-	ev.events = EPOLLIN | EPOLLPRI;
+	epoll_event ev = {0, {0}};
+
+	ev.events = events;
 	ev.data.fd = fd;
 	BULLSEYE_EXCLUDE_BLOCK_START
 	if (orig_os_api.epoll_ctl(m_epfd, operation, fd, &ev) < 0) {
@@ -511,7 +521,7 @@ void event_handler_manager::priv_register_ibverbs_events(ibverbs_reg_info_t& inf
 
 		priv_prepare_ibverbs_async_event_queue(i);
 
-		update_epfd(info.fd, EPOLL_CTL_ADD);
+		update_epfd(info.fd, EPOLL_CTL_ADD, EPOLLIN | EPOLLPRI);
 		evh_logdbg("%d added to event_handler_map_t!", info.fd);
 	}
 	BULLSEYE_EXCLUDE_BLOCK_START
@@ -573,7 +583,7 @@ void event_handler_manager::priv_unregister_ibverbs_events(ibverbs_reg_info_t& i
 
 	i->second.ibverbs_ev.ev_map.erase(j);
 	if (n == 1) {
-		update_epfd(info.fd, EPOLL_CTL_DEL);
+		update_epfd(info.fd, EPOLL_CTL_DEL, EPOLLIN | EPOLLPRI);
 		m_event_handler_map.erase(i);
 		evh_logdbg("%d erased from event_handler_map_t!", info.fd);
 	}
@@ -598,7 +608,7 @@ void event_handler_manager::priv_register_rdma_cm_events(rdma_cm_reg_info_t& inf
 		/* cppcheck-suppress uninitStructMember */
 		m_event_handler_map[info.fd] = map_value;
 
-		update_epfd(info.fd, EPOLL_CTL_ADD);
+		update_epfd(info.fd, EPOLL_CTL_ADD, EPOLLIN | EPOLLPRI);
 	}
 	else {
 		BULLSEYE_EXCLUDE_BLOCK_START
@@ -642,7 +652,7 @@ void event_handler_manager::priv_unregister_rdma_cm_events(rdma_cm_reg_info_t& i
 			iter_fd->second.rdma_cm_ev.map_rdma_cm_id.erase(iter_id);
 			iter_fd->second.rdma_cm_ev.n_ref_count--;
 			if (iter_fd->second.rdma_cm_ev.n_ref_count == 0) {
-				update_epfd(info.fd, EPOLL_CTL_DEL);
+				update_epfd(info.fd, EPOLL_CTL_DEL, EPOLLIN | EPOLLPRI);
 				m_event_handler_map.erase(iter_fd);
 				evh_logdbg("Removed channel <%d %p>", info.fd, info.id);
 			}
@@ -670,7 +680,7 @@ void event_handler_manager::priv_register_command_events(command_reg_info_t& inf
 		/* coverity[uninit_use_in_call] */
 		/* cppcheck-suppress uninitStructMember */
 		m_event_handler_map[info.fd] = map_value;
-		update_epfd(info.fd, EPOLL_CTL_ADD);
+		update_epfd(info.fd, EPOLL_CTL_ADD, EPOLLIN | EPOLLPRI);
 	}
 
 }
@@ -687,7 +697,7 @@ void event_handler_manager::priv_unregister_command_events(command_reg_info_t& i
 		evh_logdbg(" This fd (%d) no longer COMMAND type fd", info.fd);
 	}
 	else {
-		update_epfd(info.fd, EPOLL_CTL_DEL);
+		update_epfd(info.fd, EPOLL_CTL_DEL, EPOLLIN | EPOLLPRI);
 	}
 }
 
@@ -863,7 +873,7 @@ void* event_handler_manager::thread_loop()
 		if( m_b_sysvar_internal_thread_arm_cq_enabled && m_cq_epfd == 0 && g_p_net_device_table_mgr) {
 			m_cq_epfd = g_p_net_device_table_mgr->global_ring_epfd_get();
 			if( m_cq_epfd > 0 ) {
-				epoll_event evt;
+				epoll_event evt = {0, {0}};
 				evt.events = EPOLLIN | EPOLLPRI;
 				evt.data.fd = m_cq_epfd;
 				orig_os_api.epoll_ctl(m_epfd, EPOLL_CTL_ADD, m_cq_epfd, &evt);
@@ -945,7 +955,10 @@ void* event_handler_manager::thread_loop()
 
 			event_handler_map_t::iterator i = m_event_handler_map.find(fd);
 			if (i == m_event_handler_map.end()) {
-				evh_logdbg("No event handler (fd=%d)", fd);
+				// No event handler - this is probably a poll_os event!
+				if (!g_p_fd_collection->set_immediate_os_sample(fd)) {
+					evh_logdbg("No event handler (fd=%d)", fd);
+				}
 				continue;
 			}
 

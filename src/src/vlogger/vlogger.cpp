@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2001-2016 Mellanox Technologies, Ltd. All rights reserved.
+ * Copyright (c) 2001-2017 Mellanox Technologies, Ltd. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -101,12 +101,31 @@ namespace log_level
 		for (size_t i = 0; i < num_levels; ++i) {
 			const char ** input_name = levels[i].input_names;
 			while (*input_name) {
-				if (strcasecmp(str, *input_name) == 0)
-					return levels[i].level;
+				if (strcasecmp(str, *input_name) == 0) {
+					/* Set maximum accessible logging level in case
+					 * a user requests level that is reduced during compilation
+					 * or requested one if the level is in valid range
+					 */
+					if (levels[i].level <= VMA_MAX_DEFINED_LOG_LEVEL) {
+						return levels[i].level;
+					}
+					def_value = (vlog_levels_t)(VMA_MAX_DEFINED_LOG_LEVEL);
+					vlog_printf(VLOG_WARNING, "VMA trace level set to max level %s\n", to_str(def_value));
+					return def_value;
+				}
 				input_name++;
 			}
 		}
 
+		return def_value; // not found. use given def_value
+	}
+
+	// convert int to vlog_levels_t; upon error - returns the given 'def_value'
+	vlog_levels_t from_int(const int int_log, vlog_levels_t def_value)
+	{
+		if (int_log >= VLOG_NONE && int_log <= VLOG_ALL) {
+			return static_cast<vlog_levels_t>(int_log);
+		}
 		return def_value; // not found. use given def_value
 	}
 

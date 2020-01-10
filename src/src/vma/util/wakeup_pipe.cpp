@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2001-2016 Mellanox Technologies, Ltd. All rights reserved.
+ * Copyright (c) 2001-2017 Mellanox Technologies, Ltd. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -51,12 +51,15 @@
 #define MODULE_HDR_INFO 	MODULE_NAME "[epfd=%d]:%d:%s() "
 #undef	__INFO__
 #define __INFO__	m_epfd
+#define UNINIT_PIPE_FD (-1)
 
-int wakeup_pipe::g_wakeup_pipes[2] = {-1,-1};
+int wakeup_pipe::g_wakeup_pipes[2] = {UNINIT_PIPE_FD, UNINIT_PIPE_FD};
+atomic_t wakeup_pipe::ref_count = ATOMIC_INIT(0);
 
 wakeup_pipe::wakeup_pipe()
 {
-	if (g_wakeup_pipes[0] == -1 && g_wakeup_pipes[1] == -1) {
+	int ref = atomic_fetch_and_inc(&ref_count);
+	if (ref == 0) {
 		BULLSEYE_EXCLUDE_BLOCK_START
 		if (orig_os_api.pipe(g_wakeup_pipes)) {
 			wkup_logpanic("wakeup pipe create failed (errno=%d %m)", errno);
@@ -113,11 +116,23 @@ void wakeup_pipe::remove_wakeup_fd()
 	if (orig_os_api.epoll_ctl(m_epfd, EPOLL_CTL_DEL, g_wakeup_pipes[0], NULL))
 	{
 		BULLSEYE_EXCLUDE_BLOCK_START
-		if (errno == ENOENT)
+		if (errno == ENOENT) {
 			wkup_logdbg("Failed to delete global pipe from internal epfd it was already deleted");
-		else
+		} else {
 			wkup_logerr("failed to delete global pipe from internal epfd (errno=%d %m)", errno);
+		}
 		BULLSEYE_EXCLUDE_BLOCK_END
 	}
 	errno = tmp_errno;
+}
+
+wakeup_pipe::~wakeup_pipe()
+{
+	int ref = atomic_fetch_and_dec(&ref_count);
+	if (ref == 1) {
+		close(g_wakeup_pipes[0]);
+		close(g_wakeup_pipes[1]);
+		g_wakeup_pipes[0] = UNINIT_PIPE_FD;
+		g_wakeup_pipes[1] = UNINIT_PIPE_FD;
+	}
 }

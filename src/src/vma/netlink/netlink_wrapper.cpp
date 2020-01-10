@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2001-2016 Mellanox Technologies, Ltd. All rights reserved.
+ * Copyright (c) 2001-2017 Mellanox Technologies, Ltd. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -53,15 +53,22 @@
 #define nl_logdbg		__log_dbg
 #define nl_logfunc		__log_func
 
-#define ROUTE_MAIN_TABLE_ID (254)
-
 netlink_wrapper* g_p_netlink_handler = NULL;
-rcv_msg_arg_t  	g_nl_rcv_arg;
 
+// structure to pass arguments on internal netlink callbacks handling
+typedef struct rcv_msg_arg
+{
+	netlink_wrapper* netlink;
+	nl_socket_handle* socket_handle;
+	map<e_netlink_event_type, subject*>* subjects_map;
+	nlmsghdr* msghdr;
+} rcv_msg_arg_t;
+
+static rcv_msg_arg_t  	g_nl_rcv_arg;
 
 int nl_msg_rcv_cb(struct nl_msg *msg, void *arg) {
 	nl_logfunc( "---> nl_msg_rcv_cb");
-	if (arg) {} // avoid warn message
+	NOT_IN_USE(arg);
 	g_nl_rcv_arg.msghdr = nlmsg_hdr(msg);
 	// NETLINK MESAGE DEBUG
 	//nl_msg_dump(msg, stdout);
@@ -69,6 +76,9 @@ int nl_msg_rcv_cb(struct nl_msg *msg, void *arg) {
 	return 0;
 }
 
+/* This function is called from internal thread only as neigh_timer_expired()
+ * so it is protected by m_cache_lock call
+ */
 void netlink_wrapper::notify_observers(netlink_event *p_new_event, e_netlink_event_type type)
 {
 	g_nl_rcv_arg.netlink->m_cache_lock.unlock();
@@ -122,14 +132,19 @@ void netlink_wrapper::route_cache_callback(nl_object* obj)
 {
 	nl_logfunc( "---> route_cache_callback");
 	struct rtnl_route* route = (struct rtnl_route*) obj;
-	route_nl_event new_event(g_nl_rcv_arg.msghdr, route,g_nl_rcv_arg.netlink);
-	// notify only route events of main table
-	const netlink_route_info* info =  new_event.get_route_info();
-	if (info->table == ROUTE_MAIN_TABLE_ID) {
-		netlink_wrapper::notify_observers(&new_event, nlgrpROUTE);
+	if (route) {
+		int table_id = rtnl_route_get_table(route);
+		int family = rtnl_route_get_family(route);
+		if ((table_id > (int)RT_TABLE_UNSPEC) && (table_id != RT_TABLE_LOCAL) && (family == AF_INET)) {
+			route_nl_event new_event(g_nl_rcv_arg.msghdr, route, g_nl_rcv_arg.netlink);
+			netlink_wrapper::notify_observers(&new_event, nlgrpROUTE);
+		}
+		else {
+			nl_logdbg("Received event for not handled route entry: family=%d, table_id=%d", family, table_id);
+		}	
 	}
 	else {
-		nl_logfunc("ROUTE events from non-main route table are filtered: table_id=%d", info->table);
+		nl_logdbg("Received invalid route event");
 	}
 	g_nl_rcv_arg.msghdr = NULL;
 	nl_logfunc( "<--- route_cache_callback");
@@ -152,12 +167,12 @@ netlink_wrapper::~netlink_wrapper()
 	/* different handling under LIBNL1 versus LIBNL3 */
 #ifdef HAVE_LIBNL3
 	nl_logdbg( "---> netlink_route_listener DTOR (LIBNL3)");
-	nl_socket_handle_free(m_socket_handle); 
 	/* should not call nl_cache_free() for link, neigh, route as nl_cach_mngr_free() does the freeing */
 	// nl_cache_free(m_cache_link);
 	// nl_cache_free(m_cache_neigh);
 	// nl_cache_free(m_cache_route);
 	nl_cache_mngr_free(m_mngr);	
+	nl_socket_handle_free(m_socket_handle); 
 #else // HAVE_LINBL1
 	nl_logdbg( "---> netlink_route_listener DTOR (LIBNL1)");
 	/* should not call nl_socket_handle_free(m_socket_handle) as nl_cache_mngr_free() does the freeing */ 
@@ -248,10 +263,13 @@ int netlink_wrapper::open_channel()
 
 	if (nl_cache_mngr_compatible_add(m_mngr, "route/neigh", neigh_callback, NULL, &m_cache_neigh))
 		return -1;
+	usleep(500);
 	if (nl_cache_mngr_compatible_add(m_mngr, "route/link", link_callback, NULL, &m_cache_link))
 		return -1;
+	usleep(500);
 	if (nl_cache_mngr_compatible_add(m_mngr, "route/route", route_callback, NULL, &m_cache_route))
 		return -1;
+	usleep(500);
 
 	// set custom callback for every message to update message
 	nl_socket_modify_cb(m_socket_handle, NL_CB_MSG_IN, NL_CB_CUSTOM, nl_msg_rcv_cb ,NULL);

@@ -2,14 +2,9 @@
 
 source $(dirname $0)/globals.sh
 
-check_filter "Checking for coverity ..." "on"
+do_check_filter "Checking for coverity ..." "on"
 
-# This unit requires module so check for existence
-if [ $(command -v module >/dev/null 2>&1 || echo $?) ]; then
-	echo "[SKIP] module tool does not exist"
-	exit 0
-fi
-module load tools/cov
+do_module "tools/cov-8.7"
 
 cd $WORKSPACE
 
@@ -24,17 +19,22 @@ cov_build="$cov_dir/$cov_build_id"
 
 set +eE
 
-${WORKSPACE}/configure --prefix=${cov_dir}/install $jenkins_test_custom_configure
-make clean
-eval "cov-build --dir $cov_build make"
+${WORKSPACE}/configure --prefix=${cov_dir}/install $jenkins_test_custom_configure > "${cov_dir}/cov.log" 2>&1
+make clean >> "${cov_dir}/cov.log" 2>&1
+eval "cov-configure --config $cov_dir/coverity_config.xml --gcc"
+eval "cov-build --config $cov_dir/coverity_config.xml --dir $cov_build make >> "${cov_dir}/cov.log" 2>&1"
 rc=$(($rc+$?))
 
 for excl in $cov_exclude_file_list; do
-    cov-manage-emit --dir $cov_build --tu-pattern "file('$excl')" delete
+    cov-manage-emit --config $cov_dir/coverity_config.xml --dir $cov_build --tu-pattern "file('$excl')" delete
     sleep 1
 done
 
-eval "cov-analyze --enable-fnptr --fnptr-models --all --paths 20000 --dir $cov_build"
+eval "cov-analyze --config $cov_dir/coverity_config.xml \
+	--all --aggressiveness-level low \
+	--enable-fnptr --fnptr-models --paths 20000 \
+	--disable-parse-warnings \
+	--dir $cov_build"
 rc=$(($rc+$?))
 
 set -eE
@@ -54,6 +54,7 @@ coverity_tap=${WORKSPACE}/${prefix}/coverity.tap
 echo 1..1 > $coverity_tap
 if [ $rc -gt 0 ]; then
     echo "not ok 1 Coverity Detected $nerrors failures # $cov_url" >> $coverity_tap
+    do_err "coverity" "${cov_build}/output/summary.txt"
     info="Coverity found $nerrors errors"
     status="error"
 else
@@ -70,7 +71,9 @@ fi
 echo Coverity report: $cov_url
 printf "%s\t%s\n" Coverity $cov_url >> jenkins_sidelinks.txt
 
-module unload tools/cov
+module unload tools/cov-8.7
+
+do_archive "$( find ${cov_build}/output -type f -name "*.txt" -or -name "*.html" -or -name "*.xml" )"
 
 echo "[${0##*/}]..................exit code = $rc"
 exit $rc

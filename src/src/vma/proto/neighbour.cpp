@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2001-2016 Mellanox Technologies, Ltd. All rights reserved.
+ * Copyright (c) 2001-2017 Mellanox Technologies, Ltd. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -42,6 +42,8 @@
 #include "vma/dev/ib_ctx_handler_collection.h"
 #include "vma/proto/neighbour.h"
 #include "vma/proto/neighbour_table_mgr.h"
+#include "vma/proto/route_rule_table_key.h"
+#include "vma/proto/route_table_mgr.h"
 #include "vma/dev/wqe_send_handler.h"
 #include "vma/dev/wqe_send_ib_handler.h"
 
@@ -69,7 +71,6 @@
 		}}
 
 #define RDMA_CM_TIMEOUT 3500
-#define RING_KEY 0
 
 
 /**/
@@ -175,12 +176,23 @@ neigh_val & neigh_ib_val::operator=(const neigh_val & val)
 
 neigh_entry::neigh_entry(neigh_key key, transport_type_t _type, bool is_init_resources):
 	cache_entry_subject<neigh_key, neigh_val *>(key),
-	m_cma_id(NULL), m_rdma_port_space((enum rdma_port_space)0), m_state_machine(NULL), m_type(UNKNOWN), m_trans_type(_type),
-	m_state(false), m_err_counter(0), m_timer_handle(NULL),
-	m_arp_counter(0), m_p_dev(NULL), m_p_ring(NULL), m_is_loopback(false),
+	m_cma_id(NULL),
+	m_rdma_port_space((enum rdma_port_space)0),
+	m_state_machine(NULL),
+	m_type(UNKNOWN),
+	m_trans_type(_type),
+	m_state(false),
+	m_err_counter(0),
+	m_timer_handle(NULL),
+	m_arp_counter(0),
+	m_p_dev(NULL),
+	m_p_ring(NULL),
+	m_is_loopback(false),
 	m_to_str(std::string(priv_vma_transport_type_str(m_trans_type)) + ":" + get_key().to_str()), m_id(0),
 	m_is_first_send_arp(true), m_n_sysvar_neigh_wait_till_send_arp_msec(safe_mce_sys().neigh_wait_till_send_arp_msec),
-	m_n_sysvar_neigh_uc_arp_quata(safe_mce_sys().neigh_uc_arp_quata), m_n_sysvar_neigh_num_err_retries(safe_mce_sys().neigh_num_err_retries)
+	m_n_sysvar_neigh_uc_arp_quata(safe_mce_sys().neigh_uc_arp_quata),
+	m_n_sysvar_neigh_num_err_retries(safe_mce_sys().neigh_num_err_retries),
+	m_res_key(NULL)
 {
 	m_val = NULL;
 	m_p_dev = key.get_net_device_val();
@@ -191,7 +203,8 @@ neigh_entry::neigh_entry(neigh_key key, transport_type_t _type, bool is_init_res
 	}
 
 	if(is_init_resources) {
-		m_p_ring = m_p_dev->reserve_ring(RING_KEY);
+		m_res_key = new resource_allocation_key;
+		m_p_ring = m_p_dev->reserve_ring(m_res_key);
 		if (m_p_ring == NULL) {
 			neigh_logpanic("reserve_ring return NULL");
 		}
@@ -226,11 +239,15 @@ neigh_entry::~neigh_entry()
 		delete m_state_machine;
 		m_state_machine = NULL;
 	}
-	if (m_p_dev && m_p_ring) {
-		m_p_dev->release_ring(RING_KEY);
+	if (m_p_dev && m_p_ring && m_res_key) {
+		m_p_dev->release_ring(m_res_key);
 		m_p_ring = NULL;
+		delete m_res_key;
 	}
-
+	if (m_val) {
+		delete m_val;
+		m_val = NULL;
+	}
 	//TODO:Do we want to check here that unsent queue is empty and if not to send everything?
 
 	neigh_logdbg("Done");
@@ -388,12 +405,13 @@ bool neigh_entry::post_send_udp(iovec * iov, header *h)
 #ifdef VMA_NO_HW_CSUM
 	b_need_sw_csum = true;
 #endif
-
 	mem_buf_desc_t* p_mem_buf_desc, *tmp = NULL;
 	tx_packet_template_t *p_pkt;
-
 	size_t sz_data_payload = iov->iov_len;
-	size_t max_ip_payload_size = ((m_p_ring->get_mtu() - sizeof(struct iphdr)) & ~0x7);
+	iphdr* p_hdr = &h->m_header.hdr.m_ip_hdr;
+
+	int mtu = m_p_ring->get_mtu(route_rule_table_key(p_hdr->daddr, p_hdr->saddr, 0));
+	size_t max_ip_payload_size = ((mtu - sizeof(struct iphdr)) & ~0x7);
 
 	if (sz_data_payload > 65536) {
 		neigh_logdbg("sz_data_payload=%d exceeds max of 64KB", sz_data_payload);
@@ -471,6 +489,7 @@ bool neigh_entry::post_send_udp(iovec * iov, header *h)
 		BULLSEYE_EXCLUDE_BLOCK_END
 
 		wqe_send_handler wqe_sh;
+		vma_wr_tx_packet_attr attr = (vma_wr_tx_packet_attr)0;
 		if (b_need_sw_csum) {
 			neigh_logdbg("ip fragmentation detected, using SW checksum calculation");
 			p_pkt->hdr.m_ip_hdr.check = 0; // use 0 at csum calculation time
@@ -479,6 +498,7 @@ bool neigh_entry::post_send_udp(iovec * iov, header *h)
 		} else {
 			neigh_logdbg("using HW checksum calculation");
 			wqe_sh.enable_hw_csum(m_send_wqe);
+			attr = (vma_wr_tx_packet_attr)(VMA_TX_PACKET_L3_CSUM|VMA_TX_PACKET_L4_CSUM);
 		}
 
 		m_sge.addr = (uintptr_t)(p_mem_buf_desc->p_buffer + (uint8_t)h->m_transport_header_tx_offset);
@@ -493,7 +513,7 @@ bool neigh_entry::post_send_udp(iovec * iov, header *h)
 		p_mem_buf_desc->p_next_desc = NULL;
 
 		// We don't check the return value of post send when we reach the HW we consider that we completed our job
-		m_p_ring->send_ring_buffer(m_id, &m_send_wqe, false);
+		m_p_ring->send_ring_buffer(m_id, &m_send_wqe, attr);
 
 		p_mem_buf_desc = tmp;
 
@@ -557,6 +577,7 @@ bool neigh_entry::post_send_tcp(iovec *iov, header *h)
 	}
 
 	m_send_wqe.wr_id = (uintptr_t)p_mem_buf_desc;
+	vma_wr_tx_packet_attr attr = (vma_wr_tx_packet_attr)0;
 #ifdef VMA_NO_HW_CSUM
 		p_pkt->hdr.m_ip_hdr.check = 0; // use 0 at csum calculation time
 		p_pkt->hdr.m_ip_hdr.check = compute_ip_checksum((unsigned short*)&p_pkt->hdr.m_ip_hdr, p_pkt->hdr.m_ip_hdr.ihl * 2);
@@ -564,11 +585,13 @@ bool neigh_entry::post_send_tcp(iovec *iov, header *h)
 		p_tcphdr->check = 0;
 		p_tcphdr->check = compute_tcp_checksum(&p_pkt->hdr.m_ip_hdr, (const uint16_t *)p_tcphdr);
 		neigh_logdbg("using SW checksum calculation: p_pkt->hdr.m_ip_hdr.check=%d, p_tcphdr->check=%d", (int)p_tcphdr->check, (int)p_pkt->hdr.m_ip_hdr.check);
+#else
+	attr = (vma_wr_tx_packet_attr)(VMA_TX_PACKET_L3_CSUM|VMA_TX_PACKET_L4_CSUM);
 #endif
-	m_p_ring->send_ring_buffer(m_id, &m_send_wqe, false);
+	m_p_ring->send_ring_buffer(m_id, &m_send_wqe, attr);
 #ifndef __COVERITY__
 	struct tcphdr* p_tcp_h = (struct tcphdr*)(((uint8_t*)(&(p_pkt->hdr.m_ip_hdr))+sizeof(p_pkt->hdr.m_ip_hdr)));
-	NOT_IN_USE(p_tcp_h); /* to supress warning in case VMA_OPTIMIZE_LOG */
+	NOT_IN_USE(p_tcp_h); /* to supress warning in case VMA_MAX_DEFINED_LOG_LEVEL */
 	neigh_logdbg("Tx TCP segment info: src_port=%d, dst_port=%d, flags='%s%s%s%s%s%s' seq=%u, ack=%u, win=%u, payload_sz=%u",
 			ntohs(p_tcp_h->source), ntohs(p_tcp_h->dest),
 			p_tcp_h->urg?"U":"", p_tcp_h->ack?"A":"", p_tcp_h->psh?"P":"",
@@ -937,7 +960,7 @@ void neigh_entry::dofunc_enter_ready(const sm_info_t& func_info)
 
 void neigh_entry::priv_general_st_entry(const sm_info_t& func_info)
 {
-	NOT_IN_USE(func_info); /* to supress warning in case VMA_OPTIMIZE_LOG */
+	NOT_IN_USE(func_info); /* to supress warning in case VMA_MAX_DEFINED_LOG_LEVEL */
 	neigh_logdbg("State change: %s (%d) => %s (%d) with event %s (%d)",
 		state_to_str((state_t) func_info.old_state), func_info.old_state,
 		state_to_str((state_t) func_info.new_state), func_info.new_state,
@@ -951,8 +974,8 @@ void neigh_entry::priv_general_st_leave(const sm_info_t& func_info)
 
 void neigh_entry::priv_print_event_info(state_t state, event_t event)
 {
-	NOT_IN_USE(state); /* to supress warning in case VMA_OPTIMIZE_LOG */
-	NOT_IN_USE(event); /* to supress warning in case VMA_OPTIMIZE_LOG */
+	NOT_IN_USE(state); /* to supress warning in case VMA_MAX_DEFINED_LOG_LEVEL */
+	NOT_IN_USE(event); /* to supress warning in case VMA_MAX_DEFINED_LOG_LEVEL */
 	neigh_logdbg("Got event '%s' (%d) in state '%s' (%d)",
 		event_to_str(event), event, state_to_str(state), state);
 }
@@ -1451,7 +1474,7 @@ bool neigh_eth::post_send_arp(bool is_broadcast)
 	p_mem_buf_desc->p_next_desc = NULL;
 	m_send_wqe.wr_id = (uintptr_t)p_mem_buf_desc;
 
-	m_p_ring->send_ring_buffer(m_id, &m_send_wqe, false);
+	m_p_ring->send_ring_buffer(m_id, &m_send_wqe, (vma_wr_tx_packet_attr)0);
 
 	neigh_logdbg("ARP Sent");
 	return true;
@@ -1716,7 +1739,7 @@ bool neigh_ib::post_send_arp(bool is_broadcast)
 	p_mem_buf_desc->p_next_desc = NULL;
 	m_send_wqe.wr_id = (uintptr_t)p_mem_buf_desc;
 
-	m_p_ring->send_ring_buffer(m_id, &m_send_wqe, false);
+	m_p_ring->send_ring_buffer(m_id, &m_send_wqe, (vma_wr_tx_packet_attr)0);
 
 	neigh_logdbg("ARP Sent");
 	return true;

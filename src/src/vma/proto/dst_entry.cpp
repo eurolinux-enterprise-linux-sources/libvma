@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2001-2016 Mellanox Technologies, Ltd. All rights reserved.
+ * Copyright (c) 2001-2017 Mellanox Technologies, Ltd. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -48,10 +48,11 @@
 #define dst_logfuncall         __log_info_funcall
 
 
-dst_entry::dst_entry(in_addr_t dst_ip, uint16_t dst_port, uint16_t src_port, int owner_fd):
+dst_entry::dst_entry(in_addr_t dst_ip, uint16_t dst_port, uint16_t src_port, int owner_fd, resource_allocation_key &ring_alloc_logic):
 	m_dst_ip(dst_ip), m_dst_port(dst_port), m_src_port(src_port), m_bound_ip(0),
-	m_so_bindtodevice_ip(0), m_ring_alloc_logic(owner_fd, this), m_p_tx_mem_buf_desc_list(NULL),
-	m_b_tx_mem_buf_desc_list_pending(false), m_id(0)
+	m_so_bindtodevice_ip(0), m_route_src_ip(0), m_pkt_src_ip(0),
+	m_ring_alloc_logic(owner_fd, ring_alloc_logic, this),
+	m_p_tx_mem_buf_desc_list(NULL), m_b_tx_mem_buf_desc_list_pending(false), m_id(0)
 {
 	dst_logdbg("dst:%s:%d src: %d", m_dst_ip.to_str().c_str(), ntohs(m_dst_port), ntohs(m_src_port));
 	init_members();
@@ -62,11 +63,15 @@ dst_entry::~dst_entry()
 	dst_logdbg("%s", to_str().c_str());
 
 	if (m_p_neigh_entry) {
-		g_p_neigh_table_mgr->unregister_observer(neigh_key(m_dst_ip, m_p_net_dev_val),this);
+		ip_address dst_addr = m_dst_ip;
+		if (m_p_rt_val && m_p_rt_val->get_gw_addr() != INADDR_ANY && !dst_addr.is_mc()) {
+			dst_addr = m_p_rt_val->get_gw_addr();
+		}
+		g_p_neigh_table_mgr->unregister_observer(neigh_key(dst_addr, m_p_net_dev_val),this);
 	}
 
 	if (m_p_rt_entry) {
-		g_p_route_table_mgr->unregister_observer(route_rule_table_key(m_dst_ip.get_in_addr(), m_bound_ip ? m_bound_ip : m_so_bindtodevice_ip, m_tos), this);
+		g_p_route_table_mgr->unregister_observer(route_rule_table_key(m_dst_ip.get_in_addr(), m_route_src_ip, m_tos), this);
 		m_p_rt_entry = NULL;
 	}
 
@@ -93,6 +98,7 @@ dst_entry::~dst_entry()
 		delete m_p_neigh_val;
 		m_p_neigh_val = NULL;
 	}
+
 	dst_logdbg("Done %s", to_str().c_str());
 }
 
@@ -109,6 +115,7 @@ void dst_entry::init_members()
 	m_num_sge = 0;
 	memset(&m_inline_send_wqe, 0, sizeof(m_inline_send_wqe));
 	memset(&m_not_inline_send_wqe, 0, sizeof(m_not_inline_send_wqe));
+	memset(&m_fragmented_send_wqe, 0, sizeof(m_not_inline_send_wqe));
 	m_p_send_wqe_handler = NULL;
 	memset(&m_sge, 0, sizeof(m_sge));
 	m_tos = 0;
@@ -118,9 +125,23 @@ void dst_entry::init_members()
 	m_p_send_wqe = NULL;
 	m_max_inline = 0;
 	m_max_ip_payload_size = 0;
+	m_max_udp_payload_size = 0;
 	m_b_force_os = false;
 }
 
+void dst_entry::set_src_addr()
+{
+	m_pkt_src_ip = INADDR_ANY;
+	if (m_route_src_ip) {
+		m_pkt_src_ip = m_route_src_ip;
+	}
+	else if (m_p_rt_val && m_p_rt_val->get_src_addr()) {
+		m_pkt_src_ip = m_p_rt_val->get_src_addr();
+	}
+	else if (m_p_net_dev_val && m_p_net_dev_val->get_local_addr()) {
+		m_pkt_src_ip = m_p_net_dev_val->get_local_addr();
+	}
+}
 
 bool dst_entry::update_net_dev_val()
 {
@@ -140,7 +161,11 @@ bool dst_entry::update_net_dev_val()
 		dst_logdbg("updating net_device");
 
 		if (m_p_neigh_entry) {
-			g_p_neigh_table_mgr->unregister_observer(neigh_key(m_dst_ip, m_p_net_dev_val),this);
+			ip_address dst_addr = m_dst_ip;
+			if (m_p_rt_val && m_p_rt_val->get_gw_addr() != INADDR_ANY && !dst_addr.is_mc()) {
+				dst_addr = m_p_rt_val->get_gw_addr();
+			}
+			g_p_neigh_table_mgr->unregister_observer(neigh_key(dst_addr, m_p_net_dev_val),this);
 			m_p_neigh_entry = NULL;
 		}
 
@@ -185,8 +210,8 @@ bool dst_entry::update_rt_val()
 			dst_logdbg("updating route val");
 			m_p_rt_val = p_rt_val;
 		}
-			}
-			else {
+	}
+	else {
 		dst_logdbg("Route entry is not valid");
 		ret_val = false;
 	}
@@ -194,7 +219,7 @@ bool dst_entry::update_rt_val()
 	return ret_val;
 }
 
-bool dst_entry::resolve_net_dev()
+bool dst_entry::resolve_net_dev(bool is_connect)
 {
 	bool ret_val = false;
 
@@ -210,20 +235,39 @@ bool dst_entry::resolve_net_dev()
 		return ret_val;
 	}
 	
-	
-	route_rule_table_key rtk(m_dst_ip.get_in_addr(), m_bound_ip ? m_bound_ip : m_so_bindtodevice_ip, m_tos);
-	
-	if (m_p_rt_entry || g_p_route_table_mgr->register_observer(rtk, this, &p_ces)) {
-	
-		if (m_p_rt_entry == NULL) {
+	//When VMA will support routing with OIF, we need to check changing in outgoing interface
+	//Source address changes is not checked since multiple bind is not allowed on the same socket
+	if (!m_p_rt_entry) {
+		m_route_src_ip = m_bound_ip;
+		route_rule_table_key rtk(m_dst_ip.get_in_addr(), m_route_src_ip, m_tos);
+		if (g_p_route_table_mgr->register_observer(rtk, this, &p_ces)) {
 			// In case this is the first time we trying to resolve route entry,
 			// means that register_observer was run
 			m_p_rt_entry = dynamic_cast<route_entry*>(p_ces);
+			if (is_connect && !m_route_src_ip) {
+				route_val* p_rt_val = NULL;
+				if (m_p_rt_entry && m_p_rt_entry->get_val(p_rt_val) && p_rt_val->get_src_addr()) {
+					g_p_route_table_mgr->unregister_observer(rtk, this);
+					m_route_src_ip = p_rt_val->get_src_addr();
+					route_rule_table_key new_rtk(m_dst_ip.get_in_addr(), m_route_src_ip, m_tos);
+					if (g_p_route_table_mgr->register_observer(new_rtk, this, &p_ces)) {
+						m_p_rt_entry = dynamic_cast<route_entry*>(p_ces);
+					}
+					else {
+						dst_logdbg("Error in route resolving logic");
+						return ret_val;
+					}
+				}
+			}
 		}
+		else {
+			dst_logdbg("Error in registering route entry");
+			return ret_val;
+		}
+	}
 
-		if(update_rt_val()) {
-			ret_val = update_net_dev_val();
-		}
+	if (update_rt_val()) {
+		ret_val = update_net_dev_val();
 	}
 	return ret_val;
 }
@@ -264,8 +308,8 @@ bool dst_entry::resolve_ring()
 			m_p_ring = m_p_net_dev_val->reserve_ring(m_ring_alloc_logic.create_new_key());
 		}
 		if (m_p_ring) {
-			m_max_inline = m_p_ring->get_max_tx_inline();
-			m_max_inline = std::min(m_max_inline, m_p_net_dev_val->get_mtu() + (uint32_t)m_header.m_transport_header_len);
+			m_max_inline = std::min<uint32_t>(m_p_ring->get_max_tx_inline(),
+					get_route_mtu() + m_header.m_transport_header_len);
 			ret_val = true;
 		}
 	}
@@ -282,7 +326,10 @@ bool dst_entry::release_ring()
 				m_p_tx_mem_buf_desc_list = NULL;
 			}
 			dst_logdbg("releasing a ring");
-			m_p_net_dev_val->release_ring(m_ring_alloc_logic.get_key());
+			if (m_p_net_dev_val->release_ring(m_ring_alloc_logic.get_key())) {
+				dst_logerr("Failed to release ring for allocation key %s",
+					   m_ring_alloc_logic.get_key()->to_str());
+			}
 			m_p_ring = NULL;
 		}
 		ret_val = true;
@@ -298,7 +345,7 @@ void dst_entry::notify_cb()
 
 void dst_entry::configure_ip_header(header *h, uint16_t packet_id)
 {
-	h->configure_ip_header(get_protocol_type(), m_bound_ip ? m_bound_ip : m_p_net_dev_val->get_local_addr(), m_dst_ip.get_in_addr(), m_ttl, m_tos, packet_id);
+	h->configure_ip_header(get_protocol_type(), m_pkt_src_ip, m_dst_ip.get_in_addr(), m_ttl, m_tos, packet_id);
 }
 
 bool dst_entry::conf_l2_hdr_and_snd_wqe_eth()
@@ -316,7 +363,8 @@ bool dst_entry::conf_l2_hdr_and_snd_wqe_eth()
 		dst_logpanic("%s Failed to allocate send WQE handler", to_str().c_str());
 	}
 	m_p_send_wqe_handler->init_inline_wqe(m_inline_send_wqe, get_sge_lst_4_inline_send(), get_inline_sge_num());
-	m_p_send_wqe_handler->init_wqe(m_not_inline_send_wqe, get_sge_lst_4_not_inline_send(), 1);
+	m_p_send_wqe_handler->init_not_inline_wqe(m_not_inline_send_wqe, get_sge_lst_4_not_inline_send(), 1);
+	m_p_send_wqe_handler->init_wqe(m_fragmented_send_wqe, get_sge_lst_4_not_inline_send(), 1);
 
 	net_device_val_eth *netdevice_eth = dynamic_cast<net_device_val_eth*>(m_p_net_dev_val);
 	BULLSEYE_EXCLUDE_BLOCK_START
@@ -377,7 +425,8 @@ bool  dst_entry::conf_l2_hdr_and_snd_wqe_ib()
 		}
 		BULLSEYE_EXCLUDE_BLOCK_END
 		((wqe_send_ib_handler *)(m_p_send_wqe_handler))->init_inline_ib_wqe(m_inline_send_wqe, get_sge_lst_4_inline_send(), get_inline_sge_num(), ah, qpn, qkey);
-		((wqe_send_ib_handler*)(m_p_send_wqe_handler))->init_ib_wqe(m_not_inline_send_wqe, get_sge_lst_4_not_inline_send(), 1, ah, qpn, qkey);
+		((wqe_send_ib_handler*)(m_p_send_wqe_handler))->init_not_inline_ib_wqe(m_not_inline_send_wqe, get_sge_lst_4_not_inline_send(), 1, ah, qpn, qkey);
+		((wqe_send_ib_handler*)(m_p_send_wqe_handler))->init_ib_wqe(m_fragmented_send_wqe, get_sge_lst_4_not_inline_send(), 1, ah, qpn, qkey);
 		m_header.configure_ipoib_headers();
 		init_sge();
 
@@ -420,7 +469,7 @@ bool dst_entry::get_net_dev_val()
 	bool ret_val = false;
 
 	if (m_p_rt_entry) {
-		ret_val = m_p_rt_entry->get_val(m_p_rt_val);
+		m_p_rt_entry->get_val(m_p_rt_val);
 		ret_val = true;
 	}
 	else {
@@ -447,17 +496,13 @@ transport_type_t dst_entry::get_obs_transport_type() const
 
 flow_tuple dst_entry::get_flow_tuple() const
 {
-	in_addr_t src_ip = 0;
 	in_addr_t dst_ip = 0;
 	in_protocol_t protocol = PROTO_UNDEFINED;
 
-	if (m_p_net_dev_val) {
-		src_ip = m_p_net_dev_val->get_local_addr();
-	}
 	dst_ip = m_dst_ip.get_in_addr();
 	protocol = (in_protocol_t)get_protocol_type();
 
-	return flow_tuple(dst_ip, m_dst_port, src_ip, m_src_port, protocol);
+	return flow_tuple(dst_ip, m_dst_port, m_pkt_src_ip, m_src_port, protocol);
 }
 
 #if _BullseyeCoverage
@@ -484,7 +529,7 @@ bool dst_entry::offloaded_according_to_rules()
 	return ret_val;
 }
 
-bool dst_entry::prepare_to_send(bool skip_rules)
+bool dst_entry::prepare_to_send(const int ratelimit_kbps, bool skip_rules, bool is_connect)
 {
 	bool resolved = false;
 	m_slow_path_lock.lock();
@@ -500,21 +545,28 @@ bool dst_entry::prepare_to_send(bool skip_rules)
 	if (!m_b_force_os && !is_valid()) {
 		bool is_ofloaded = false;
 		set_state(true);
-		if (resolve_net_dev()) {
-			m_max_ip_payload_size = ((m_p_net_dev_val->get_mtu()-sizeof(struct iphdr)) & ~0x7);
+		if (resolve_net_dev(is_connect)) {
+			set_src_addr();
+			// overwrite mtu from route if exists
+			m_max_udp_payload_size = get_route_mtu() - sizeof(struct iphdr);
+			m_max_ip_payload_size = m_max_udp_payload_size & ~0x7;
 			if (resolve_ring()) {
 				is_ofloaded = true;
+				if (ratelimit_kbps) {
+					modify_ratelimit(ratelimit_kbps);
+				}
 				if (resolve_neigh()) {
-					if (get_obs_transport_type() == VMA_TRANSPORT_ETH)
+					if (get_obs_transport_type() == VMA_TRANSPORT_ETH) {
 						dst_logdbg("local mac: %s peer mac: %s", m_p_net_dev_val->get_l2_address()->to_str().c_str(), m_p_neigh_val->get_l2_address()->to_str().c_str());
-					else
+					} else {
 						dst_logdbg("peer L2 address: %s", m_p_neigh_val->get_l2_address()->to_str().c_str());
+					}
 					configure_headers();
 					m_id = m_p_ring->generate_id(m_p_net_dev_val->get_l2_address()->get_address(),
 								     m_p_neigh_val->get_l2_address()->get_address(),
 								     ((ethhdr*)(m_header.m_actual_hdr_addr))->h_proto /* if vlan, use vlan proto */,
 								     htons(ETH_P_IP),
-								     m_bound_ip ? m_bound_ip : m_p_net_dev_val->get_local_addr(),
+								     m_pkt_src_ip,
 								     m_dst_ip.get_in_addr(),
 								     m_src_port,
 								     m_dst_port);
@@ -549,6 +601,14 @@ bool dst_entry::try_migrate_ring(lock_base& socket_lock)
 	return false;
 }
 
+int dst_entry::get_route_mtu()
+{
+	if (m_p_rt_val && m_p_rt_val->get_mtu() > 0 ) {
+		return m_p_rt_val->get_mtu();
+	}
+	return m_p_net_dev_val->get_mtu();
+}
+
 void dst_entry::do_ring_migration(lock_base& socket_lock)
 {
 	m_slow_path_lock.lock();
@@ -558,14 +618,17 @@ void dst_entry::do_ring_migration(lock_base& socket_lock)
 		return;
 	}
 
-	resource_allocation_key old_key = m_ring_alloc_logic.get_key();
-	resource_allocation_key new_key = m_ring_alloc_logic.create_new_key(old_key);
-
-	if (old_key == new_key) {
+	resource_allocation_key *new_key = m_ring_alloc_logic.get_key();
+	uint64_t new_calc_id = m_ring_alloc_logic.calc_res_key_by_logic();
+	// Check again if migration is needed before migration
+	if (new_key->get_user_id_key() == new_calc_id) {
 		m_slow_path_lock.unlock();
 		return;
 	}
-
+	// Save old key for release
+	resource_allocation_key old_key(*m_ring_alloc_logic.get_key());
+	// Update key to new ID
+	new_key->set_user_id_key(new_calc_id);
 	m_slow_path_lock.unlock();
 	socket_lock.unlock();
 
@@ -575,12 +638,16 @@ void dst_entry::do_ring_migration(lock_base& socket_lock)
 		return;
 	}
 	if (new_ring == m_p_ring) {
-		m_p_net_dev_val->release_ring(old_key);
+		if (!m_p_net_dev_val->release_ring(&old_key)) {
+			dst_logerr("Failed to release ring for allocation key %s",
+				  old_key.to_str());
+		}
 		socket_lock.lock();
 		return;
 	}
 
-	dst_logdbg("migrating from key=%lu and ring=%p to key=%lu and ring=%p", old_key, m_p_ring, new_key, new_ring);
+	dst_logdbg("migrating from key=%s and ring=%p to key=%s and ring=%p",
+		   old_key.to_str(), m_p_ring, new_key->to_str(), new_ring);
 
 	socket_lock.lock();
 	m_slow_path_lock.lock();
@@ -590,7 +657,8 @@ void dst_entry::do_ring_migration(lock_base& socket_lock)
 	ring* old_ring = m_p_ring;
 	m_p_ring = new_ring;
 	m_max_inline = m_p_ring->get_max_tx_inline();
-	m_max_inline = std::min(m_max_inline, m_p_net_dev_val->get_mtu() + (uint32_t)m_header.m_transport_header_len);
+	m_max_inline = std::min<uint32_t>(m_max_inline,
+				get_route_mtu() + m_header.m_transport_header_len);
 
 	mem_buf_desc_t* tmp_list = m_p_tx_mem_buf_desc_list;
 	m_p_tx_mem_buf_desc_list = NULL;
@@ -602,7 +670,7 @@ void dst_entry::do_ring_migration(lock_base& socket_lock)
 		old_ring->mem_buf_tx_release(tmp_list, true);
 	}
 
-	m_p_net_dev_val->release_ring(old_key);
+	m_p_net_dev_val->release_ring(&old_key);
 
 	socket_lock.lock();
 }
@@ -619,16 +687,6 @@ void dst_entry::set_so_bindtodevice_addr(in_addr_t addr)
 	dst_logdbg("");
 	m_so_bindtodevice_ip = addr;
 	set_state(false);
-}
-
-in_addr_t dst_entry::get_src_addr()
-{
-	in_addr_t ret_val = INADDR_ANY;
-
-	if (m_p_net_dev_val) {
-		ret_val = m_p_net_dev_val->get_local_addr();
-	}
-	return ret_val;
 }
 
 in_addr_t dst_entry::get_dst_addr()
@@ -703,4 +761,12 @@ void dst_entry::return_buffers_pool()
 	} else {
 		set_tx_buff_list_pending(true);
 	}
+}
+
+int dst_entry::modify_ratelimit(const uint32_t ratelimit_kbps)
+{
+	if (m_p_ring) {
+		return m_p_ring->modify_ratelimit(ratelimit_kbps);
+	}
+	return 0;
 }

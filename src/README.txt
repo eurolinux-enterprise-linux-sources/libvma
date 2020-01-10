@@ -1,4 +1,4 @@
-Updated: 25 Aug 2015
+Update: 07 Nov 2017
 
 Introduction
 ============
@@ -92,13 +92,13 @@ Please notice that except VMA_TRACELEVEL, VMA logs just those parameters whose v
 
 Example:
  VMA INFO: ---------------------------------------------------------------------------
- VMA INFO: VMA_VERSION: 7.0.11-0
- VMA INFO: Cmd Line: sockperf sr
- VMA INFO: Current Time: Tue Dec 22 16:17:53 2015
- VMA INFO: Pid:  5797
- VMA INFO: OFED Version: MLNX_OFED_LINUX-3.1-1.5.5:
+ VMA INFO: VMA_VERSION: 8.4.3-0 Development Snapshot built on Sep  3 2017 11:58:07
+ VMA INFO: Cmd Line: sockperf sr -i 4.4.4.3
+ VMA INFO: Current Time: Sun Sep  3 12:03:14 2017
+ VMA INFO: Pid: 29881
+ VMA INFO: OFED Version: MLNX_OFED_LINUX-4.1-2.0.0.0:
  VMA INFO: Architecture: x86_64
- VMA INFO: Node: r-aa-bob06.mtr.labs.mlnx
+ VMA INFO: Node: r-aa-bob3.mtr.labs.mlnx
  VMA INFO: ---------------------------------------------------------------------------
  VMA INFO: Log Level                      DETAILS                    [VMA_TRACELEVEL]
  VMA DETAILS: Log Details                    0                          [VMA_LOG_DETAILS]
@@ -117,23 +117,25 @@ Example:
  VMA DETAILS: Ring migration ratio TX        100                        [VMA_RING_MIGRATION_RATIO_TX]
  VMA DETAILS: Ring migration ratio RX        100                        [VMA_RING_MIGRATION_RATIO_RX]
  VMA DETAILS: Ring limit per interface       0 (no limit)               [VMA_RING_LIMIT_PER_INTERFACE]
+ VMA DETAILS: Ring On Device Memory TX       0                          [VMA_RING_DEV_MEM_TX]
  VMA DETAILS: TCP max syn rate               0 (no limit)               [VMA_TCP_MAX_SYN_RATE]
  VMA DETAILS: Tx Mem Segs TCP                1000000                    [VMA_TX_SEGS_TCP]
  VMA DETAILS: Tx Mem Bufs                    200000                     [VMA_TX_BUFS]
- VMA DETAILS: Tx QP WRE                      3000                       [VMA_TX_WRE]
+ VMA DETAILS: Tx QP WRE                      2048                       [VMA_TX_WRE]
  VMA DETAILS: Tx QP WRE Batching             64                         [VMA_TX_WRE_BATCHING]
- VMA DETAILS: Tx Max QP INLINE               220                        [VMA_TX_MAX_INLINE]
+ VMA DETAILS: Tx Max QP INLINE               204                        [VMA_TX_MAX_INLINE]
  VMA DETAILS: Tx MC Loopback                 Enabled                    [VMA_TX_MC_LOOPBACK]
  VMA DETAILS: Tx non-blocked eagains         Disabled                   [VMA_TX_NONBLOCKED_EAGAINS]
  VMA DETAILS: Tx Prefetch Bytes              256                        [VMA_TX_PREFETCH_BYTES]
  VMA DETAILS: Rx Mem Bufs                    200000                     [VMA_RX_BUFS]
  VMA DETAILS: Rx QP WRE                      16000                      [VMA_RX_WRE]
- VMA DETAILS: Rx QP WRE BATCHING             64                         [VMA_RX_WRE_BATCHING]
+ VMA DETAILS: Rx QP WRE Batching             64                         [VMA_RX_WRE_BATCHING]
  VMA DETAILS: Rx Byte Min Limit              65536                      [VMA_RX_BYTES_MIN]
  VMA DETAILS: Rx Poll Loops                  100000                     [VMA_RX_POLL]
  VMA DETAILS: Rx Poll Init Loops             0                          [VMA_RX_POLL_INIT]
  VMA DETAILS: Rx UDP Poll OS Ratio           100                        [VMA_RX_UDP_POLL_OS_RATIO]
- VMA DETAILS: Rx UDP HW TS Conversion        3                          [VMA_RX_UDP_HW_TS_CONVERSION]
+ VMA DETAILS: HW TS Conversion               3                          [VMA_HW_TS_CONVERSION]
+ VMA DETAILS: Rx SW CSUM                     1                          [VMA_RX_SW_CSUM]
  VMA DETAILS: Rx Poll Yield                  Disabled                   [VMA_RX_POLL_YIELD]
  VMA DETAILS: Rx Prefetch Bytes              256                        [VMA_RX_PREFETCH_BYTES]
  VMA DETAILS: Rx Prefetch Bytes Before Poll  0                          [VMA_RX_PREFETCH_BYTES_BEFORE_POLL]
@@ -141,6 +143,7 @@ Example:
  VMA DETAILS: GRO max streams                32                         [VMA_GRO_STREAMS_MAX]
  VMA DETAILS: TCP 3T rules                   Disabled                   [VMA_TCP_3T_RULES]
  VMA DETAILS: ETH MC L2 only rules           Disabled                   [VMA_ETH_MC_L2_ONLY_RULES]
+ VMA DETAILS: Force Flowtag for MC           Disabled                   [VMA_MC_FORCE_FLOWTAG]
  VMA DETAILS: Select Poll (usec)             100000                     [VMA_SELECT_POLL]
  VMA DETAILS: Select Poll OS Force           Disabled                   [VMA_SELECT_POLL_OS_FORCE]
  VMA DETAILS: Select Poll OS Ratio           10                         [VMA_SELECT_POLL_OS_RATIO]
@@ -162,8 +165,11 @@ Example:
  VMA DETAILS: TCP Timer Resolution (msec)    100                        [VMA_TCP_TIMER_RESOLUTION_MSEC]
  VMA DETAILS: TCP control thread             0 (Disabled)               [VMA_TCP_CTL_THREAD]
  VMA DETAILS: TCP timestamp option           0                          [VMA_TCP_TIMESTAMP_OPTION]
- VMA DETAILS: Exception handling mode        -1 (just log debug message) [VMA_EXCEPTION_HANDLING]
+ VMA DETAILS: TCP nodelay                    0                          [VMA_TCP_NODELAY]
+ VMA DETAILS: TCP quickack                   0                          [VMA_TCP_QUICKACK]
+ VMA DETAILS: Exception handling mode        -1(just log debug message) [VMA_EXCEPTION_HANDLING]
  VMA DETAILS: Avoid sys-calls on tcp fd      Disabled                   [VMA_AVOID_SYS_CALLS_ON_TCP_FD]
+ VMA DETAILS: Allow privileged sock opt      Enabled                    [VMA_ALLOW_PRIVILEGED_SOCK_OPT]
  VMA DETAILS: Delay after join (msec)        0                          [VMA_WAIT_AFTER_JOIN_MSEC]
  VMA DETAILS: Internal Thread Affinity       -1                         [VMA_INTERNAL_THREAD_AFFINITY]
  VMA DETAILS: Internal Thread Cpuset                                    [VMA_INTERNAL_THREAD_CPUSET]
@@ -182,9 +188,9 @@ Example:
  VMA DETAILS: MTU                            0 (follow actual MTU)      [VMA_MTU]
  VMA DETAILS: MSS                            0 (follow VMA_MTU)         [VMA_MSS]
  VMA DETAILS: TCP CC Algorithm               0 (LWIP)                   [VMA_TCP_CC_ALGO]
- VMA DETAILS: Suppress IGMP ver. warning     Disabled                   [VMA_SUPPRESS_IGMP_WARNING]
+ VMA DETAILS: Polling Rx on Tx TCP           Disabled                   [VMA_RX_POLL_ON_TX_TCP]
+ VMA DETAILS: Trig dummy send getsockname()  Disabled                   [VMA_TRIGGER_DUMMY_SEND_GETSOCKNAME]
  VMA INFO: ---------------------------------------------------------------------------
-
 
 VMA_TRACELEVEL 
 Logging level the VMA library will be using. Default is info
@@ -250,6 +256,54 @@ the process loaded with VMA. This can help in running multiple instances of VMA
 each with it's own log file name.
 Example:  VMA_LOG_FILE=/tmp/vma_log.txt
 
+VMA_SPEC
+VMA predefined specification profiles.
+
+latency
+    Optimized for use cases that are keen on latency. i.e. Ping-Pong tests.
+
+    Latency SPEC changes the following default configuration
+     VMA_RING_DEV_MEM_TX = 16384              (default: 0)
+     VMA_TX_WRE = 256                         (default: 2048)
+     VMA_TX_WRE_BATCHING = 4                  (default: 64)
+     VMA_RX_WRE = 256                         (default: 16000)
+     VMA_RX_WRE_BATCHING = 4                  (default: 64)
+     VMA_RX_POLL = -1                         (default: 100000)
+     VMA_RX_PREFETCH_BYTES_BEFORE_POLL = 256  (default: 0)
+     VMA_GRO_STREAMS_MAX = 0                  (default: 32)
+     VMA_SELECT_POLL = -1                     (default: 100000)
+     VMA_SELECT_POLL_OS_FORCE = Enable        (default: Disabled)
+     VMA_SELECT_POLL_OS_RATIO = 1             (default: 10)
+     VMA_SELECT_SKIP_OS = 1                   (default: 4)
+     VMA_PROGRESS_ENGINE_INTERVAL = 100       (default: 10)
+     VMA_CQ_MODERATION_ENABLE = Disable       (default: Enabled)
+     VMA_CQ_AIM_MAX_COUNT = 128               (default: 560)
+     VMA_CQ_AIM_INTERVAL_MSEC = Disable       (default: 250)
+     VMA_CQ_KEEP_QP_FULL = Disable            (default: Enable)
+     VMA_TCP_NODELAY = Enable                 (default: Disable)
+     VMA_AVOID_SYS_CALLS_ON_TCP_FD = Enable   (default: Disable)
+     VMA_INTERNAL_THREAD_AFFINITY = 0         (default: -1)
+     VMA_THREAD_MODE = Single                 (default: Multi spin lock)
+     VMA_MEM_ALLOC_TYPE = 2                   (default: 1 (Contig Pages))
+
+    Example: VMA_SPEC=latency
+
+multi_ring_latency
+     Optimized for use cases that are keen on latency where two applications communicate using send-only and receive-only TCP sockets
+          
+    Multi ring latency SPEC changes the following default configuration
+     VMA_MEM_ALLOC_TYPE = 2                    (default: 1 (Contig Pages))
+     VMA_SELECT_POLL = -1                      (default: 100000)
+     VMA_RX_POLL = -1                          (default: 100000)
+     VMA_RING_ALLOCATION_LOGIC_TX = 20         (default: Ring per interface)
+     VMA_RING_ALLOCATION_LOGIC_RX = 20         (default: Ring per interface)
+     VMA_SELECT_POLL_OS_RATIO = 0              (default: 10)
+     VMA_SELECT_SKIP_OS = 0                    (default: 4)
+     VMA_RX_POLL_ON_TX_TCP = true              (dafault: false)
+     VMA_TRIGGER_DUMMY_SEND_GETSOCKNAME = true (dafault: false)
+
+    Example: VMA_SPEC=multi_ring_latency
+
 VMA_STATS_FILE
 Redirect socket statistics to a specific user defined file.
 VMA will dump each socket's statistics into a file when closing the socket.
@@ -303,7 +357,7 @@ VMA_TX_WRE
 Number of Work Request Elements allocated in all transmit QP's.
 The number of QP's can change according to the number of network offloaded
 interfaces.
-Default value is 3000
+Default value is 2048
 
 VMA_TX_WRE_BATCHING
 The number of Tx Work Request Elements used until a completion signal is requested.
@@ -319,7 +373,7 @@ Data copied into the INLINE space is at least 32 bytes of headers and
 the rest can be user datagram payload.
 VMA_TX_MAX_INLINE=0 disables INLINEing on the tx transmit path.
 In older releases this parameter was called: VMA_MAX_INLINE
-Default VMA_TX_MAX_INLINE is 220
+Default VMA_TX_MAX_INLINE is 204
 
 VMA_TX_MC_LOOPBACK
 This parameter sets the initial value used by VMA internally to controls the
@@ -384,14 +438,22 @@ rings in the system. Each ring consume VMA_RX_WRE buffers.]
 Use a value of 0 for unlimited number of rings.
 Default value is 0 (no limit)
 
+VMA_RING_DEV_MEM_TX
+VMA can use the On Device Memory to store the egress packet if it does not fit into
+the BF inline buffer. This improves application egress latency by reducing PCI transactions.
+Using VMA_RING_DEV_MEM_TX, the user can set the amount of On Device Memory buffer allocated
+for each TX ring.
+The total size of the On Device Memory is limited to 256k for a single port HCA and to
+128k for dual port HCA.
+Default value is 0
+
 VMA_RX_BUFS
-Number Rx data buffer elements allocation for the processes. These data buffers
-will be used by all QPs on all HCAs as determined by the VMA_QP_LOGIC.
+Number Rx data buffer elements allocation for the processes. These data buffers 
+may be used by all QPs on all HCAs
 Default value is 200000
 
 VMA_RX_WRE
-Number of Work Request Elements allocated in all receive QP's. 
-The number of QP's can change according to the VMA_QP_LOGIC.
+Number of Work Request Elements allocated in all receive QP's.
 Default value is 16000
 
 VMA_RX_WRE_BATCHING
@@ -409,7 +471,7 @@ application does not drain a sockets and the byte limit is reached, new
 received datagrams will be dropped.
 Monitor of the applications socket's usage of current, max and dropped bytes
 and packet counters can be done with vma_stats.
-Default value is 2000000
+Default value is 65536
 
 VMA_RX_POLL
 The number of times to poll on Rx path for ready packets before going to sleep
@@ -433,31 +495,35 @@ Default value is 0
 
 VMA_RX_UDP_POLL_OS_RATIO
 The above param will define the ratio between VMA CQ poll and OS FD poll.
-This will result in a signle poll of the not-offloaded sockets every
-VMA_RX_UDP_POLL_OS_RATIO offlaoded socket (CQ) polls. No matter if the CQ poll 
+This will result in a single poll of the not-offloaded sockets every
+VMA_RX_UDP_POLL_OS_RATIO offloaded socket (CQ) polls. No matter if the CQ poll 
 was a hit or miss. No matter if the socket is blocking or non-blocking.
-When disabled, only offlaoded sockets are polled.
+When disabled, only offloaded sockets are polled.
 This parameter replaces the two old parameters: VMA_RX_POLL_OS_RATIO and 
 VMA_RX_SKIP_OS
 Disable with 0
 Default value is 100
 
-VMA_RX_UDP_HW_TS_CONVERSION
-The above param will define the udp hardware receive time stamp conversion method.
+VMA_HW_TS_CONVERSION
+The above param defines the time stamp conversion method.
 Experimental verbs is required for converting the time stamp from hardware time (Hz) 
 to system time (seconds.nano_seconds). Hence, hardware support is not guaranteed.
-The value of VMA_RX_UDP_HW_TS_CONVERSION determined by all devices - i.e
-if the hardware of one device does not support the conversion, then it will
-be canceled for the other devices. 
-Disable with 0
-Raw HW time with 1            - only convert the time stamp to seconds.nano_seconds time
-                                units (or disable if hardware does not supports).
-Use best sync possible with 2 - Sync to system time, then Raw hardware time -
-                                disable if none of them are supported by hardware. 
-Sync to system time with 3    - convert the time stamp to seconds.nano_seconds time units.
-                                comparable to UDP receive software timestamp.
-                                disable if hardware does not supports.
-Default value 3
+The value of VMA_HW_TS_CONVERSION is determined by all devices - i.e if the hardware of
+one device does not support the conversion, then it will be disabled for the other devices.
+Currently only UDP RX flow is supported.
+Options = [0,1,2,3,4]:
+0 = Disabled
+1 = Raw-HW time                           - only convert the time stamp to seconds.nano_seconds time
+                                            units (or disable if hardware does not supports).
+2 = Best possible - Raw-HW or system time - Sync to system time, then Raw hardware time -
+                                            disable if none of them are supported by hardware. 
+3 = Sync to system time                   - convert the time stamp to seconds.nano_seconds time units.
+                                            comparable to UDP receive software timestamp.
+                                            disable if hardware does not supports.
+4 = PTP Sync                              - convert the time stamp to seconds.nano_seconds time units.
+                                            in case it is not supported - will apply option 3 (or disable
+                                            if hardware does not supports).
+Default value: 3
 
 VMA_RX_POLL_YIELD
 When an application is running with multiple threads, on a limited number of
@@ -494,6 +560,17 @@ sockets ready packet queue.
 Recommended value is 100-5000 (nsec)
 Default value is 0 (Disable)
 
+VMA_RX_POLL_ON_TX_TCP
+This parameter enables/disables TCP RX polling during TCP TX operation for faster 
+TCP ACK reception. 
+Default: 0 (Disable)
+
+VMA_TRIGGER_DUMMY_SEND_GETSOCKNAME
+This parameter triggers dummy packet send from getsockname(), this
+will warm up the caches. 
+For more information regarding dummy send, see VMA user manual document.
+Default: 0 (Disable)
+
 VMA_GRO_STREAMS_MAX
 Control the number of TCP streams to perform GRO (generic receive offload) simultaneously.
 Disable GRO with a value of 0.
@@ -507,6 +584,11 @@ connections.
 VMA_ETH_MC_L2_ONLY_RULES
 Use only L2 rules for Ethernet Multicast.
 All loopback traffic will be handled by VMA instead of OS.
+
+VMA_MC_FORCE_FLOWTAG
+Forces the use of flow tag acceleration for multicast flows where setsockopt(SO_REUSEADDR) is
+set.
+Applicable if there are no other sockets opened for the same flow in system.
 
 VMA_SELECT_POLL
 The duration in micro-seconds (usec) in which to poll the hardware on Rx path before
@@ -537,18 +619,18 @@ Default value is 0
 
 VMA_SELECT_POLL_OS_RATIO
 This will enable polling of the OS file descriptors while user thread calls
-select(), poll() or epoll_wait() and the VMA is busy in the offloaded sockets
-polling loop. This will result in a signle poll of the not-offloaded sockets
-every VMA_SELECT_POLL_RATIO offlaoded sockets (CQ) polls.
+select() or poll() and the VMA is busy in the offloaded sockets polling loop.
+This will result in a signle poll of the not-offloaded sockets every
+VMA_SELECT_POLL_RATIO offlaoded sockets (CQ) polls.
 When disabled, only offlaoded sockets are polled. 
 (See VMA_SELECT_POLL for more info)
 Disable with 0
 Default value is 10
 
 VMA_SELECT_SKIP_OS
-Similar to VMA_RX_SKIP_OS, but in select(), poll() or epoll_wait() this will
-force the VMA to check the non offloaded fd even though an offloaded socket
-has ready packets found while polling.
+Similar to VMA_RX_SKIP_OS, but in select() or poll() this will force the VMA
+to check the non offloaded fd even though an offloaded socket has ready
+packets found while polling.
 Default value is 4
 
 VMA_PROGRESS_ENGINE_INTERVAL
@@ -566,7 +648,7 @@ Each time VMA's internal thread starts it's CQ draining, it will stop when
 reach this max value. 
 The application is not limited by this value in the number of CQ elements
 it can ProcessId form calling any of the receive path socket APIs.
-Default value is 2048
+Default value is 10000
 
 VMA_CQ_MODERATION_ENABLE
 Enable CQ interrupt moderation.
@@ -602,7 +684,7 @@ Default value is 5000
 
 VMA_CQ_POLL_BATCH_MAX
 Max size of the array while polling the CQs in the VMA
-Default value is 8
+Default value is 16
 
 VMA_CQ_KEEP_QP_FULL
 If disabled (default), CQ will not try to compensate for each poll on the
@@ -641,13 +723,32 @@ Use value of 2 for waiting for thread timer to expire.
 Default value is disabled
 
 VMA_TCP_TIMESTAMP_OPTION
+If set, enable TCP timestamp option.
 Currently, LWIP is not supporting RTTM and PAWS mechanisms. 
-see RFC1323 for info.
+See RFC1323 for info.
 Use value of 0 to disable.
 Use value of 1 for enable.
 Use value of 2 for OS follow up.
-Disabled by default (enabling causing a slight performance
-degradation of ~50-100 nano sec per half round trip)
+Disabled by default (enabling causing a slight performance degradation).
+
+VMA_TCP_NODELAY
+If set, disable the Nagle algorithm option for each TCP socket during initialization.
+This means that TCP segments are always sent as soon as possible, even if there is
+only a small amount of data.
+For more information on TCP_NODELAY flag refer to tcp manual page.
+Valid Values are:
+Use value of 0 to disable.
+Use value of 1 for enable.
+Default value is Disabled.
+
+VMA_TCP_QUICKACK
+If set, disable delayed ack ability.
+This means that TCP responds after every packet.
+For more information on TCP_QUICKACK flag refer to tcp manual page.
+Valid Values are:
+Use value of 0 to disable.
+Use value of 1 for enable.
+Default value is Disabled.
 
 VMA_RX_SW_CSUM
 This parameter enables/disables software checksum validation for ingress TCP/UDP IP packets.
@@ -669,6 +770,7 @@ Default value is Enabled.
 VMA_EXCEPTION_HANDLING
 Mode for handling missing support or error cases in Socket API or functionality by VMA.
 Useful for quickly identifying VMA unsupported Socket API or features
+Use value of -2 to exit() on VMA startup failure.
 Use value of -1 for just handling at DEBUG severity.
 Use value of 0 to log DEBUG message and try recovering via Kernel network stack (un-offloading the socket).
 Use value of 1 to log ERROR message and try recovering via Kernel network stack (un-offloading the socket).
@@ -831,17 +933,6 @@ Use a value of 0 for un-limiting the number of TCP SYN packets that can be handl
 Value range is 0 to 100000.
 Default value is 0 (no limit)
 
-VMA_IPERF
-Support iperf server default test which is multithreaded. 
-In you run the iperf server with the additional flag -U and you feel that the 
-VMA can do better, you can disable this function (VMA_IPERF=0)
-Default value is 1 (Enabled)
-
-VMA_SUPPRESS_IGMP_WARNING
-Use VMA_SUPPRESS_IGMP_WARNING=1 to suppress the warnings about igmp version not forced to be 2.
-Default value is 0 (Disabled)
-
-
 
 VMA Monitoring & Performance Counters
 =====================================
@@ -897,24 +988,6 @@ Looking good :)
  the receiving thread did not get to a blocked state to cause a contexts
  switch and hurt latency.
 - No dropped packets caused by socket receive buffer limit (see VMA_RX_BYTES_MIN)
-
-
-IGMP 
-====
-To participate in a multicast that spans multiple networks, a host must inform 
-local routers. The local routers contact other routers, passing on the membership
-information and establishing routes.
-
-Routers and hosts that implement multicast use the Internet Group Management 
-Protocol (IGMP) to communicate group membership information, later the local 
-router can propagate multicast membership information to other routers through 
-the Internet.
-
-In order to enable this behavior at applications running over IPoIB networks 
-please use IGMPv2 on the network:
-   'echo 2 > /proc/sys/net/ipv4/conf/ibX/force_igmp_version'
-
-
 
 Interrupt Moderation
 ====================
@@ -1001,38 +1074,6 @@ while the kernel requires this operation to be performed only by privileged
 users. Run as user root or grant CAP_NET_RAW privileges to your user
 1. "setcap cap_net_raw=ep /usr/bin/sockperf"
 2. "chmod u+s </usr/lib64/libvma.so>"
-
-
-* IGMP not forced to V2:
-
-  VMA WARNING: ************************************************************************
-  VMA WARNING: IGMP Version flag is not forced to IGMPv2 for interface ib2!
-  VMA WARNING: Working in this mode might causes VMA functionality degradation
-  VMA WARNING: Please "echo 2 > /proc/sys/net/ipv4/conf/ib2/force_igmp_version"
-  VMA WARNING: before loading your application with VMA library
-  VMA WARNING: Please refer to the IGMP section in the VMA's User Manual for more information
-  VMA WARNING: ************************************************************************
-This warning message means that you are using on IB interfaces IGMP version other then 2 which is supported by VMA.
-You can disabled VMA_IGMP=0 if you do not need to receive multicast packets from the Ethernet to 
-the InfiniBand fabric or if you are using a Ethernet switch that does not do IGMP snooping.
-If you do expect to receive multicast packets from the Ethernet to the InfiniBand fabric with VMA 
-or if your Ethernet switch does IGMP snooping then you should force IGMP working mode to version 2
-in all your hosts as well as your routers.
-You can also do: "echo 2 > /proc/sys/net/ipv4/conf/all/force_igmp_version"
-
-
-* IGMP Forced Version info missing:
-
-  VMA WARNING: ************************************************************************
-  VMA WARNING: Error in reading IGMP Version flag for interface 192.168.0.10!
-  VMA WARNING: Working in this mode most probably causes VMA performance degradation
-  VMA WARNING: Please refer to the IGMP section in the VMA's User Manual for more information
-  VMA WARNING: ************************************************************************
-This warning message means that you are using VMA with an older version of OFED
-which does not support user space IGMP. 
-If you do expect to receive multicast packets from the Ethernet to the
-InfiniBand fabric with VMA then you need to upgrade your OFED based network stack.
-
 
 * Huge pages out of resource:
 

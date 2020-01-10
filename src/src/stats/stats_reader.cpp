@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2001-2016 Mellanox Technologies, Ltd. All rights reserved.
+ * Copyright (c) 2001-2017 Mellanox Technologies, Ltd. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -95,6 +95,7 @@ typedef enum {
 #define CYCLES_SEPARATOR		"-------------------------------------------------------------------------------\n" 
 #define FORMAT_CQ_STATS_32bit		"%-20s %10u\n"
 #define FORMAT_CQ_STATS_64bit		"%-20s %10llu %-3s\n"
+#define FORMAT_DEV_MEM				"%-20s %lu KB / %lu / %lu [bytes/packets/oob] %-3s\n"
 #define FORMAT_CQ_STATS_percent		"%-20s %10.2f%%\n"
 
 #define INTERVAL			1
@@ -175,6 +176,7 @@ void update_delta_stat(socket_stats_t* p_curr_stat, socket_stats_t* p_prev_stat)
 	p_prev_stat->counters.n_tx_sent_pkt_count = (p_curr_stat->counters.n_tx_sent_pkt_count - p_prev_stat->counters.n_tx_sent_pkt_count) / delay;
 	p_prev_stat->counters.n_tx_drops = (p_curr_stat->counters.n_tx_drops - p_prev_stat->counters.n_tx_drops) / delay;
 	p_prev_stat->counters.n_tx_errors = (p_curr_stat->counters.n_tx_errors - p_prev_stat->counters.n_tx_errors) / delay;
+	p_prev_stat->counters.n_tx_dummy = (p_curr_stat->counters.n_tx_dummy - p_prev_stat->counters.n_tx_dummy) / delay;
 	p_prev_stat->counters.n_tx_os_bytes = (p_curr_stat->counters.n_tx_os_bytes - p_prev_stat->counters.n_tx_os_bytes) / delay;
 	p_prev_stat->counters.n_tx_os_packets = (p_curr_stat->counters.n_tx_os_packets - p_prev_stat->counters.n_tx_os_packets) / delay;
 	p_prev_stat->counters.n_tx_os_eagain = (p_curr_stat->counters.n_tx_os_eagain - p_prev_stat->counters.n_tx_os_eagain) / delay;
@@ -232,6 +234,10 @@ void update_delta_ring_stat(ring_stats_t* p_curr_ring_stats, ring_stats_t* p_pre
 		p_prev_ring_stats->n_rx_cq_moderation_count = p_curr_ring_stats->n_rx_cq_moderation_count;
 		p_prev_ring_stats->n_rx_cq_moderation_period = p_curr_ring_stats->n_rx_cq_moderation_period;
 		p_prev_ring_stats->n_tx_retransmits = (p_curr_ring_stats->n_tx_retransmits - p_prev_ring_stats->n_tx_retransmits) / delay;
+		p_prev_ring_stats->n_tx_dev_mem_allocated = p_curr_ring_stats->n_tx_dev_mem_allocated;
+		p_prev_ring_stats->n_tx_dev_mem_byte_count = (p_curr_ring_stats->n_tx_dev_mem_byte_count - p_prev_ring_stats->n_tx_dev_mem_byte_count) / delay;
+		p_prev_ring_stats->n_tx_dev_mem_pkt_count = (p_curr_ring_stats->n_tx_dev_mem_pkt_count - p_prev_ring_stats->n_tx_dev_mem_pkt_count) / delay;
+		p_prev_ring_stats->n_tx_dev_mem_oob = (p_curr_ring_stats->n_tx_dev_mem_oob - p_prev_ring_stats->n_tx_dev_mem_oob) / delay;
 	}
 
 }
@@ -244,7 +250,6 @@ void update_delta_cq_stat(cq_stats_t* p_curr_cq_stats, cq_stats_t* p_prev_cq_sta
 		p_prev_cq_stats->n_rx_pkt_drop = (p_curr_cq_stats->n_rx_pkt_drop - p_prev_cq_stats->n_rx_pkt_drop) / delay;
 		p_prev_cq_stats->n_rx_sw_queue_len = p_curr_cq_stats->n_rx_sw_queue_len;
 		p_prev_cq_stats->n_buffer_pool_len = p_curr_cq_stats->n_buffer_pool_len;
-		p_prev_cq_stats->buffer_miss_rate = p_curr_cq_stats->buffer_miss_rate;
 	}
 }
 
@@ -281,6 +286,10 @@ void print_ring_stats(ring_instance_block_t* p_ring_inst_arr)
 			printf(FORMAT_CQ_STATS_32bit, "Moderation frame count:",p_ring_stats->n_rx_cq_moderation_count);
 			printf(FORMAT_CQ_STATS_32bit, "Moderation usec period:",p_ring_stats->n_rx_cq_moderation_period);
 			printf(FORMAT_CQ_STATS_64bit, "Retransmissions:", (unsigned long long int)p_ring_stats->n_tx_retransmits, post_fix);
+			if (p_ring_stats->n_tx_dev_mem_allocated) {
+				printf(FORMAT_CQ_STATS_32bit, "Dev Mem allocation:", p_ring_stats->n_tx_dev_mem_allocated);
+				printf(FORMAT_DEV_MEM, "Dev Mem stats:", p_ring_stats->n_tx_dev_mem_byte_count/BYTES_TRAFFIC_UNIT,  p_ring_stats->n_tx_dev_mem_pkt_count, p_ring_stats->n_tx_dev_mem_oob, post_fix);
+			}
 		}
 	}
 	printf("======================================================\n");
@@ -303,7 +312,6 @@ void print_cq_stats(cq_instance_block_t* p_cq_inst_arr)
 			printf(FORMAT_CQ_STATS_32bit, "Packets queue len:",p_cq_stats->n_rx_sw_queue_len);
 			printf(FORMAT_CQ_STATS_32bit, "Drained max:", p_cq_stats->n_rx_drained_at_once_max);
 			printf(FORMAT_CQ_STATS_32bit, "Buffer pool size:",p_cq_stats->n_buffer_pool_len);
-			printf(FORMAT_CQ_STATS_percent,"Buffer disorder:",p_cq_stats->buffer_miss_rate*100);
 		}
 	}
 	printf("======================================================\n");
@@ -938,28 +946,34 @@ void set_defaults()
 
 bool check_if_process_running(char* pid_str)
 {
-	char proccess_proc_dir[FILE_NAME_MAX_SIZE];
+	char proccess_proc_dir[FILE_NAME_MAX_SIZE] = {0};
 	struct stat st;
+	int n = -1;
 	
-	memset((void*)proccess_proc_dir,0, sizeof(char) * FILE_NAME_MAX_SIZE);
-	strcat(strcpy(proccess_proc_dir, "/proc/"), pid_str);
-	return stat(proccess_proc_dir, &st) == 0;
-
+	n = snprintf(proccess_proc_dir, sizeof(proccess_proc_dir), "/proc/%s", pid_str);
+	if (likely((0 < n) && (n < (int)sizeof(proccess_proc_dir)))) {
+		return stat(proccess_proc_dir, &st) == 0;
+	}
+	return false;
 }
 
 bool check_if_process_running(int pid)
 {
-	char pid_str[MAX_BUFF_SIZE];
-	
-	sprintf(pid_str, "%d", pid);
-	return check_if_process_running(pid_str);
+	char pid_str[MAX_BUFF_SIZE] = {0};
+	int n = -1;
+
+	n = snprintf(pid_str, sizeof(pid_str), "%d", pid);
+	if (likely((0 < n) && (n < (int)sizeof(pid_str)))) {
+		return check_if_process_running(pid_str);
+	}
+	return false;
 }
 
 void stats_reader_handler(sh_mem_t* p_sh_mem, int pid)
 {
 	int ret;
 	int num_act_inst = 0;
-	int cycles = 0;
+	int cycles = user_params.cycles ? user_params.cycles : -1;
 	int printed_line_num = SCREEN_SIZE;
 	struct timespec start, end;	
 	bool proc_running = true;
@@ -1017,9 +1031,9 @@ void stats_reader_handler(sh_mem_t* p_sh_mem, int pid)
 	
 	set_signal_action();
 	
-	while (!g_b_exit && proc_running && (user_params.cycles ? (cycles < user_params.cycles) : (true)))
+	while (!g_b_exit && proc_running && cycles)
 	{
-		++cycles;
+		--cycles;
 
 		if (gettime(&start)) {
 			log_system_err("gettime()");
@@ -1084,7 +1098,9 @@ void stats_reader_handler(sh_mem_t* p_sh_mem, int pid)
 		uint64_t delay_int_micro = SEC_TO_MICRO(user_params.interval);
 		uint64_t adjasted_delay = delay_int_micro - TIME_DIFF_in_MICRO(start, end);
 		if (!g_b_exit && proc_running){
-			usleep(adjasted_delay);
+			if (cycles) {
+				usleep(adjasted_delay);
+			}
             inc_read_counter(p_sh_mem);
 		}
 		proc_running = check_if_process_running(pid);
@@ -1099,21 +1115,24 @@ out:
 
 bool check_if_app_match(char* app_name, char* pid_str)
 {
-	char app_full_name[FILE_NAME_MAX_SIZE];
-	char proccess_proc_dir[FILE_NAME_MAX_SIZE];
+	char app_full_name[FILE_NAME_MAX_SIZE] = {0};
+	char proccess_proc_dir[FILE_NAME_MAX_SIZE] = {0};
 	char* app_base_name = NULL;
+	int n = -1;
 	
-	memset((void*)app_full_name, 0 , sizeof(char) * FILE_NAME_MAX_SIZE);
-	memset((void*)proccess_proc_dir, 0 , sizeof(char) * FILE_NAME_MAX_SIZE);
+	n = snprintf(proccess_proc_dir, sizeof(proccess_proc_dir), "/proc/%s/exe", pid_str);
+	if (likely((0 < n) && (n < (int)sizeof(proccess_proc_dir)))) {
+		n = readlink(proccess_proc_dir, app_full_name, sizeof(app_full_name) - 1);
+		if (n > 0) {
+			app_full_name[n] = '\0';
+			app_base_name = strrchr(app_full_name, '/');
+			if (app_base_name) {
+				return strcmp((app_base_name + 1), app_name) == 0;
+			}
+		}
+	}
 	
-	strcat(strcat(strcpy(proccess_proc_dir, "/proc/"),pid_str),"/exe");
-	if (readlink(proccess_proc_dir,app_full_name,FILE_NAME_MAX_SIZE) < 0)
-		return false;
-	app_base_name = strrchr(app_full_name, '/');
-	if (app_base_name)
-		return strcmp(++app_base_name, app_name) == 0;
-	else
-		return false;
+	return false;
 }
 
 void clean_inactive_sh_ibj()
@@ -1134,9 +1153,13 @@ void clean_inactive_sh_ibj()
 			bool proccess_running = false;
 			proccess_running = check_if_process_running(dirent->d_name + pid_offset);
 			if (!proccess_running) {
-				char to_delete[FILE_NAME_MAX_SIZE];
-				memset((void*)to_delete,0,sizeof(char) * FILE_NAME_MAX_SIZE);
-				unlink(strcat(strcat(strcpy(to_delete, g_vma_shmem_dir), "/"),dirent->d_name));
+				char to_delete[FILE_NAME_MAX_SIZE] = {0};
+				int n = -1;
+
+				n = snprintf(to_delete, sizeof(to_delete), "%s/%s", g_vma_shmem_dir, dirent->d_name);
+				if (likely((0 < n) && (n < (int)sizeof(to_delete)))) {
+					unlink(to_delete);
+				}
 			}		
 		}
 		dirent = readdir(dir);
@@ -1277,6 +1300,9 @@ void zero_ring_stats(ring_stats_t* p_ring_stats)
 	p_ring_stats->n_rx_interrupt_received = 0;
 	p_ring_stats->n_rx_interrupt_requests = 0;
 	p_ring_stats->n_tx_retransmits = 0;
+	p_ring_stats->n_tx_dev_mem_byte_count = 0;
+	p_ring_stats->n_tx_dev_mem_pkt_count = 0;
+	p_ring_stats->n_tx_dev_mem_oob = 0;
 }
 
 void zero_cq_stats(cq_stats_t* p_cq_stats)
@@ -1317,7 +1343,11 @@ int get_pid(char* proc_desc, char* argv0)
 {
 	char* app_name = NULL;
 	int pid = -1;
-	
+
+	if (NULL == proc_desc) {
+		return -1;
+	}
+
 	if (user_params.proc_ident_mode == e_by_pid_str) {
 		errno = 0;
 		pid = strtol(proc_desc, NULL, 0);
