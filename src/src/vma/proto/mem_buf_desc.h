@@ -39,17 +39,12 @@
 #include "vma/util/vma_list.h"
 #include "vma/lwip/pbuf.h"
 
-class mem_buf_desc_t;
+class ring_slave;
 
-class mem_buf_desc_owner
+struct timestamps_t
 {
-public:
-	// Call back function
-	virtual ~mem_buf_desc_owner() {};
-	virtual void mem_buf_desc_completion_with_error_rx(mem_buf_desc_t* p_mem_buf_desc) = 0;
-	virtual void mem_buf_desc_completion_with_error_tx(mem_buf_desc_t* p_mem_buf_desc) = 0;
-	virtual void mem_buf_desc_return_to_owner_rx(mem_buf_desc_t* p_mem_buf_desc, void* pv_fd_ready_array = NULL) = 0;
-	virtual void mem_buf_desc_return_to_owner_tx(mem_buf_desc_t* p_mem_buf_desc) = 0;
+	struct timespec sw;
+	struct timespec	hw;
 };
 
 /**
@@ -90,6 +85,7 @@ public:
 			iovec 		frag; // Datagram part base address and length
 			size_t		sz_payload; // This is the total amount of data of the packet, if (sz_payload>sz_data) means fragmented packet.
 			uint64_t	hw_raw_timestamp;
+			timestamps_t	timestamps;
 			void* 		context;
 			uint32_t	flow_tag_id; // Flow Tag ID of this received packet
 
@@ -99,13 +95,9 @@ public:
 					struct tcphdr* 	p_tcp_h;
 					size_t		n_transport_header_len;
 					bool		gro;
-					bool		pad[7];
 				} tcp;
 				struct {
-					struct timespec sw_timestamp;
-					struct timespec	hw_timestamp;
 					in_addr_t	local_if; // L3 info
-					uint32_t	pad;
 				} udp;
 			};
 
@@ -136,7 +128,7 @@ public:
 
 	// Tx: qp_mgr owns the mem_buf_desc and the associated data buffer
 	// Rx: cq_mgr owns the mem_buf_desc and the associated data buffer
-	mem_buf_desc_owner* p_desc_owner;
+	ring_slave* p_desc_owner;
 
 	inline int get_ref_count() const {return atomic_read(&n_ref_count);}
 	inline void  reset_ref_count() {atomic_set(&n_ref_count, 0);}

@@ -85,8 +85,23 @@ enum tcp_conn_state_e {
 	TCP_CONN_RESETED
 };
 
-typedef std::map<tcp_pcb*, int>		ready_pcb_map_t;
-typedef std::map<flow_tuple, tcp_pcb*>	syn_received_map_t;
+struct socket_option_t {
+	const int level;
+	const int optname;
+	const socklen_t optlen;
+	void *optval;
+
+	socket_option_t(const int _level, const int _optname, const void *_optval, const socklen_t _optlen) :
+		level(_level), optname(_optname), optlen(_optlen), optval(malloc(optlen)) {
+		memcpy(optval, _optval, optlen);
+	}
+
+	~socket_option_t() { if (optval) free(optval); }
+};
+
+typedef std::deque<socket_option_t*> socket_options_list_t;
+typedef std::map<tcp_pcb*, int> ready_pcb_map_t;
+typedef std::map<flow_tuple, tcp_pcb*> syn_received_map_t;
 typedef std::map<peer_key, vma_desc_list_t> peer_map_t;
 
 /* taken from inet_ecn.h in kernel */
@@ -101,6 +116,8 @@ enum inet_ecns {
 class sockinfo_tcp : public sockinfo, public timer_handler
 {
 public:
+	static inline size_t accepted_conns_node_offset(void) {return NODE_OFFSET(sockinfo_tcp, accepted_conns_node);}
+	typedef vma_list_t<sockinfo_tcp, sockinfo_tcp::accepted_conns_node_offset> sock_list_t;
 	sockinfo_tcp(int fd);
 	virtual ~sockinfo_tcp();
 
@@ -112,7 +129,6 @@ public:
 	}
 	bool isPassthrough()  {return m_sock_offload == TCP_SOCK_PASSTHROUGH;}
 
-	int prepareConnect(const sockaddr *__to, socklen_t __tolen);
 	int prepareListen();
 	int shutdown(int __how);
 
@@ -158,6 +174,7 @@ public:
 	static void tcp_state_observer(void* pcb_container, enum tcp_state new_state);
 	static uint16_t get_route_mtu(struct tcp_pcb *pcb);
 
+	virtual void update_header_field(data_updater *updater);
 	virtual bool rx_input_cb(mem_buf_desc_t* p_rx_pkt_mem_buf_desc_info, void* pv_fd_ready_array);
 	virtual void set_rx_packet_processor(void) { }
 
@@ -177,17 +194,6 @@ public:
 		// to make things worse, it returns that os fd is ready...
 		return (m_sock_offload == TCP_SOCK_LWIP && !is_server() && m_conn_state != TCP_CONN_INIT);
 	}
-
-#if _BullseyeCoverage
-    #pragma BullseyeCoverage off
-#endif
-	bool is_eof()
-	{
-		return m_sock_state == TCP_SOCK_INITED || m_sock_state == TCP_SOCK_CONNECTED_WR;
-	}
-#if _BullseyeCoverage
-    #pragma BullseyeCoverage on
-#endif
 
 	bool is_connected()
 	{
@@ -210,28 +216,21 @@ public:
 		return m_sock_state == TCP_SOCK_ACCEPT_READY || m_sock_state == TCP_SOCK_ACCEPT_SHUT;
 	}
 
+	virtual void update_socket_timestamps(timestamps_t * ts)
+	{
+		m_rx_timestamps = *ts;
+	}
+
 	static const int CONNECT_DEFAULT_TIMEOUT_MS = 10000;
 	virtual inline fd_type_t get_type()
 	{
 		return FD_TYPE_SOCKET;
 	}
 
-#if _BullseyeCoverage
-    #pragma BullseyeCoverage off
-#endif
-	tcp_pcb *get_pcb()
-	{
-		return &m_pcb;
-	}
-#if _BullseyeCoverage
-    #pragma BullseyeCoverage on
-#endif
-
 	void handle_timer_expired(void* user_data);
 
 	virtual bool delay_orig_close_to_dtor();
 
-	static inline size_t accepted_conns_node_offset(void) {return NODE_OFFSET(sockinfo_tcp, accepted_conns_node);}
 	list_node<sockinfo_tcp, sockinfo_tcp::accepted_conns_node_offset> accepted_conns_node;
 
 protected:
@@ -242,6 +241,8 @@ protected:
 private:
 	//lwip specific things
 	struct tcp_pcb m_pcb;
+	socket_options_list_t m_socket_options_list;
+	timestamps_t m_rx_timestamps;
 	tcp_sock_offload_e m_sock_offload;
 	tcp_sock_state_e m_sock_state;
 	sockinfo_tcp *m_parent;
@@ -272,7 +273,7 @@ private:
 	uint32_t m_received_syn_num;
 
 	/* pending connections */
-	vma_list_t<sockinfo_tcp, sockinfo_tcp::accepted_conns_node_offset> m_accepted_conns;
+	sock_list_t m_accepted_conns;
 
 	uint32_t m_ready_conn_cnt;
 	int m_backlog;
@@ -356,11 +357,17 @@ private:
         
 	// Be sure that m_pcb is initialized
 	void set_conn_properties_from_pcb();
+	void set_sock_options(sockinfo_tcp *new_sock);
 
 	//Register to timer
 	void register_timer();
 
 	void handle_socket_linger();
+
+	/*
+	 * Supported only for UDP
+	 */
+	virtual void handle_ip_pktinfo(struct cmsg_state *) {};
 
 	int handle_rx_error();
 
@@ -375,17 +382,14 @@ private:
 	 *            ERR_RST: the connection was reset by the remote host
 	 */
 	static void 	err_lwip_cb(void *arg, err_t err);
-	/* (re)alloc sockaddr of desired len. old addr may be freed if new_len != old_len
-	 * old_len will be changed to new_len
-	 */
-	struct sockaddr *sockaddr_realloc(struct sockaddr *old_addr, socklen_t & old_len, socklen_t new_len);
-	inline void 	return_rx_buffs(ring *p_ring);
+
 	// TODO: it is misleading to declare inline in file that doesn't contain the implementation as it can't help callers
 	inline void 	return_pending_rx_buffs();
 	inline void 	return_pending_tx_buffs();
 	inline void 	reuse_buffer(mem_buf_desc_t *buff);
 	virtual mem_buf_desc_t *get_next_desc(mem_buf_desc_t *p_desc);
 	virtual	mem_buf_desc_t* get_next_desc_peek(mem_buf_desc_t *p_desc, int& rx_pkt_ready_list_idx);
+	virtual timestamps_t* get_socket_timestamps();
 	virtual void 	post_deqeue(bool release_buff);
 	virtual int 	zero_copy_rx(iovec *p_iov, mem_buf_desc_t *pdesc, int *p_flags);
 	struct tcp_pcb* get_syn_received_pcb(const flow_tuple &key) const;
@@ -421,6 +425,7 @@ private:
 	void process_reuse_ctl_packets();
 	void process_rx_ctl_packets();
 	bool check_dummy_send_conditions(const int flags, const iovec* p_iov, const ssize_t sz_iov);
+	static void put_agent_msg(void *arg);
 };
 typedef struct tcp_seg tcp_seg;
 

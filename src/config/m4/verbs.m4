@@ -27,7 +27,12 @@ AC_DEFUN([CHECK_VERBS_ATTRIBUTE], [
     ])
 ])
 
-
+# Check attributes
+# Usage: CHECK_VERBS_MEMBER([attribute], [header file], [definition])
+#
+AC_DEFUN([CHECK_VERBS_MEMBER], [
+    AC_CHECK_MEMBER( $1, [AC_DEFINE_UNQUOTED([DEFINED_$3], [1], [Define to 1 if attribute $1 is supported])], [], [[#include <$2>]])
+])
 
 ##########################
 # Configure ofed capabilities
@@ -56,108 +61,114 @@ verbs_saved_libs=$LIBS
 LIBS="$LIBS $VERBS_LIBS"
 
 
-# Check if OFED verbs (2.1 and older)
+# Check if VERBS version
 #
-AC_MSG_CHECKING([for Mellanox OFED verbs (2.1 and older)])
+vma_cv_verbs=0
+vma_cv_verbs_str="None"
 AC_TRY_LINK(
 #include <infiniband/verbs_exp.h>
 ,
 [
-  int access = (int)IBV_EXP_ACCESS_ALLOCATE_MR;
-  access = access;
+    int access = (int)IBV_EXP_ACCESS_ALLOCATE_MR;
+    access = access;
 ],
 [
-  AC_MSG_RESULT([no])
+    vma_cv_verbs=2
+    vma_cv_verbs_str="Experimental"
 ],
 [
-  AC_MSG_RESULT([yes])
-  AC_DEFINE(DEFINED_IBV_OLD_VERBS_MLX_OFED, 1, [Define to 1 for ofed 2.1 and older])
+    AC_CHECK_HEADER([infiniband/verbs.h],
+        [AC_CHECK_MEMBERS([struct ibv_query_device_ex_input.comp_mask],
+            [vma_cv_verbs=3 vma_cv_verbs_str="Upstream"],
+            [vma_cv_verbs=1 vma_cv_verbs_str="Legacy"],
+            [[#include <infiniband/verbs.h>]] )],
+            [],
+            [AC_MSG_ERROR([Can not detect VERBS version])]
+    )
 ])
+AC_MSG_CHECKING([for OFED Verbs version])
+AC_MSG_RESULT([$vma_cv_verbs_str])
+AC_DEFINE_UNQUOTED([DEFINED_VERBS_VERSION], [$vma_cv_verbs], [Define found Verbs version])
 
 
 # Check if direct hardware operations can be used instead of VERBS API
-# infiniband/mlx5_hw.h should exist
 #
-AC_CHECK_HEADER([infiniband/mlx5_hw.h],
-    [AC_CHECK_MEMBERS([struct mlx5_qp.ctrl_seg, struct mlx5_qp.gen_data],
-        [AC_DEFINE([HAVE_INFINIBAND_MLX5_HW_H],1,[infiniband/mlx5_hw.h can be used])
-            enable_mlx5=yes],
-        [enable_mlx5=no],
-        [[#include <infiniband/mlx5_hw.h>]] )],
-        [],[]
-)
+vma_cv_directverbs=0
+case "$vma_cv_verbs" in
+    1)
+        ;;
+    2)
+        AC_CHECK_HEADER([infiniband/mlx5_hw.h],
+            [AC_CHECK_DECL([MLX5_ETH_INLINE_HEADER_SIZE],
+                [vma_cv_directverbs=$vma_cv_verbs], [], [[#include <infiniband/mlx5_hw.h>]])])
+        ;;
+    3)
+        AC_CHECK_HEADER([infiniband/mlx5dv.h],
+            [AC_CHECK_LIB(mlx5,
+                mlx5dv_init_obj, [VERBS_LIBS="$VERBS_LIBS -lmlx5" vma_cv_directverbs=$vma_cv_verbs])])
+        ;;
+    *)
+        AC_MSG_ERROR([Unrecognized parameter 'vma_cv_verbs' as $vma_cv_verbs])
+        ;;
+esac
+AC_MSG_CHECKING([for direct verbs support])
+if test "$vma_cv_directverbs" -ne 0; then
+    AC_DEFINE_UNQUOTED([DEFINED_DIRECT_VERBS], [$vma_cv_directverbs], [Direct VERBS support])
+    AC_MSG_RESULT([yes])
+else
+    AC_MSG_RESULT([no])
+fi
 
-
-# Enable tcp tx window availability
-#
-AC_ARG_ENABLE([tcp-tx-wnd-availability],
-    AC_HELP_STRING([--enable-tcp-tx-wnd-availability],
-                   [Enable TCP Tx window availability (TCP packets will only be sent if their size (hdr options + data) is less than or equal to the window size. Otherwise -1 is returned and errno is set to EAGAIN)]),
-    [AC_DEFINE(DEFINED_TCP_TX_WND_AVAILABILITY, 1, [Define to 1 to enable TCP Tx window availability])],
-    [])
-
-
-#
-# Experimental Verbs CQ
-#
-AC_ARG_ENABLE([exp-cq],
-    AC_HELP_STRING([--disable-exp-cq],
-                   [Disable experimental Verbs CQ (disables UDP RX HW Timestamp, RX CSUM verification offload and Multi Packet RQ)]),
-    [enable_exp_cq=no],
-    [enable_exp_cq=yes]
-)
-
-AS_IF([test "x$enable_exp_cq" == xyes],
-    [AC_DEFINE([DEFINED_IBV_EXP_CQ], 1, [Define to 1 if Experimental Verbs CQ was enabled at configure time])]
-
-    CHECK_VERBS_ATTRIBUTE([IBV_EXP_CQ_TIMESTAMP], [infiniband/verbs_exp.h])
-    CHECK_VERBS_ATTRIBUTE([IBV_EXP_VALUES_CLOCK_INFO], [infiniband/verbs_exp.h])
-    CHECK_VERBS_ATTRIBUTE([IBV_EXP_DEVICE_RX_CSUM_L4_PKT], [infiniband/verbs_exp.h])
-    CHECK_VERBS_ATTRIBUTE([IBV_EXP_DEVICE_RX_CSUM_TCP_UDP_PKT], [infiniband/verbs_exp.h])
-    CHECK_VERBS_ATTRIBUTE([IBV_EXP_FLOW_SPEC_ACTION_TAG], [infiniband/verbs_exp.h], [IBV_EXP_FLOW_TAG])
-)
 
 # Check <verbs.h>
 #
+CHECK_VERBS_ATTRIBUTE([IBV_CQ_ATTR_MODERATE], [infiniband/verbs.h], [IBV_CQ_ATTR_MODERATE])
 CHECK_VERBS_ATTRIBUTE([IBV_QPT_RAW_PACKET], [infiniband/verbs.h])
 CHECK_VERBS_ATTRIBUTE([IBV_WC_WITH_VLAN], [infiniband/verbs.h])
 CHECK_VERBS_ATTRIBUTE([IBV_ACCESS_ALLOCATE_MR], [infiniband/verbs.h])
+CHECK_VERBS_ATTRIBUTE([IBV_QP_CREATE_SOURCE_QPN], [infiniband/verbs.h], [IBV_QP_INIT_SOURCE_QPN])
 CHECK_VERBS_ATTRIBUTE([IBV_FLOW_SPEC_IB], [infiniband/verbs.h], [IBV_FLOW_SPEC_IB])
 CHECK_VERBS_ATTRIBUTE([IBV_DEVICE_RAW_IP_CSUM], [infiniband/verbs.h])
 CHECK_VERBS_ATTRIBUTE([IBV_SEND_IP_CSUM], [infiniband/verbs.h])
+CHECK_VERBS_ATTRIBUTE([IBV_FLOW_SPEC_ACTION_TAG], [infiniband/verbs.h], [IBV_FLOW_TAG])
+CHECK_VERBS_ATTRIBUTE([IBV_WC_EX_WITH_COMPLETION_TIMESTAMP], [infiniband/verbs.h], [IBV_CQ_TIMESTAMP])
+CHECK_VERBS_MEMBER([struct ibv_device_attr_ex.orig_attr], [infiniband/verbs.h], [IBV_DEVICE_ATTR_EX])
 
 # Check <verbs_exp.h>
 #
-CHECK_VERBS_ATTRIBUTE([IBV_EXP_CQ_MODERATION], [infiniband/verbs_exp.h])
-CHECK_VERBS_ATTRIBUTE([IBV_EXP_WR_NOP], [infiniband/verbs_exp.h])
-CHECK_VERBS_ATTRIBUTE([IBV_EXP_ACCESS_ALLOCATE_MR], [infiniband/verbs_exp.h])
-CHECK_VERBS_ATTRIBUTE([IBV_EXP_QP_INIT_ATTR_ASSOCIATED_QPN], [infiniband/verbs_exp.h])
-CHECK_VERBS_ATTRIBUTE([IBV_EXP_FLOW_SPEC_IB], [infiniband/verbs_exp.h], [IBV_FLOW_SPEC_IB])
-CHECK_VERBS_ATTRIBUTE([IBV_EXP_SEND_IP_CSUM], [infiniband/verbs_exp.h])
+if test "x$vma_cv_verbs" == x2; then
+    CHECK_VERBS_ATTRIBUTE([IBV_EXP_CQ_MODERATION], [infiniband/verbs_exp.h], [IBV_CQ_ATTR_MODERATE])
+    CHECK_VERBS_ATTRIBUTE([IBV_EXP_WR_NOP], [infiniband/verbs_exp.h])
+    CHECK_VERBS_ATTRIBUTE([IBV_EXP_ACCESS_ALLOCATE_MR], [infiniband/verbs_exp.h])
+    CHECK_VERBS_ATTRIBUTE([IBV_EXP_QP_INIT_ATTR_ASSOCIATED_QPN], [infiniband/verbs_exp.h], [IBV_QP_INIT_SOURCE_QPN])
+    CHECK_VERBS_ATTRIBUTE([IBV_EXP_FLOW_SPEC_IB], [infiniband/verbs_exp.h], [IBV_FLOW_SPEC_IB])
+    CHECK_VERBS_ATTRIBUTE([IBV_EXP_SEND_IP_CSUM], [infiniband/verbs_exp.h])
+    CHECK_VERBS_ATTRIBUTE([IBV_EXP_DEVICE_ATTR_MAX_DM_SIZE], [infiniband/verbs_exp.h], [IBV_DM])
+    CHECK_VERBS_ATTRIBUTE([IBV_EXP_QP_RATE_LIMIT], [infiniband/verbs_exp.h])
+    CHECK_VERBS_ATTRIBUTE([IBV_EXP_QP_SUPPORT_BURST], [infiniband/verbs_exp.h])
 
-# Check for <mlx5/wqe.h>
-#
-CHECK_VERBS_ATTRIBUTE([MLX5_ETH_WQE_L3_CSUM], [infiniband/mlx5_hw.h], [MLX5_HW_ETH_WQE_HEADER])
+    #
+    # Experimental Verbs CQ
+    #
+    AC_ARG_ENABLE([exp-cq],
+        AC_HELP_STRING([--disable-exp-cq],
+                       [Disable experimental Verbs CQ (disables UDP RX HW Timestamp, RX CSUM verification offload and Multi Packet RQ)]),
+        [enable_exp_cq=no],
+        [enable_exp_cq=yes]
+    )
 
-#
-# On Device Memory
-#
-AC_CHECK_DECL([IBV_EXP_DEVICE_ATTR_MAX_DM_SIZE],
-    [AC_DEFINE(HAVE_IBV_DM, 1, [Define to 1 if IBV_EXP_DEVICE_ATTR_MAX_DM_SIZE is defined])],
-    [],
-    [[#include <infiniband/verbs_exp.h>]])
+    AS_IF([test "x$enable_exp_cq" == xyes],
+        [AC_DEFINE([DEFINED_IBV_EXP_CQ], 1, [Define to 1 if Experimental Verbs CQ was enabled at configure time])]
 
+        CHECK_VERBS_ATTRIBUTE([IBV_EXP_CQ_TIMESTAMP], [infiniband/verbs_exp.h], [IBV_CQ_TIMESTAMP])
+        CHECK_VERBS_ATTRIBUTE([IBV_EXP_VALUES_CLOCK_INFO], [infiniband/verbs_exp.h])
+        CHECK_VERBS_ATTRIBUTE([IBV_EXP_DEVICE_RX_CSUM_L4_PKT], [infiniband/verbs_exp.h])
+        CHECK_VERBS_ATTRIBUTE([IBV_EXP_DEVICE_RX_CSUM_TCP_UDP_PKT], [infiniband/verbs_exp.h])
+        CHECK_VERBS_ATTRIBUTE([IBV_EXP_FLOW_SPEC_ACTION_TAG], [infiniband/verbs_exp.h], [IBV_FLOW_TAG])
+    )
 
-AC_CHECK_DECLS([IBV_EXP_QP_RATE_LIMIT],
-	[AC_DEFINE(DEFINED_IBV_EXP_QP_RATE_LIMIT, 1, [Define to 1 if IBV_EXP_QP_RATE_LIMIT defined])],
-	[], [[#include <infiniband/verbs_exp.h>]])
-
-AC_CHECK_DECLS([IBV_EXP_QP_SUPPORT_BURST],
-	[AC_DEFINE(DEFINED_IBV_EXP_QP_SUPPORT_BURST, 1, [Define to 1 if IBV_EXP_QP_SUPPORT_BURST defined])],
-	[], [[#include <infiniband/verbs_exp.h>]])
-
-have_mp_rq=yes
-AC_CHECK_DECLS([IBV_EXP_DEVICE_ATTR_VLAN_OFFLOADS,
+    have_mp_rq=yes
+    AC_CHECK_DECLS([IBV_EXP_DEVICE_ATTR_VLAN_OFFLOADS,
 		IBV_EXP_DEVICE_ATTR_MAX_CTX_RES_DOMAIN,
 		IBV_EXP_CQ_RX_UDP_PACKET,
 		MLX5_CQE_L3_HDR_TYPE_MASK,
@@ -168,13 +179,24 @@ AC_CHECK_DECLS([IBV_EXP_DEVICE_ATTR_VLAN_OFFLOADS,
 		[[#include <infiniband/verbs_exp.h>]
 		 [#include <infiniband/mlx5_hw.h>]])
 
-AC_MSG_CHECKING([for multi packet RQ support])
-AS_IF([test "x$have_mp_rq" == xyes -a "x$enable_exp_cq" == xyes -a "x$enable_mlx5" == xyes],
-	[AC_DEFINE([HAVE_MP_RQ], 1, [MP_RQ QP supported])] [AC_MSG_RESULT([yes])],
-	[AC_MSG_RESULT([no])])
+    AC_MSG_CHECKING([for multi packet RQ support])
+    AS_IF([test "x$have_mp_rq" == xyes -a "x$enable_exp_cq" == xyes -a "x$vma_cv_directverbs" == x2],
+	    [AC_DEFINE([HAVE_MP_RQ], 1, [MP_RQ QP supported])] [AC_MSG_RESULT([yes])],
+	    [AC_MSG_RESULT([no])]
+	)
 
-AC_CHECK_FUNCS([rdma_lib_reset])
-AC_CHECK_FUNCS([ibv_exp_get_device_list])
+    AC_CHECK_DECL([IBV_EXP_DEVICE_CROSS_CHANNEL],
+        [], [], [[#include <infiniband/verbs_exp.h>]])
+    AC_MSG_CHECKING([for direct ring support])
+    AS_IF([test "x$ac_cv_have_decl_IBV_EXP_DEVICE_CROSS_CHANNEL" = "xyes" -a "x$vma_cv_directverbs" == x2],
+        [AC_DEFINE_UNQUOTED([HAVE_DIRECT_RING], [1], [Define to 1 if direct ring is supported])]
+        [AC_MSG_RESULT([yes])],
+        [AC_MSG_RESULT([no])]
+    )
+
+    AC_CHECK_FUNCS([rdma_lib_reset])
+    AC_CHECK_FUNCS([ibv_exp_get_device_list])
+fi
 
 # Restore LIBS
 LIBS=$verbs_saved_libs

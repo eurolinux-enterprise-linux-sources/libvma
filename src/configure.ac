@@ -13,8 +13,8 @@ dnl===-----------------------------------------------------------------------===
 # Update version number here:
 #
 define([vma_ver_major], 8)
-define([vma_ver_minor], 6)
-define([vma_ver_revision], 10)
+define([vma_ver_minor], 7)
+define([vma_ver_revision], 5)
 define([vma_ver_release], 0)
 
 
@@ -29,8 +29,8 @@ AC_INIT(libvma, [vma_ver_major.vma_ver_minor.vma_ver_revision], support@mellanox
 AC_CONFIG_HEADER([config.h])
 
 VMA_LIBRARY_MAJOR=8
-VMA_LIBRARY_MINOR=6
-VMA_LIBRARY_REVISION=10
+VMA_LIBRARY_MINOR=7
+VMA_LIBRARY_REVISION=5
 VMA_LIBRARY_RELEASE=0
 
 AC_DEFINE_UNQUOTED(VMA_LIBRARY_MAJOR, ${VMA_LIBRARY_MAJOR}, [VMA Major Version])
@@ -276,6 +276,8 @@ AC_ARG_WITH(ofed,
 CPPFLAGS="$CPPFLAGS -I$ac_cv_ofed_path/include"
 if test -d "$ac_cv_ofed_path/lib64" ; then
     LDFLAGS="$LDFLAGS -L$ac_cv_ofed_path/lib64"
+elif test -d "$ac_cv_ofed_path/lib/$(uname -m)-linux-*" ; then
+    LDFLAGS="$LDFLAGS -L$(ls -d $ac_cv_ofed_path/lib/$(uname -m)-linux-*)"
 else
     LDFLAGS="$LDFLAGS -L$ac_cv_ofed_path/lib"
 fi
@@ -300,10 +302,8 @@ AC_ARG_ENABLE([vmapoll],
 AC_ARG_ENABLE([socketxtreme],
     AC_HELP_STRING([--enable-socketxtreme],
         [Enable alternative API to standard sockets API for receiving packets (default=no)]))
-if test "x$enable_socketxtreme" = xyes; then
-    AC_CHECK_HEADER([infiniband/mlx5_hw.h],
-        [AC_DEFINE([DEFINED_SOCKETXTREME], 1, [Define to 1 if socketxtreme was enabled at configure time])],
-        [AC_MSG_ERROR([socketxtreme mode is not supported with the current installed OFED version])])
+if test "x$enable_socketxtreme" = xyes -a "$vma_cv_directverbs" -ne 0; then
+    AC_DEFINE([DEFINED_SOCKETXTREME], 1, [Define to 1 if socketxtreme was enabled at configure time])
 else
     enable_socketxtreme=no
 fi
@@ -329,6 +329,22 @@ else
     AC_MSG_RESULT([yes])
 fi
 
+# Enable tcp tx window availability
+#
+AC_ARG_ENABLE([tcp-tx-wnd-availability],
+    AC_HELP_STRING([--enable-tcp-tx-wnd-availability],
+        [Enable TCP Tx window availability
+         (TCP packets will only be sent if their size (hdr options + data) is less than or equal to the window size.
+         Otherwise -1 is returned and errno is set to EAGAIN)  (default=no)]))
+AC_MSG_CHECKING(
+    [for tcp tx window availability support])
+if test "x$enable_tcp_tx_wnd_availability" = "xyes"; then
+    AC_DEFINE(DEFINED_TCP_TX_WND_AVAILABILITY, 1, [Define to 1 to enable TCP Tx window availability])
+    AC_MSG_RESULT([yes])
+else
+    AC_MSG_RESULT([no])
+fi
+
 AC_MSG_CHECKING([for md5 version of VMA statistics is])
 STATS_PROTOCOL_VER=`md5sum ${srcdir}/src/vma/util/vma_stats.h | awk '{ print $1}'`
 AC_DEFINE_UNQUOTED(STATS_PROTOCOL_VER, "${STATS_PROTOCOL_VER}", [Stats Protocol Version])
@@ -347,7 +363,7 @@ show_section_title "Check for header files"
 #
 AC_HEADER_STDC
 
-AC_CHECK_HEADERS([sys/prctl.h sys/inotify.h sys/fanotify.h])
+AC_CHECK_HEADERS([sys/prctl.h sys/inotify.h sys/fanotify.h sys/capability.h])
 
 
 dnl===-----------------------------------------------------------------------===

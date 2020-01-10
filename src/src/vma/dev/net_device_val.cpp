@@ -62,6 +62,10 @@
 #include "vma/proto/neighbour_table_mgr.h"
 #include "ring_profile.h"
 
+#ifdef HAVE_LIBNL3
+#include <netlink/route/link/vlan.h>
+#endif
+
 #define MODULE_NAME             "ndv"
 
 #define nd_logpanic           __log_panic
@@ -75,14 +79,20 @@
 ring_alloc_logic_attr::ring_alloc_logic_attr():
 				m_ring_alloc_logic(RING_LOGIC_PER_INTERFACE),
 				m_ring_profile_key(0),
-				m_user_id_key(0) {
+				m_user_id_key(0)
+{
+	m_mem_desc.iov_base = NULL;
+	m_mem_desc.iov_len = 0;
 	init();
 }
 
 ring_alloc_logic_attr::ring_alloc_logic_attr(ring_logic_t ring_logic):
 				m_ring_alloc_logic(ring_logic),
 				m_ring_profile_key(0),
-				m_user_id_key(0) {
+				m_user_id_key(0)
+{
+	m_mem_desc.iov_base = NULL;
+	m_mem_desc.iov_len = 0;
 	init();
 }
 
@@ -90,7 +100,8 @@ ring_alloc_logic_attr::ring_alloc_logic_attr(const ring_alloc_logic_attr &other)
 	m_hash(other.m_hash),
 	m_ring_alloc_logic(other.m_ring_alloc_logic),
 	m_ring_profile_key(other.m_ring_profile_key),
-	m_user_id_key(other.m_user_id_key)
+	m_user_id_key(other.m_user_id_key),
+	m_mem_desc(other.m_mem_desc)
 {
 	snprintf(m_str, RING_ALLOC_STR_SIZE, "%s", other.m_str);
 }
@@ -102,10 +113,12 @@ void ring_alloc_logic_attr::init()
 	char buff[RING_ALLOC_STR_SIZE];
 
 	snprintf(m_str, RING_ALLOC_STR_SIZE,
-		 "allocation logic %d profile %d key %ld", m_ring_alloc_logic,
-		 m_ring_profile_key, m_user_id_key);
-	snprintf(buff, RING_ALLOC_STR_SIZE, "%d%d%ld", m_ring_alloc_logic,
-		 m_ring_profile_key, m_user_id_key);
+		 "allocation logic %d profile %d key %ld user address %p "
+		 "user length %zd", m_ring_alloc_logic, m_ring_profile_key,
+		 m_user_id_key, m_mem_desc.iov_base, m_mem_desc.iov_len);
+	snprintf(buff, RING_ALLOC_STR_SIZE, "%d%d%ld%p%zd", m_ring_alloc_logic,
+		 m_ring_profile_key, m_user_id_key, m_mem_desc.iov_base,
+		 m_mem_desc.iov_len);
 	const char* chr = buff;
 	while ((c = *chr++))
 		h = ((h << 5) + h) + c; /* m_hash * 33 + c */
@@ -124,6 +137,15 @@ void ring_alloc_logic_attr::set_ring_profile_key(vma_ring_profile_key profile)
 {
 	if (m_ring_profile_key != profile) {
 		m_ring_profile_key = profile;
+		init();
+	}
+}
+
+void ring_alloc_logic_attr::set_memory_descriptor(iovec &mem_desc)
+{
+	if (m_mem_desc.iov_base != mem_desc.iov_base ||
+	    m_mem_desc.iov_len != mem_desc.iov_len) {
+		m_mem_desc = mem_desc;
 		init();
 	}
 }
@@ -158,7 +180,6 @@ net_device_val::net_device_val(struct net_device_val_desc *desc) : m_lock("net_d
 	m_bond_xmit_hash_policy = XHP_LAYER_2;
 	m_bond_fail_over_mac = 0;
 	m_transport_type = VMA_TRANSPORT_UNKNOWN;
-	memset(&m_netvsc, 0, sizeof(m_netvsc));
 
 	if (NULL == desc) {
 		nd_logerr("Invalid net_device_val name=%s", "NA");
@@ -226,16 +247,11 @@ net_device_val::net_device_val(struct net_device_val_desc *desc) : m_lock("net_d
 	switch (m_bond) {
 	case NETVSC:
 		if (get_type() == ARPHRD_ETHER) {
-			valid = (bool)(!netvsc_create());
-			if (valid) {
-				char slave_ifname[IFNAMSIZ] = {0};
-				unsigned int slave_flags = 0;
-				if (get_netvsc_slave(get_ifname_link(), slave_ifname, slave_flags)) {
-					valid = verify_eth_qp_creation(slave_ifname);
-					if (!valid) {
-						netvsc_destroy();
-					}
-				}
+			char slave_ifname[IFNAMSIZ] = {0};
+			unsigned int slave_flags = 0;
+			/* valid = true; uncomment it is valid flow to operate w/o SRIOV */
+			if (get_netvsc_slave(get_ifname_link(), slave_ifname, slave_flags)) {
+				valid = verify_qp_creation(slave_ifname, IBV_QPT_RAW_PACKET);
 			}
 		}
 		break;
@@ -288,10 +304,6 @@ net_device_val::net_device_val(struct net_device_val_desc *desc) : m_lock("net_d
 net_device_val::~net_device_val()
 {
 	auto_unlocker lock(m_lock);
-
-	if (NETVSC == m_bond) {
-		netvsc_destroy();
-	}
 
 	rings_hash_map_t::iterator ring_iter;
 	while ((ring_iter = m_h_ring_map.begin()) != m_h_ring_map.end()) {
@@ -533,12 +545,11 @@ void net_device_val::set_slave_array()
 	nd_logdbg("");
 
 	if (m_bond == NETVSC) {
-		slave_data_t* s = new slave_data_t(get_tap_if_index());
-		m_slaves.push_back(s);
+		slave_data_t* s = NULL;
 		unsigned int slave_flags = 0;
 		if (get_netvsc_slave(get_ifname_link(), active_slave, slave_flags)) {
 			if ((slave_flags & IFF_UP) &&
-					verify_eth_qp_creation(active_slave)) {
+					verify_qp_creation(active_slave, IBV_QPT_RAW_PACKET)) {
 				s = new slave_data_t(if_nametoindex(active_slave));
 				m_slaves.push_back(s);
 			}
@@ -581,7 +592,7 @@ void net_device_val::set_slave_array()
 		get_up_and_active_slaves(up_and_active_slaves, m_slaves.size());
 	}
 
-	for (uint16_t i = 0; i<m_slaves.size(); i++) {
+	for (uint16_t i = 0; i < m_slaves.size(); i++) {
 		char if_name[IFNAMSIZ] = {0};
 		char base_ifname[IFNAMSIZ];
 
@@ -606,11 +617,7 @@ void net_device_val::set_slave_array()
 		}
 
 		if (m_bond == NETVSC) {
-			if ((m_slaves.size() > 1) && (m_slaves[i]->if_index == get_tap_if_index())) {
-				m_slaves[i]->active = false;
-			} else {
-				m_slaves[i]->active = true;
-			}
+			m_slaves[i]->active = true;
 		}
 
 		if (m_bond == NO_BOND) {
@@ -625,7 +632,7 @@ void net_device_val::set_slave_array()
 		}
 	}
 
-	if (m_slaves.size() == 0) {
+	if (m_slaves.empty() && NETVSC != m_bond) {
 		m_state = INVALID;
 		nd_logpanic("No slave found.");
 	}
@@ -866,84 +873,62 @@ bool net_device_val::update_active_slaves()
 	return 0;
 }
 
-bool net_device_val::update_netvsc_slaves()
+void net_device_val::update_netvsc_slaves(int if_index, int if_flags)
 {
-	bool changed = false;
 	slave_data_t* s = NULL;
-	uint16_t i = 0;
-	ib_ctx_handler *ib_ctx = NULL;
-	char slave_ifname[IFNAMSIZ] = {0};
-	unsigned int slave_flags = 0;
+	bool found = false;
+	ib_ctx_handler *ib_ctx = NULL, *up_ib_ctx = NULL;
+	char if_name[IFNAMSIZ] = {0};
 
 	m_lock.lock();
 
-	if (get_netvsc_slave(get_ifname_link(), slave_ifname, slave_flags) &&
-			(slave_flags & IFF_UP) && (slave_flags & IFF_RUNNING)) {
-		s = new slave_data_t(if_nametoindex(slave_ifname));
-		m_slaves.push_back(s);
+	if (if_indextoname(if_index, if_name) && (if_flags & IFF_UP) && (if_flags & IFF_RUNNING)) {
+		nd_logdbg("slave %d is up", if_index);
 
-		nd_logdbg("slave %d is up ", s->if_index);
-		changed = true;
-		g_p_ib_ctx_handler_collection->update_tbl();
-		g_buffer_pool_rx->register_memory();
-		g_buffer_pool_tx->register_memory();
+		g_p_ib_ctx_handler_collection->update_tbl(if_name);
+		if ((up_ib_ctx = g_p_ib_ctx_handler_collection->get_ib_ctx(if_name))) {
+			s = new slave_data_t(if_index);
+			s->active = true;
+			s->p_ib_ctx = up_ib_ctx;
+			s->p_L2_addr = create_L2_address(if_name);
+			s->port_num = get_port_from_ifname(if_name);
+			m_slaves.push_back(s);
+
+			g_buffer_pool_rx->register_memory(s->p_ib_ctx);
+			g_buffer_pool_tx->register_memory(s->p_ib_ctx);
+			found = true;
+		}
 	} else {
-		slave_data_vector_t::iterator slave = m_slaves.begin();
-		for (; slave != m_slaves.end(); ++slave) {
-			s = *slave;
-			if (s->if_index != get_tap_if_index()) {
-				nd_logdbg("slave %d is down ", s->if_index);
-				changed = true;
+		if (!m_slaves.empty()) {
+			s = m_slaves.back();
+			m_slaves.pop_back();
 
-				ib_ctx = s->p_ib_ctx;
-				delete s;
-				m_slaves.erase(slave);
-				break;
-			}
+			nd_logdbg("slave %d is down ", s->if_index);
+
+			ib_ctx = s->p_ib_ctx;
+			delete s;
+			found = true;
 		}
-	}
-	for (i = 0; changed && (i < m_slaves.size()); i++) {
-		char if_name[IFNAMSIZ] = {0};
-		char base_ifname[IFNAMSIZ];
-
-		if (!if_indextoname(m_slaves[i]->if_index, if_name)) {
-			nd_logerr("Can not find interface name by index=%d", m_slaves[i]->if_index);
-			continue;
-		}
-		get_base_interface_name((const char*)if_name, base_ifname, sizeof(base_ifname));
-
-		// Save L2 address
-		m_slaves[i]->p_L2_addr = create_L2_address(if_name);
-		m_slaves[i]->active = false;
-
-		if (m_bond == NETVSC) {
-			if ((m_slaves.size() > 1) && (m_slaves[i]->if_index == get_tap_if_index())) {
-				m_slaves[i]->active = false;
-			} else {
-				m_slaves[i]->active = true;
-			}
-		}
-
-		m_slaves[i]->p_ib_ctx = g_p_ib_ctx_handler_collection->get_ib_ctx(base_ifname);
-		m_slaves[i]->port_num = get_port_from_ifname(base_ifname);
 	}
 
 	m_lock.unlock();
 
-	/* restart if status changed */
-	if (changed) {
-		m_p_L2_addr = create_L2_address(get_ifname());
-		// restart rings
-		rings_hash_map_t::iterator ring_iter;
-		for (ring_iter = m_h_ring_map.begin(); ring_iter != m_h_ring_map.end(); ring_iter++) {
-			THE_RING->restart();
-		}
-		if (ib_ctx) {
-			g_p_ib_ctx_handler_collection->del_ib_ctx(ib_ctx);
-		}
+	if (!found) {
+		nd_logdbg("Unable to detect any changes for interface %d. ignoring", if_index);
+		return;
 	}
 
-	return changed;
+	/* restart if status changed */
+	m_p_L2_addr = create_L2_address(get_ifname());
+	// restart rings
+	rings_hash_map_t::iterator ring_iter;
+	for (ring_iter = m_h_ring_map.begin(); ring_iter != m_h_ring_map.end(); ring_iter++) {
+		THE_RING->restart();
+	}
+
+	if (ib_ctx) {
+		g_p_ib_ctx_handler_collection->del_ib_ctx(ib_ctx);
+	}
 }
 
 std::string net_device_val::to_str()
@@ -1224,6 +1209,9 @@ void net_device_val_eth::configure()
 	create_br_address(get_ifname());
 
 	m_vlan = get_vlan_id_from_ifname(get_ifname());
+	if (m_vlan) {
+		parse_prio_egress_map();
+	}
 	if (m_vlan && m_bond != NO_BOND && m_bond_fail_over_mac == 1) {
 		vlog_printf(VLOG_WARNING, " ******************************************************************\n");
 		vlog_printf(VLOG_WARNING, "%s: vlan over bond while fail_over_mac=1 is not offloaded\n", get_ifname());
@@ -1240,6 +1228,65 @@ void net_device_val_eth::configure()
 		//in case vlan is configured on slave
 		m_vlan = get_vlan_id_from_ifname(if_name);
 	}
+}
+
+int net_device_val::get_priority_by_tc_class(uint32_t tc_class)
+{
+	tc_class_priority_map::iterator it = m_class_prio_map.find(tc_class);
+	if (it == m_class_prio_map.end()) {
+		return VMA_DEFAULT_ENGRESS_MAP_PRIO;
+	}
+	return it->second;
+}
+
+void net_device_val_eth::parse_prio_egress_map()
+{
+#ifdef HAVE_LIBNL3
+	int len, ret;
+	nl_cache *cache = NULL;
+	rtnl_link *link;
+	vlan_map *map;
+
+	nl_socket_handle *nl_socket = nl_socket_handle_alloc();
+	if (!nl_socket) {
+		nd_logdbg("unable to allocate socket socket %m", errno);
+		goto out;
+	}
+	nl_socket_set_local_port(nl_socket, 0);
+	ret = nl_connect(nl_socket, NETLINK_ROUTE);
+	if (ret < 0) {
+		nd_logdbg("unable to connect to libnl socket %d %m", ret, errno);
+		goto out;
+	}
+	ret = rtnl_link_alloc_cache(nl_socket, AF_UNSPEC, &cache);
+	if (!cache) {
+		nd_logdbg("unable to create libnl cache %d %m", ret, errno);
+		goto out;
+	}
+	link = rtnl_link_get_by_name(cache, get_ifname());
+	if (!link) {
+		nd_logdbg("unable to get libnl link %d %m", ret, errno);
+		goto out;
+	}
+	map = rtnl_link_vlan_get_egress_map(link, &len);
+	if (!map || !len) {
+		nd_logdbg("no egress map found %d %p",len, map);
+		goto out;
+	}
+	for (int i = 0; i < len; i++) {
+		m_class_prio_map[map[i].vm_from] = map[i].vm_to;
+	}
+out:
+	if (cache) {
+		nl_cache_free(cache);
+	}
+	if (nl_socket) {
+		nl_socket_handle_free(nl_socket);
+	}
+#else
+	nd_logdbg("libnl3 not found, cannot read engress map, "
+		  "SO_PRIORITY will not work properly");
+#endif
 }
 
 ring* net_device_val_eth::create_ring(resource_allocation_key *key)
@@ -1264,13 +1311,16 @@ ring* net_device_val_eth::create_ring(resource_allocation_key *key)
 #ifdef HAVE_MP_RQ
 			case VMA_RING_CYCLIC_BUFFER:
 				ring = new ring_eth_cb(get_if_idx(),
-						       &prof->get_desc()->ring_cyclicb);
+						       &prof->get_desc()->ring_cyclicb,
+						       key->get_memory_descriptor());
 			break;
 #endif
+#ifdef HAVE_DIRECT_RING
 			case VMA_RING_EXTERNAL_MEM:
 				ring = new ring_eth_direct(get_if_idx(),
 							   &prof->get_desc()->ring_ext);
 			break;
+#endif
 			default:
 				nd_logdbg("Unknown ring type");
 				break;
@@ -1380,7 +1430,6 @@ ring* net_device_val_ib::create_ring(resource_allocation_key *key)
 	ring* ring = NULL;
 
 	NOT_IN_USE(key);
-
 	try {
 		switch (m_bond) {
 		case NO_BOND:
@@ -1460,7 +1509,7 @@ bool net_device_val::verify_bond_ipoib_or_eth_qp_creation()
 	}
 	if (!bond_ok) {
 		vlog_printf(VLOG_WARNING,"*******************************************************************************************************\n");
-		vlog_printf(VLOG_WARNING,"* Bond %s will not be offloaded due to problem with it's slaves.\n", get_ifname());
+		vlog_printf(VLOG_WARNING,"* Bond %s will not be offloaded due to problem with its slaves.\n", get_ifname());
 		vlog_printf(VLOG_WARNING,"* Check warning messages for more information.\n");
 		vlog_printf(VLOG_WARNING,"*******************************************************************************************************\n");
 	}
@@ -1471,33 +1520,37 @@ bool net_device_val::verify_bond_ipoib_or_eth_qp_creation()
 bool net_device_val::verify_ipoib_or_eth_qp_creation(const char* interface_name)
 {
 	if (m_type == ARPHRD_INFINIBAND) {
-		if (verify_enable_ipoib(interface_name) && verify_ipoib_mode()) {
+		if (verify_enable_ipoib(interface_name) && verify_qp_creation(interface_name, IBV_QPT_UD)) {
 			return true;
 		}
 	} else {
-		if (verify_eth_qp_creation(interface_name)) {
+		if (verify_qp_creation(interface_name, IBV_QPT_RAW_PACKET)) {
 			return true;
 		}
 	}
 	return false;
 }
 
-bool net_device_val::verify_enable_ipoib(const char* ifname)
-{
-	NOT_IN_USE(ifname);
-	if(!safe_mce_sys().enable_ipoib) {
-		nd_logdbg("Blocking offload: IPoIB interfaces ('%s')", ifname);
-		return false;
-	}
-	return true;
-}
-
-// Verify IPoIB is in 'datagram mode' for proper VMA with flow steering operation
-// Also verify umcast is disabled for IB flow
-bool net_device_val::verify_ipoib_mode()
+bool net_device_val::verify_enable_ipoib(const char* interface_name)
 {
 	char filename[256] = "\0";
 	char ifname[IFNAMSIZ] = "\0";
+
+	if(!safe_mce_sys().enable_ipoib) {
+		nd_logdbg("Blocking offload: IPoIB interfaces ('%s')", interface_name);
+		return false;
+	}
+
+#ifndef DEFINED_IBV_QP_INIT_SOURCE_QPN
+	// Dont offload mlx5 devices if source qpn is not defined.
+	ib_ctx_handler* ib_ctx = g_p_ib_ctx_handler_collection->get_ib_ctx(get_ifname_link());
+	if (!strncmp(ib_ctx->get_ibname(), "mlx5", 4)) {
+		nd_logwarn("Blocking offload: SOURCE_QPN is not supported for this driver ('%s')", interface_name);
+		return false;
+	}
+#endif
+
+	// Verify IPoIB is in 'datagram mode' for proper VMA with flow steering operation
 	if (validate_ipoib_prop(get_ifname(), m_flags, IPOIB_MODE_PARAM_FILE, "datagram", 8, filename, ifname)) {
 		vlog_printf(VLOG_WARNING,"*******************************************************************************************************\n");
 		vlog_printf(VLOG_WARNING,"* IPoIB mode of interface '%s' is \"connected\" !\n", get_ifname());
@@ -1511,6 +1564,7 @@ bool net_device_val::verify_ipoib_mode()
 		nd_logdbg("verified interface '%s' is running in datagram mode", get_ifname());
 	}
 
+	// Verify umcast is disabled for IB flow
 	if (validate_ipoib_prop(get_ifname(), m_flags, UMCAST_PARAM_FILE, "0", 1, filename, ifname)) { // Extract UMCAST flag (only for IB transport types)
 		vlog_printf(VLOG_WARNING,"*******************************************************************************************************\n");
 		vlog_printf(VLOG_WARNING,"* UMCAST flag is Enabled for interface %s !\n", get_ifname());
@@ -1523,18 +1577,20 @@ bool net_device_val::verify_ipoib_mode()
 	else {
 		nd_logdbg("verified interface '%s' is running with umcast disabled", get_ifname());
 	}
+
 	return true;
 }
 
 //ifname should point to a physical device
-bool net_device_val::verify_eth_qp_creation(const char* ifname)
+bool net_device_val::verify_qp_creation(const char* ifname, enum ibv_qp_type qp_type)
 {
 	bool success = false;
+	char bond_roce_lag_path[256] = {0};
 	struct ibv_cq* cq = NULL;
 	struct ibv_comp_channel *channel = NULL;
 	struct ibv_qp* qp = NULL;
 
-	struct ibv_qp_init_attr qp_init_attr;
+	vma_ibv_qp_init_attr qp_init_attr;
 	memset(&qp_init_attr, 0, sizeof(qp_init_attr));
 
 	vma_ibv_cq_init_attr attr;
@@ -1546,15 +1602,44 @@ bool net_device_val::verify_eth_qp_creation(const char* ifname)
 	qp_init_attr.cap.max_send_sge = MCE_DEFAULT_TX_NUM_SGE;
 	qp_init_attr.cap.max_recv_sge = MCE_DEFAULT_RX_NUM_SGE;
 	qp_init_attr.sq_sig_all = 0;
-	qp_init_attr.qp_type = IBV_QPT_RAW_PACKET;
+	qp_init_attr.qp_type = qp_type;
 
 	//find ib_cxt
 	char base_ifname[IFNAMSIZ];
 	get_base_interface_name((const char*)(ifname), base_ifname, sizeof(base_ifname));
+	int port_num = get_port_from_ifname(base_ifname);
 	ib_ctx_handler* p_ib_ctx = g_p_ib_ctx_handler_collection->get_ib_ctx(base_ifname);
 
 	if (!p_ib_ctx) {
 		nd_logdbg("Cant find ib_ctx for interface %s", base_ifname);
+		if (qp_type == IBV_QPT_RAW_PACKET && m_bond != NO_BOND) {
+			if (check_bond_roce_lag_exist(bond_roce_lag_path, sizeof(bond_roce_lag_path), ifname)) {
+				vlog_printf(VLOG_WARNING,"*******************************************************************************************************\n");
+				vlog_printf(VLOG_WARNING,"* Interface %s will not be offloaded.\n", get_ifname_link());
+				vlog_printf(VLOG_WARNING,"* VMA cannot offload the device while RoCE LAG is enabled.\n");
+				vlog_printf(VLOG_WARNING,"* In order to disable RoCE LAG please use:\n");
+				vlog_printf(VLOG_WARNING,"* echo 0 > %s\n", bond_roce_lag_path);
+				vlog_printf(VLOG_WARNING,"******************************************************************************************************\n");
+			} else if ((p_ib_ctx = g_p_ib_ctx_handler_collection->get_ib_ctx(get_ifname_link()))
+					&& strstr(p_ib_ctx->get_ibname(), "bond")) {
+				vlog_printf(VLOG_WARNING,"*******************************************************************************************************\n");
+				vlog_printf(VLOG_WARNING,"* Interface %s will not be offloaded.\n", get_ifname_link());
+				vlog_printf(VLOG_WARNING,"* VMA cannot offload the device while RoCE LAG is enabled.\n");
+				vlog_printf(VLOG_WARNING,"* Please refer to VMA Release Notes for more info\n");
+				vlog_printf(VLOG_WARNING,"******************************************************************************************************\n");
+
+			}
+		}
+		goto release_resources;
+	} else if (port_num > p_ib_ctx->get_ibv_device_attr()->phys_port_cnt) {
+		nd_logdbg("Invalid port for interface %s", base_ifname);
+		if (qp_type == IBV_QPT_RAW_PACKET && m_bond != NO_BOND && !strncmp(p_ib_ctx->get_ibname(), "mlx4", 4)) {
+			vlog_printf(VLOG_WARNING,"*******************************************************************************************************\n");
+			vlog_printf(VLOG_WARNING,"* Interface %s will not be offloaded.\n", get_ifname_link());
+			vlog_printf(VLOG_WARNING,"* VMA cannot offload the device while RoCE LAG is enabled.\n");
+			vlog_printf(VLOG_WARNING,"* Please refer to VMA Release Notes for more info\n");
+			vlog_printf(VLOG_WARNING,"******************************************************************************************************\n");
+		}
 		goto release_resources;
 	}
 
@@ -1570,36 +1655,57 @@ bool net_device_val::verify_eth_qp_creation(const char* ifname)
 		nd_logdbg("cq creation failed for interface %s (errno=%d %m)", ifname, errno);
 		goto release_resources;
 	}
+
+	vma_ibv_qp_init_attr_comp_mask(p_ib_ctx->get_ibv_pd(), qp_init_attr);
 	qp_init_attr.recv_cq = cq;
 	qp_init_attr.send_cq = cq;
-	qp = ibv_create_qp(p_ib_ctx->get_ibv_pd(), &qp_init_attr);
-	if (qp) {
-		success = true;
-		if (!priv_ibv_query_flow_tag_supported(qp, get_port_from_ifname(base_ifname))) {
-			p_ib_ctx->set_flow_tag_capability(true);
-		}
-		nd_logdbg("verified interface %s for flow tag capabilities : %s", ifname, p_ib_ctx->get_flow_tag_capability() ? "enabled" : "disabled");
 
+	// Set source qpn for mlx5 IPoIB devices
+	if (qp_type == IBV_QPT_UD && !strncmp(p_ib_ctx->get_ibname(), "mlx5", 4)) {
+		unsigned char hw_addr[IPOIB_HW_ADDR_LEN];
+		get_local_ll_addr(ifname, hw_addr, IPOIB_HW_ADDR_LEN, false);
+		IPoIB_addr ipoib_addr(hw_addr);
+		ibv_source_qpn_set(qp_init_attr, ipoib_addr.get_qpn());
+	}
+
+	qp = vma_ibv_create_qp(p_ib_ctx->get_ibv_pd(), &qp_init_attr);
+	if (qp) {
+		if (qp_type == IBV_QPT_UD && priv_ibv_create_flow_supported(qp, port_num) == -1) {
+			nd_logdbg("Create_ibv_flow failed on interface %s (errno=%d %m), Traffic will not be offloaded", ifname, errno);
+			goto qp_failure;
+		} else {
+			success = true;
+			if (qp_type == IBV_QPT_RAW_PACKET && !priv_ibv_query_flow_tag_supported(qp, port_num)) {
+				p_ib_ctx->set_flow_tag_capability(true);
+
+			}
+			nd_logdbg("verified interface %s for flow tag capabilities : %s", ifname, p_ib_ctx->get_flow_tag_capability() ? "enabled" : "disabled");
+		}
 	} else {
-		nd_logdbg("QP creation failed on interface %s (errno=%d %m), Traffic will not be offloaded \n", ifname, errno);
+		nd_logdbg("QP creation failed on interface %s (errno=%d %m), Traffic will not be offloaded", ifname, errno);
+qp_failure:
 		int err = errno; //verify_raw_qp_privliges can overwrite errno so keep it before the call
 		if (validate_raw_qp_privliges() == 0) {
 			// MLNX_OFED raw_qp_privliges file exist with bad value
 			vlog_printf(VLOG_WARNING,"*******************************************************************************************************\n");
 			vlog_printf(VLOG_WARNING,"* Interface %s will not be offloaded.\n", ifname);
-			vlog_printf(VLOG_WARNING,"* Working in this mode might causes VMA malfunction over Ethernet interfaces\n");
+			vlog_printf(VLOG_WARNING,"* Working in this mode might causes VMA malfunction over Ethernet/InfiniBand interfaces\n");
 			vlog_printf(VLOG_WARNING,"* WARNING: the following steps will restart your network interface!\n");
 			vlog_printf(VLOG_WARNING,"* 1. \"echo options ib_uverbs disable_raw_qp_enforcement=1 > /etc/modprobe.d/ib_uverbs.conf\"\n");
-			vlog_printf(VLOG_WARNING,"* 2. \"/etc/init.d/openibd restart\"\n");
+			vlog_printf(VLOG_WARNING,"* 2. Restart openibd or rdma service depending on your system configuration\n");
 			vlog_printf(VLOG_WARNING,"* Read the RAW_PACKET QP root access enforcement section in the VMA's User Manual for more information\n");
 			vlog_printf(VLOG_WARNING,"******************************************************************************************************\n");
 		}
-		else if (err == EPERM) {
-			// file doesn't exists, print msg if errno is a permission problem
+		else if (validate_user_has_cap_net_raw_privliges() == 0 || err == EPERM) {
 			vlog_printf(VLOG_WARNING,"*******************************************************************************************************\n");
 			vlog_printf(VLOG_WARNING,"* Interface %s will not be offloaded.\n", ifname);
 			vlog_printf(VLOG_WARNING,"* Offloaded resources are restricted to root or user with CAP_NET_RAW privileges\n");
 			vlog_printf(VLOG_WARNING,"* Read the CAP_NET_RAW and root access section in the VMA's User Manual for more information\n");
+			vlog_printf(VLOG_WARNING,"*******************************************************************************************************\n");
+		} else {
+			vlog_printf(VLOG_WARNING,"*******************************************************************************************************\n");
+			vlog_printf(VLOG_WARNING,"* Interface %s will not be offloaded.\n", ifname);
+			vlog_printf(VLOG_WARNING,"* VMA was not able to create QP for this device (errno = %d).\n", err);
 			vlog_printf(VLOG_WARNING,"*******************************************************************************************************\n");
 		}
 	}
@@ -1625,130 +1731,4 @@ release_resources:
 		VALGRIND_MAKE_MEM_UNDEFINED(channel, sizeof(ibv_comp_channel));
 	}
 	return success;
-}
-
-int net_device_val::netvsc_create()
-{
-	#define TAP_NAME_FORMAT "t%x%x" // t<pid7c><fd7c>
-	#define TAP_STR_LENGTH	512
-	#define TAP_DISABLE_IPV6 "sysctl -w net.ipv6.conf.%s.disable_ipv6=1"
-
-	int rc = 0;
-	struct ifreq ifr;
-	int ioctl_sock = -1;
-	char command_str[TAP_STR_LENGTH], return_str[TAP_STR_LENGTH], tap_name[IFNAMSIZ];
-	unsigned char hw_addr[ETH_ALEN];
-
-	/* Open TAP device */
-	if( (m_netvsc.tap_fd = orig_os_api.open("/dev/net/tun", O_RDWR)) < 0 ) {
-		nd_logerr("FAILED to open tap %m");
-		rc = -errno;
-		goto error;
-	}
-
-	/* Tap name */
-	rc = snprintf(tap_name, sizeof(tap_name), TAP_NAME_FORMAT, getpid() & 0xFFFFFFF, m_netvsc.tap_fd & 0xFFFFFFF);
-	if (unlikely(((int)sizeof(tap_name) < rc) || (rc < 0))) {
-		nd_logerr("FAILED to create tap name %m");
-		rc = -errno;
-		goto error;
-	}
-
-	/* Init ifr */
-	memset(&ifr, 0, sizeof(ifr));
-	rc = snprintf(ifr.ifr_name, IFNAMSIZ, "%s", tap_name);
-	if (unlikely((IFNAMSIZ < rc) || (rc < 0))) {
-		nd_logerr("FAILED to create tap name %m");
-		rc = -errno;
-		goto error;
-	}
-
-	/* Setting TAP attributes */
-	ifr.ifr_flags = IFF_TAP | IFF_NO_PI | IFF_ONE_QUEUE;
-	if ((rc = orig_os_api.ioctl(m_netvsc.tap_fd, TUNSETIFF, (void *) &ifr)) < 0) {
-		ring_logerr("ioctl failed fd = %d, %d %m", m_netvsc.tap_fd, rc);
-		rc = -errno;
-		goto error;
-	}
-
-	/* Set TAP fd nonblocking */
-	if ((rc = orig_os_api.fcntl(m_netvsc.tap_fd, F_SETFL, O_NONBLOCK))  < 0) {
-		ring_logerr("ioctl failed fd = %d, %d %m", m_netvsc.tap_fd, rc);
-		rc = -errno;
-		goto error;
-	}
-
-	/* Disable Ipv6 for TAP interface */
-	snprintf(command_str, TAP_STR_LENGTH, TAP_DISABLE_IPV6, tap_name);
-	if (run_and_retreive_system_command(command_str, return_str, TAP_STR_LENGTH)  < 0) {
-		ring_logerr("sysctl ipv6 failed fd = %d, %m", m_netvsc.tap_fd);
-		rc = -errno;
-		goto error;
-	}
-
-	/* Create socket */
-	if ((ioctl_sock = orig_os_api.socket(AF_INET, SOCK_DGRAM, 0)) < 0 ) {
-		ring_logerr("FAILED to open socket");
-		rc = -errno;
-		goto error;
-	}
-
-	/* Set MAC address */
-	ifr.ifr_hwaddr.sa_family = AF_LOCAL;
-	get_local_ll_addr(get_ifname_link(), hw_addr, ETH_ALEN, false);
-	memcpy(ifr.ifr_hwaddr.sa_data, hw_addr, ETH_ALEN);
-	if ((rc = orig_os_api.ioctl(ioctl_sock, SIOCSIFHWADDR, &ifr)) < 0) {
-		ring_logerr("ioctl SIOCSIFHWADDR failed %d %m, %s", rc, tap_name);
-		rc = -errno;
-		goto error;
-	}
-
-	/* Set link UP */
-	ifr.ifr_flags |= (IFF_UP | IFF_SLAVE);
-	if ((rc = orig_os_api.ioctl(ioctl_sock, SIOCSIFFLAGS, &ifr)) < 0) {
-		ring_logerr("ioctl SIOCGIFFLAGS failed %d %m, %s", rc, tap_name);
-		rc = -errno;
-		goto error;
-	}
-
-	/* Get TAP interface index */
-	m_netvsc.tap_if_index = if_nametoindex(tap_name);
-	if (!m_netvsc.tap_if_index) {
-		ring_logerr("if_nametoindex failed to get tap index [%s]", tap_name);
-		rc = -errno;
-		goto error;
-	}
-
-	orig_os_api.close(ioctl_sock);
-
-	ring_logdbg("Tap device %d: %s [fd=%d] was created successfully",
-			m_netvsc.tap_if_index, ifr.ifr_name, m_netvsc.tap_fd);
-
-	return 0;
-
-error:
-	ring_logerr("Tap device creation failed");
-
-	if (ioctl_sock >= 0) {
-		orig_os_api.close(ioctl_sock);
-	}
-
-	if (m_netvsc.tap_fd >= 0) {
-		orig_os_api.close(m_netvsc.tap_fd);
-	}
-
-	m_netvsc.tap_if_index = 0;
-	m_netvsc.tap_fd = -1;
-
-	return rc;
-}
-
-void net_device_val::netvsc_destroy()
-{
-	if (m_netvsc.tap_fd >= 0) {
-		orig_os_api.close(m_netvsc.tap_fd);
-
-		m_netvsc.tap_if_index = 0;
-		m_netvsc.tap_fd = -1;
-	}
 }

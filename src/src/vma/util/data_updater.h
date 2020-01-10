@@ -30,37 +30,43 @@
  * SOFTWARE.
  */
 
-#ifndef WQE_H
-#define WQE_H
+#ifndef SRC_VMA_UTIL_DATA_UPDATER_H_
+#define SRC_VMA_UTIL_DATA_UPDATER_H_
 
-#if !defined(MLX5_ETH_INLINE_HEADER_SIZE)
-#define MLX5_ETH_INLINE_HEADER_SIZE 18
-#endif
+#include "vma/proto/dst_entry.h"
 
-#define OCTOWORD	16
-#define WQEBB		64
-
-#ifndef DEFINED_MLX5_HW_ETH_WQE_HEADER
-
-struct mlx5_wqe_eth_seg {
-	uint32_t        rsvd0;
-	uint8_t         cs_flags;
-	uint8_t         rsvd1;
-	uint16_t        mss;
-	uint32_t        rsvd2;
-	uint16_t        inline_hdr_sz;
-	uint8_t         inline_hdr_start[2];
-	uint8_t         inline_hdr[16];
-};
-#endif //DEFINED_MLX5_HW_ETH_WQE_HEADER
-
-struct mlx5_wqe64 {
-	union {
-		struct mlx5_wqe_ctrl_seg ctrl;
-		uint32_t data[4];
-	} ctrl;
-	struct mlx5_wqe_eth_seg eseg;
-	struct mlx5_wqe_data_seg dseg;
+class data_updater {
+public:
+	data_updater() {};
+	virtual ~data_updater() = 0;
+	virtual bool update_field(dst_entry &dst) = 0;
 };
 
-#endif /* WQE_H */
+class header_ttl_updater: public data_updater {
+public:
+    header_ttl_updater(uint8_t ttl, bool is_unicast);
+    virtual ~header_ttl_updater() {};
+    virtual bool update_field(dst_entry &hdr);
+private:
+    uint8_t m_ttl;
+    bool m_is_multicast;
+};
+
+class header_pcp_updater: public data_updater {
+public:
+    header_pcp_updater(uint8_t pcp);
+    virtual ~header_pcp_updater() {};
+    virtual bool update_field(dst_entry &hdr);
+private:
+    uint32_t m_pcp;
+};
+
+class header_tos_updater: public data_updater {
+public:
+    header_tos_updater(uint8_t pcp);
+    virtual ~header_tos_updater() {};
+    virtual bool update_field(dst_entry &hdr);
+private:
+    uint8_t m_tos;
+};
+#endif /* SRC_VMA_UTIL_DATA_UPDATER_H_ */

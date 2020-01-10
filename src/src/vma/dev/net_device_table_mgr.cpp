@@ -42,13 +42,13 @@
 #include "vma/event/netlink_event.h"
 #include "vma/event/event_handler_manager.h"
 #include "vma/util/vtypes.h"
-#include "vma/util/verbs_extra.h"
 #include "vma/util/utils.h"
 #include "vma/util/valgrind.h"
 #include "vma/sock/sock-redirect.h"
 #include "vma/sock/fd_collection.h"
 #include "vma/dev/ring.h"
 #include "net_device_table_mgr.h"
+
 #include "ib_ctx_handler_collection.h"
 
 #define MODULE_NAME             "ndtm"
@@ -625,7 +625,7 @@ void net_device_table_mgr::new_link_event(const netlink_link_info* info)
 						(!net_dev->get_slave(if_index) && (info->flags & IFF_RUNNING)))) {
 			ndtm_logdbg("found entry [%p]: if_index: %d : %s",
 					net_dev, net_dev->get_if_idx(), net_dev->get_ifname());
-			net_dev->update_netvsc_slaves();
+			net_dev->update_netvsc_slaves(info->ifindex, info->flags);
 		}
 	}
 }

@@ -30,8 +30,8 @@
  * SOFTWARE.
  */
 
+#include "vma/ib/base/verbs_extra.h"
 #include "vma/util/to_str.h"
-#include "vma/util/verbs_extra.h"
 
 #ifndef IB_WQE_TEMPLATE_H
 #define IB_WQE_TEMPLATE_H

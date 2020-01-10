@@ -35,12 +35,11 @@
 
 #include "utils/bullseye.h"
 #include "vlogger/vlogger.h"
-#include <vma/util/verbs_extra.h>
 #include <vma/util/sys_vars.h>
 #include "vma/dev/ib_ctx_handler.h"
+#include "vma/ib/base/verbs_extra.h"
 #include "vma/dev/time_converter_ib_ctx.h"
 #include "vma/dev/time_converter_ptp.h"
-#include "vma/util/verbs_extra.h"
 #include "util/valgrind.h"
 #include "vma/event/event_handler_manager.h"
 
@@ -86,7 +85,7 @@ ib_ctx_handler::ib_ctx_handler(struct ib_ctx_handler_desc *desc) :
 			    m_p_ibv_device, m_p_ibv_context, errno);
 	}
 	VALGRIND_MAKE_MEM_DEFINED(m_p_ibv_pd, sizeof(struct ibv_pd));
-	m_p_ibv_device_attr = new vma_ibv_device_attr();
+	m_p_ibv_device_attr = new vma_ibv_device_attr_ex();
 	if (m_p_ibv_device_attr == NULL) {
 		ibch_logpanic("ibv device %p attr allocation failure (ibv context %p) (errno=%d %m)",
 			    m_p_ibv_device, m_p_ibv_context, errno);
@@ -98,7 +97,7 @@ ib_ctx_handler::ib_ctx_handler(struct ib_ctx_handler_desc *desc) :
 		goto err;
 	} ENDIF_VERBS_FAILURE;
 
-#ifdef DEFINED_IBV_EXP_CQ_TIMESTAMP
+#ifdef DEFINED_IBV_CQ_TIMESTAMP
 	switch (desc->ctx_time_converter_mode) {
 	case TS_CONVERSION_MODE_DISABLE:
 		m_p_ctx_time_converter = new time_converter_ib_ctx(m_p_ibv_context, TS_CONVERSION_MODE_DISABLE, 0);
@@ -144,7 +143,7 @@ ib_ctx_handler::ib_ctx_handler(struct ib_ctx_handler_desc *desc) :
 				"value=%d). set to TS_CONVERSION_MODE_DISABLE.",
 				desc->ctx_time_converter_mode);
 	}
-#endif // DEFINED_IBV_EXP_CQ_TIMESTAMP
+#endif // DEFINED_IBV_CQ_TIMESTAMP
 	// update device memory capabilities
 	m_on_device_memory = vma_ibv_dm_size(m_p_ibv_device_attr);
 
@@ -199,7 +198,7 @@ ib_ctx_handler::~ib_ctx_handler()
 		m_p_ibv_pd = NULL;
 	}
 
-	delete m_p_ctx_time_converter;
+	m_p_ctx_time_converter->clean_obj();
 	delete m_p_ibv_device_attr;
 
 	ibv_close_device(m_p_ibv_context);
@@ -219,19 +218,19 @@ void ib_ctx_handler::set_str()
 	strcat(m_str, str_x);
 
 	str_x[0] = '\0';
-	sprintf(str_x, " port(s): %d", m_p_ibv_device_attr->phys_port_cnt);
+	sprintf(str_x, " port(s): %d", get_ibv_device_attr()->phys_port_cnt);
 	strcat(m_str, str_x);
 
 	str_x[0] = '\0';
-	sprintf(str_x, " vendor: %d", m_p_ibv_device_attr->vendor_part_id);
+	sprintf(str_x, " vendor: %d", get_ibv_device_attr()->vendor_part_id);
 	strcat(m_str, str_x);
 
 	str_x[0] = '\0';
-	sprintf(str_x, " fw: %s", m_p_ibv_device_attr->fw_ver);
+	sprintf(str_x, " fw: %s", get_ibv_device_attr()->fw_ver);
 	strcat(m_str, str_x);
 
 	str_x[0] = '\0';
-	sprintf(str_x, " max_qp_wr: %d", m_p_ibv_device_attr->max_qp_wr);
+	sprintf(str_x, " max_qp_wr: %d", get_ibv_device_attr()->max_qp_wr);
 	strcat(m_str, str_x);
 
 	str_x[0] = '\0';

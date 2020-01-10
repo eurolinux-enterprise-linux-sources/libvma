@@ -53,7 +53,7 @@ dst_entry::dst_entry(in_addr_t dst_ip, uint16_t dst_port, uint16_t src_port, soc
 	m_so_bindtodevice_ip(0), m_route_src_ip(0), m_pkt_src_ip(0),
 	m_ring_alloc_logic(sock_data.fd, ring_alloc_logic, this),
 	m_p_tx_mem_buf_desc_list(NULL), m_b_tx_mem_buf_desc_list_pending(false),
-	m_tos(sock_data.tos), m_pcp(sock_data.pcp), m_id(0)
+	m_ttl(sock_data.ttl), m_tos(sock_data.tos), m_pcp(sock_data.pcp), m_id(0)
 {
 	dst_logdbg("dst:%s:%d src: %d", m_dst_ip.to_str().c_str(), ntohs(m_dst_port), ntohs(m_src_port));
 	init_members();
@@ -119,7 +119,6 @@ void dst_entry::init_members()
 	memset(&m_fragmented_send_wqe, 0, sizeof(m_not_inline_send_wqe));
 	m_p_send_wqe_handler = NULL;
 	memset(&m_sge, 0, sizeof(m_sge));
-	m_ttl = 64;
 	m_b_is_offloaded = true;
 	m_b_is_initialized = false;
 	m_p_send_wqe = NULL;
@@ -305,7 +304,7 @@ bool dst_entry::resolve_ring()
 	if (m_p_net_dev_val) {
 		if (!m_p_ring) {
 			dst_logdbg("getting a ring");
-			m_p_ring = m_p_net_dev_val->reserve_ring(m_ring_alloc_logic.create_new_key());
+			m_p_ring = m_p_net_dev_val->reserve_ring(m_ring_alloc_logic.create_new_key(m_pkt_src_ip));
 		}
 		if (m_p_ring) {
 			m_max_inline = std::min<uint32_t>(m_p_ring->get_max_tx_inline(),
@@ -377,7 +376,9 @@ bool dst_entry::conf_l2_hdr_and_snd_wqe_eth()
 		if (src && dst) {
 		BULLSEYE_EXCLUDE_BLOCK_END
 			if (netdevice_eth->get_vlan()) { //vlan interface
-				uint16_t vlan_tci = (m_pcp << 12) | netdevice_eth->get_vlan();
+				uint32_t prio = get_priority_by_tc_class(m_pcp);
+				uint16_t vlan_tci = (prio << NET_ETH_VLAN_PCP_OFFSET) |
+						netdevice_eth->get_vlan();
 				m_header.configure_vlan_eth_headers(*src, *dst, vlan_tci);
 			}
 			else {
@@ -769,4 +770,13 @@ int dst_entry::modify_ratelimit(struct vma_rate_limit_t &rate_limit)
 		return m_p_ring->modify_ratelimit(rate_limit);
 	}
 	return 0;
+}
+
+int dst_entry::get_priority_by_tc_class(uint32_t pcp)
+{
+	// translate class to priority
+	if (m_p_net_dev_val) {
+		return m_p_net_dev_val->get_priority_by_tc_class(pcp);
+	}
+	return VMA_DEFAULT_ENGRESS_MAP_PRIO;
 }

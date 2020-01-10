@@ -36,7 +36,7 @@
 
 #include <tr1/unordered_map>
 
-#include "vma/util/verbs_extra.h"
+#include "vma/ib/base/verbs_extra.h"
 #include "ib_ctx_handler.h"
 
 typedef std::tr1::unordered_map<struct ibv_device*, ib_ctx_handler*>  ib_context_map_t;
@@ -47,7 +47,7 @@ public:
 	ib_ctx_handler_collection();
 	~ib_ctx_handler_collection();
 
-	void update_tbl();
+	void update_tbl(const char *ifa_name = NULL);
 	void print_val_tbl();
 
 	inline ib_context_map_t* get_ib_cxt_list() {

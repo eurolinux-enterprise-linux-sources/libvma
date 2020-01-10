@@ -54,6 +54,11 @@
 #include "vma/util/sock_addr.h"
 #include "vma/sock/sock-redirect.h"
 #include "vma/util/vtypes.h"
+#include "vma/ib/base/verbs_extra.h"
+
+#ifdef HAVE_SYS_CAPABILITY_H
+	#include <sys/capability.h>
+#endif
 
 using namespace std;
 
@@ -774,6 +779,19 @@ bool get_bond_active_slave_name(IN const char* bond_name, OUT char* active_slave
 	return true;
 }
 
+bool check_bond_roce_lag_exist(OUT char* bond_roce_lag_path, int sz, IN const char* slave_name)
+{
+	char sys_res[1024] = {0};
+	snprintf(bond_roce_lag_path, sz, BONDING_ROCE_LAG_FILE, slave_name);
+	if (priv_read_file(bond_roce_lag_path, sys_res, 1024, VLOG_FUNC) > 0) {
+		if (strtol(sys_res, NULL,10) > 0 && errno != ERANGE) {
+			return true;
+		}
+	}
+
+	return false;
+}
+
 bool get_netvsc_slave(IN const char* ifname, OUT char* slave_name, OUT unsigned int &slave_flags)
 {
 	char netvsc_path[256];
@@ -863,6 +881,25 @@ bool check_device_exist(const char* ifname, const char *path)
 	return (fd > 0);
 }
 
+bool check_device_name_ib_name(const char* ifname, const char* ibname)
+{
+	int n = -1;
+	int fd = -1;
+	char ib_path[IBV_SYSFS_PATH_MAX]= {0};
+
+	n = snprintf(ib_path, sizeof(ib_path), "/sys/class/infiniband/%s/device/net/%s/ifindex",
+			ibname, ifname);
+	if (likely((0 < n) && (n < (int)sizeof(ib_path)))) {
+		fd = open(ib_path, O_RDONLY);
+		if (fd >= 0) {
+			close(fd);
+			return true;
+		}
+	}
+
+	return false;
+}
+
 bool get_interface_oper_state(IN const char* interface_name, OUT char* curr_state, IN int sz)
 {
 	char interface_state_path[256] = {0};
@@ -925,6 +962,28 @@ int validate_raw_qp_privliges()
 		return 0;
 	}
 	return 1;
+}
+
+bool validate_user_has_cap_net_raw_privliges()
+{
+#ifdef HAVE_SYS_CAPABILITY_H
+	struct __user_cap_header_struct cap_header;
+	cap_user_header_t cap_header_ptr = &cap_header;
+	struct __user_cap_data_struct cap_data;
+	cap_user_data_t cap_data_ptr = &cap_data;
+	cap_header_ptr->pid = getpid();
+	cap_header_ptr->version = _LINUX_CAPABILITY_VERSION;
+	 if(capget(cap_header_ptr, cap_data_ptr)  < 0) {
+		 __log_dbg("error getting cap_net_raw permissions (%d %m)", errno);
+		 return false;
+	 } else {
+		 __log_dbg("successfully got cap_net_raw permissions. Effective=%X Permitted=%X", cap_data_ptr->effective, cap_data_ptr->permitted);
+	 }
+	 return ((cap_data_ptr->effective & CAP_TO_MASK(CAP_NET_RAW)) != 0);
+#else
+	 __log_dbg("libcap-devel library is not installed, skipping cap_net_raw permission checks");
+	 return false;
+#endif
 }
 
 loops_timer::loops_timer()

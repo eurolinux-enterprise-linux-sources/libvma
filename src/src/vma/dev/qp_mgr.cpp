@@ -60,20 +60,16 @@
 #define FICTIVE_AH_SL		5
 #define FICTIVE_AH_DLID		0x3
 
+#define MAX_UPSTREAM_CQ_MSHV_SIZE 8192
 
 qp_mgr::qp_mgr(const ring_simple* p_ring, const ib_ctx_handler* p_context,
 		const uint8_t port_num, const uint32_t tx_num_wr):
 	 m_rq_wqe_counter(0)
 	,m_rq_wqe_idx_to_wrid(NULL)
-#ifdef DEFINED_SOCKETXTREME
-	,m_mlx5_hw_qp(NULL)
-#endif
 	,m_qp(NULL)
 	,m_p_ring((ring_simple*)p_ring)
 	,m_port_num((uint8_t)port_num)
 	,m_p_ib_ctx_handler((ib_ctx_handler*)p_context)
-	,m_p_ahc_head(NULL)
-	,m_p_ahc_tail(NULL)
 	,m_max_inline_data(0)
 	,m_max_qp_wr(0)
 	,m_p_cq_mgr_rx(NULL)
@@ -99,6 +95,7 @@ qp_mgr::qp_mgr(const ring_simple* p_ring, const ib_ctx_handler* p_context,
 	memset(&m_rate_limit, 0, sizeof(struct vma_rate_limit_t));
 
 #ifdef DEFINED_SOCKETXTREME
+	memset(&m_mlx5_qp, 0, sizeof(m_mlx5_qp));
 	m_rq_wqe_idx_to_wrid = (uint64_t*)mmap(NULL, m_rx_num_wr * sizeof(*m_rq_wqe_idx_to_wrid),
 		PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
 	if (m_rq_wqe_idx_to_wrid == MAP_FAILED) {
@@ -112,14 +109,6 @@ qp_mgr::~qp_mgr()
 {
 	qp_logfunc("");
 
-	// Don't assume anything
-	// release_tx/rx_buffers() - poll and process the CQ's
-	release_tx_buffers();
-	release_rx_buffers();
-
-	if (m_p_cq_mgr_rx) {
-		m_p_cq_mgr_rx->clean_cq();
-	}
 	qp_logdbg("calling ibv_destroy_qp(qp=%p)", m_qp);
 	if (m_qp) {
 		IF_VERBS_FAILURE_EX(ibv_destroy_qp(m_qp), EIO) {
@@ -154,16 +143,42 @@ qp_mgr::~qp_mgr()
 	qp_logdbg("delete done");
 }
 
-cq_mgr* qp_mgr::init_rx_cq_mgr(struct ibv_comp_channel* p_rx_comp_event_channel)
+cq_mgr* qp_mgr::handle_cq_initialization(uint32_t *num_wr, struct ibv_comp_channel* comp_event_channel, bool is_rx)
 {
 	qp_logfunc("");
-	return new cq_mgr(m_p_ring, m_p_ib_ctx_handler, m_rx_num_wr, p_rx_comp_event_channel, true);
+	cq_mgr* cq = NULL;
+
+	try {
+		cq = new cq_mgr(m_p_ring, m_p_ib_ctx_handler, *num_wr, comp_event_channel, is_rx);
+	} catch (vma_exception& e) {
+		// This is a workaround for an issue with cq creation of mlx4 devices on
+		// upstream-driver VMs over Windows Hypervisor.
+		if (safe_mce_sys().hypervisor == mce_sys_var::HYPER_MSHV && !strncmp(m_p_ib_ctx_handler->get_ibname(), "mlx4", 4) &&
+				*num_wr > MAX_UPSTREAM_CQ_MSHV_SIZE) {
+			qp_logdbg("cq creation failed with cq_size of %d. retrying with size of %d", *num_wr, MAX_UPSTREAM_CQ_MSHV_SIZE);
+			*num_wr = MAX_UPSTREAM_CQ_MSHV_SIZE;
+			try {
+				cq = new cq_mgr(m_p_ring, m_p_ib_ctx_handler, *num_wr, comp_event_channel, is_rx);
+			} catch (vma_exception&) {
+			}
+		}
+
+		if (!cq) {
+			qp_logerr("%s", e.message);
+		}
+	}
+
+	return cq;
+}
+
+cq_mgr* qp_mgr::init_rx_cq_mgr(struct ibv_comp_channel* p_rx_comp_event_channel)
+{
+	return handle_cq_initialization(&m_rx_num_wr, p_rx_comp_event_channel, true);
 }
 
 cq_mgr* qp_mgr::init_tx_cq_mgr()
 {
-	qp_logfunc("");
-	return new cq_mgr(m_p_ring, m_p_ib_ctx_handler, m_tx_num_wr, m_p_ring->get_tx_comp_event_channel(), false);
+	return handle_cq_initialization(&m_tx_num_wr, m_p_ring->get_tx_comp_event_channel(), false);
 }
 
 int qp_mgr::configure(struct ibv_comp_channel* p_rx_comp_event_channel)
@@ -243,12 +258,10 @@ int qp_mgr::configure(struct ibv_comp_channel* p_rx_comp_event_channel)
 
 	m_curr_rx_wr = 0;
 
-	m_p_ahc_head = NULL;
-	m_p_ahc_tail = NULL;
-
 #ifdef DEFINED_SOCKETXTREME
-	struct verbs_qp *vqp = (struct verbs_qp *)m_qp;
-	m_mlx5_hw_qp = (struct mlx5_qp*)container_of(vqp, struct mlx5_qp, verbs_qp);
+	if (0 != vma_ib_mlx5_get_qp(m_qp, &m_mlx5_qp)) {
+		qp_logpanic("vma_ib_mlx5_get_qp failed (errno=%d %m)", errno);
+	}
 #endif //DEFINED_SOCKETXTREME
 	if (m_p_cq_mgr_tx) {
 		m_p_cq_mgr_tx->add_qp_tx(this);
@@ -312,7 +325,7 @@ void qp_mgr::release_rx_buffers()
 			--m_curr_rx_wr;
 			mem_buf_desc_t* p_mem_buf_desc = (mem_buf_desc_t*)(uintptr_t)m_ibv_rx_wr_array[m_curr_rx_wr].wr_id;
 			if (p_mem_buf_desc && p_mem_buf_desc->p_desc_owner) {
-				p_mem_buf_desc->p_desc_owner->mem_buf_desc_return_to_owner_rx(p_mem_buf_desc);
+				m_p_ring->mem_buf_desc_return_to_owner_rx(p_mem_buf_desc);
 			}
 			else {
 				g_buffer_pool_rx->put_buffers_thread_safe(p_mem_buf_desc);
@@ -322,9 +335,8 @@ void qp_mgr::release_rx_buffers()
 	// Wait for all FLUSHed WQE on Rx CQ
 	qp_logdbg("draining rx cq_mgr %p (last_posted_rx_wr_id = %p)", m_p_cq_mgr_rx, m_last_posted_rx_wr_id);
 	uintptr_t last_polled_rx_wr_id = 0;
-	while (m_p_cq_mgr_rx &&
-			last_polled_rx_wr_id != m_last_posted_rx_wr_id &&
-			errno != EIO) {
+	while (m_p_cq_mgr_rx && last_polled_rx_wr_id != m_last_posted_rx_wr_id &&
+			errno != EIO && !m_p_ib_ctx_handler->is_removed()) {
 
 		// Process the FLUSH'ed WQE's
 		int ret = m_p_cq_mgr_rx->drain_and_proccess(&last_polled_rx_wr_id);
@@ -332,11 +344,16 @@ void qp_mgr::release_rx_buffers()
 
 		total_ret += ret;
 
+		if (!ret) {
+			// Query context for ib_verbs events (especially for IBV_EVENT_DEVICE_FATAL)
+			g_p_event_handler_manager->query_for_ibverbs_event(m_p_ib_ctx_handler->get_ibv_context()->async_fd);
+		}
+
 		// Add short delay (500 usec) to allow for WQE's to be flushed to CQ every poll cycle
 		const struct timespec short_sleep = {0, 500000}; // 500 usec
 		nanosleep(&short_sleep, NULL);
 	}
-	m_last_posted_rx_wr_id = 0; // Clear the posted WR_ID flag, we just clear the entier RQ
+	m_last_posted_rx_wr_id = 0; // Clear the posted WR_ID flag, we just clear the entire RQ
 	qp_logdbg("draining completed with a total of %d wce's on rx cq_mgr", total_ret);
 }
 
@@ -347,7 +364,7 @@ void qp_mgr::release_tx_buffers()
 	qp_logdbg("draining tx cq_mgr %p", m_p_cq_mgr_tx);
 	while (m_p_cq_mgr_tx && m_qp &&
 			((ret = m_p_cq_mgr_tx->poll_and_process_element_tx(&poll_sn)) > 0) &&
-			errno != EIO) {
+			(errno != EIO && !m_p_ib_ctx_handler->is_removed())) {
 		qp_logdbg("draining completed on tx cq_mgr (%d wce)", ret);
 	}
 }
@@ -443,38 +460,6 @@ void qp_mgr::trigger_completion_for_all_sent_packets()
 	}
 }
 
-#if _BullseyeCoverage
-    #pragma BullseyeCoverage off
-#endif
-
-void qp_mgr::ah_cleanup(struct ibv_ah* ah)
-{
-	ah_cleaner * curr_ahc = new ah_cleaner(ah, m_p_ring);
-	qp_logdbg("insert new ah_cleaner to list");
-
-	if (!m_p_ahc_head) {  // empty list
-		m_p_ahc_head = curr_ahc;
-	}
-	else {
-		m_p_ahc_tail->m_next_owner = curr_ahc;
-	}
-	m_p_ahc_tail = curr_ahc;
-	
-#if 0
-	ah_cleaner* temp_ahc = m_p_ahc_head;
-	int i = 1;
-	while (temp_ahc) {
-		qp_logdbg("ah num %d, ahc =%p ", i, temp_ahc);
-		i++;
-		temp_ahc = (ah_cleaner*) temp_ahc->m_next_owner;
-	}
-#endif
-}
-
-#if _BullseyeCoverage
-    #pragma BullseyeCoverage on
-#endif
-
 uint32_t qp_mgr::get_rx_max_wr_num()
 {
 	return m_rx_num_wr;
@@ -508,7 +493,11 @@ void qp_mgr::post_recv_buffer(mem_buf_desc_t* p_mem_buf_desc)
 
 		m_curr_rx_wr = 0;
 		struct ibv_recv_wr *bad_wr = NULL;
+#ifdef DEFINED_SOCKETXTREME
+		IF_VERBS_FAILURE(vma_ib_mlx5_post_recv(&m_mlx5_qp, &m_ibv_rx_wr_array[0], &bad_wr)) {
+#else
 		IF_VERBS_FAILURE(ibv_post_recv(m_qp, &m_ibv_rx_wr_array[0], &bad_wr)) {
+#endif // DEFINED_SOCKETXTREME
 			uint32_t n_pos_bad_rx_wr = ((uint8_t*)bad_wr - (uint8_t*)m_ibv_rx_wr_array) / sizeof(struct ibv_recv_wr);
 			qp_logerr("failed posting list (errno=%d %m)", errno);
 			qp_logerr("bad_wr is %d in submitted list (bad_wr=%p, m_ibv_rx_wr_array=%p, size=%d)", n_pos_bad_rx_wr, bad_wr, m_ibv_rx_wr_array, sizeof(struct ibv_recv_wr));
@@ -603,14 +592,6 @@ int qp_mgr::send(vma_ibv_send_wr* p_send_wqe, vma_wr_tx_packet_attr attr)
 
 		set_unsignaled_count();
 		m_p_last_tx_mem_buf_desc = NULL;
-
-		if (m_p_ahc_head) { // need to destroy ah
-			//save the orig owner
-			qp_logdbg("mark with signal!");
-			m_p_ahc_tail->m_next_owner = p_mem_buf_desc->p_desc_owner;
-			p_mem_buf_desc->p_desc_owner = m_p_ahc_head;
-			m_p_ahc_head = m_p_ahc_tail = NULL;
-		}
 
 		// Poll the Tx CQ
 		uint64_t dummy_poll_sn = 0;
@@ -718,25 +699,12 @@ int qp_mgr_ib::prepare_ibv_qp(vma_ibv_qp_init_attr& qp_init_attr)
 
 	qp_init_attr.qp_type = IBV_QPT_UD;
 	vma_ibv_qp_init_attr_comp_mask(m_p_ib_ctx_handler->get_ibv_pd(), qp_init_attr);
-#ifdef DEFINED_IBV_EXP_QP_INIT_ATTR_ASSOCIATED_QPN
 	if (m_underly_qpn) {
-		qp_init_attr.comp_mask |= IBV_EXP_QP_INIT_ATTR_ASSOCIATED_QPN;
-		qp_init_attr.associated_qpn = m_underly_qpn;
+		ibv_source_qpn_set(qp_init_attr, m_underly_qpn);
 		qp_logdbg("create qp using underly qpn = 0x%X", m_underly_qpn);
 	}
-#endif /* DEFINED_IBV_EXP_QP_INIT_ATTR_ASSOCIATED_QPN */
 
 	m_qp = vma_ibv_create_qp(m_p_ib_ctx_handler->get_ibv_pd(), &qp_init_attr);
-#ifdef DEFINED_IBV_EXP_QP_INIT_ATTR_ASSOCIATED_QPN
-	if (!m_qp && m_underly_qpn) {
-		qp_logdbg("ibv_create_qp failed to use underly qpn (errno=%d %m)", errno);
-
-		/* try to use traditional approach */
-		qp_init_attr.comp_mask &= ~IBV_EXP_QP_INIT_ATTR_ASSOCIATED_QPN;
-		m_underly_qpn = 0;
-		m_qp = vma_ibv_create_qp(m_p_ib_ctx_handler->get_ibv_pd(), &qp_init_attr);
-	}
-#endif /* DEFINED_IBV_EXP_QP_INIT_ATTR_ASSOCIATED_QPN */
 
 	BULLSEYE_EXCLUDE_BLOCK_START
 	if (!m_qp) {
@@ -785,7 +753,7 @@ void qp_mgr_ib::update_pkey_index()
 	else {
 		qp_logdbg("IB: Found correct pkey_index (%d) for pkey '%d'", m_pkey_index, m_pkey);
 	}
-#ifdef DEFINED_IBV_EXP_QP_INIT_ATTR_ASSOCIATED_QPN
+#ifdef DEFINED_IBV_QP_INIT_SOURCE_QPN
 	/* m_underly_qpn is introduced to detect if current qp_mgr is able to
 	 * use associated qp.
 	 * It is set to non zero value if OFED supports such possibility only but final
@@ -800,7 +768,7 @@ void qp_mgr_ib::update_pkey_index()
 		m_underly_qpn = m_p_ring->get_qpn();
 	}
 	qp_logdbg("IB: Use qpn = 0x%X for device: %s", m_underly_qpn, m_p_ib_ctx_handler->get_ibname());
-#endif /* DEFINED_IBV_EXP_QP_INIT_ATTR_ASSOCIATED_QPN */
+#endif /* DEFINED_IBV_QP_INIT_SOURCE_QPN */
 }
 
 uint32_t qp_mgr::is_ratelimit_change(struct vma_rate_limit_t &rate_limit)

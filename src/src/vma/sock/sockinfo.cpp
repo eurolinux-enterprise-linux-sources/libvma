@@ -35,6 +35,7 @@
 
 #include <sys/epoll.h>
 #include <netdb.h>
+#include <linux/sockios.h>
 
 #include "utils/bullseye.h"
 #include "vlogger/vlogger.h"
@@ -42,6 +43,7 @@
 #include "vma/proto/route_table_mgr.h"
 #include "sock-redirect.h"
 #include "fd_collection.h"
+#include "vma/dev/ring_simple.h"
 
 
 #define MODULE_NAME 		"si"
@@ -61,7 +63,13 @@
 
 sockinfo::sockinfo(int fd):
 		socket_fd_api(fd),
-		m_b_closed(false), m_b_blocking(true), m_protocol(PROTO_UNDEFINED),
+		m_b_closed(false),
+		m_b_blocking(true),
+		m_b_pktinfo(false),
+		m_b_rcvtstamp(false),
+		m_b_rcvtstampns(false),
+		m_n_tsing_flags(0),
+		m_protocol(PROTO_UNDEFINED),
 		m_lock_rcv(MODULE_NAME "::m_lock_rcv"),
 		m_lock_snd(MODULE_NAME "::m_lock_snd"),
 		m_p_connected_dst_entry(NULL),
@@ -81,6 +89,7 @@ sockinfo::sockinfo(int fd):
 		m_fd_context((void *)((uintptr_t)m_fd)),
 		m_flow_tag_id(0),
 		m_flow_tag_enabled(false),
+		m_n_uc_ttl(safe_mce_sys().sysctl_reader.get_net_ipv4_ttl()),
 		m_tcp_flow_is_5t(false),
 		m_p_rings_fds(NULL)
 
@@ -99,8 +108,8 @@ sockinfo::sockinfo(int fd):
 	m_p_socket_stats->inode = fd2inode(m_fd);
 	m_p_socket_stats->b_blocking = m_b_blocking;
 	m_rx_reuse_buff.n_buff_num = 0;
-	memset(&m_so_ratelimit, 0, sizeof(struct vma_rate_limit_t));
-
+	memset(&m_so_ratelimit, 0, sizeof(vma_rate_limit_t));
+	set_flow_tag(m_fd + 1);
 #ifdef DEFINED_SOCKETXTREME 
 	m_ec.clear();
 	m_socketxtreme_completion = NULL;
@@ -207,7 +216,8 @@ int sockinfo::ioctl(unsigned long int __request, unsigned long int __arg)
 			return ret;
 		}
 		break;
-
+	case SIOCGIFVLAN: /* prevent error print */
+		break;
 	default:
 		char buf[128];
 		snprintf(buf, sizeof(buf), "unimplemented ioctl request=%#x, flags=%#x", (unsigned)__request, (unsigned)__arg);
@@ -230,16 +240,137 @@ int sockinfo::ioctl(unsigned long int __request, unsigned long int __arg)
 
 int sockinfo::setsockopt(int __level, int __optname, const void *__optval, socklen_t __optlen)
 {
-	int ret = -1;
+	int ret = SOCKOPT_PASS_TO_OS;
 
 	if (__level == SOL_SOCKET) {
 		switch(__optname) {
 		case SO_VMA_USER_DATA:
 			if (__optlen == sizeof(m_fd_context)) {
 				m_fd_context = *(void **)__optval;
-				ret = 0;
+				ret = SOCKOPT_INTERNAL_VMA_SUPPORT;
 			} else {
+				ret = SOCKOPT_NO_VMA_SUPPORT;
 				errno = EINVAL;
+			}
+			break;
+		case SO_VMA_RING_USER_MEMORY:
+			if (__optval) {
+				if (__optlen == sizeof(iovec)) {
+					iovec *attr = (iovec *)__optval;
+					m_ring_alloc_log_rx.set_memory_descriptor(*attr);
+					m_ring_alloc_logic = ring_allocation_logic_rx(get_fd(), m_ring_alloc_log_rx, this);
+					if (m_p_rx_ring || m_rx_ring_map.size()) {
+						si_logwarn("user asked to assign memory for "
+							   "RX ring but ring already exists");
+					}
+					ret = SOCKOPT_INTERNAL_VMA_SUPPORT;
+				} else {
+					ret = SOCKOPT_NO_VMA_SUPPORT;
+					errno = EINVAL;
+					si_logdbg("SOL_SOCKET, SO_VMA_RING_USER_MEMORY - "
+						  "bad length expected %d got %d",
+						  sizeof(iovec), __optlen);
+				}
+			}
+			else {
+				ret = SOCKOPT_NO_VMA_SUPPORT;
+				errno = EINVAL;
+				si_logdbg("SOL_SOCKET, SO_VMA_RING_USER_MEMORY - NOT HANDLED, optval == NULL");
+			}
+			break;
+		case SO_VMA_FLOW_TAG:
+			if (__optval) {
+				if (__optlen == sizeof(uint32_t)) {
+					if (set_flow_tag(*(uint32_t*)__optval)) {
+						si_logdbg("SO_VMA_FLOW_TAG, set "
+							  "socket %s to flow id %d",
+							  m_fd, m_flow_tag_id);
+						// not supported in OS
+						ret = SOCKOPT_INTERNAL_VMA_SUPPORT;
+					} else {
+						ret = SOCKOPT_NO_VMA_SUPPORT;
+						errno = EINVAL;
+					}
+				} else {
+					ret = SOCKOPT_NO_VMA_SUPPORT;
+					errno = EINVAL;
+					si_logdbg("SO_VMA_FLOW_TAG, bad length "
+						  "expected %d got %d",
+						  sizeof(uint32_t), __optlen);
+					break;
+				}
+			} else {
+				ret = SOCKOPT_NO_VMA_SUPPORT;
+				errno = EINVAL;
+				si_logdbg("SO_VMA_FLOW_TAG - NOT HANDLED, "
+					  "optval == NULL");
+			}
+			break;
+		case SO_TIMESTAMP:
+		case SO_TIMESTAMPNS:
+			if (__optval) {
+				m_b_rcvtstamp = *(bool*)__optval;
+				if (__optname == SO_TIMESTAMPNS)
+					m_b_rcvtstampns = m_b_rcvtstamp;
+				si_logdbg("SOL_SOCKET, %s=%s", setsockopt_so_opt_to_str(__optname), (m_b_rcvtstamp ? "true" : "false"));
+			}
+			else {
+				si_logdbg("SOL_SOCKET, %s=\"???\" - NOT HANDLED, optval == NULL", setsockopt_so_opt_to_str(__optname));
+			}
+			break;
+
+		case SO_TIMESTAMPING:
+			if (__optval) {
+				uint8_t val = *(uint8_t*)__optval;
+
+				// SOF_TIMESTAMPING_TX_SOFTWARE and SOF_TIMESTAMPING_TX_HARDWARE is NOT supported.
+				if (val & (SOF_TIMESTAMPING_TX_SOFTWARE | SOF_TIMESTAMPING_TX_HARDWARE)) {
+					ret = SOCKOPT_NO_VMA_SUPPORT;
+					errno = EOPNOTSUPP;
+					si_logdbg("SOL_SOCKET, SOF_TIMESTAMPING_TX_SOFTWARE and SOF_TIMESTAMPING_TX_HARDWARE is not supported, errno set to EOPNOTSUPP");
+				}
+
+				if (val & (SOF_TIMESTAMPING_RAW_HARDWARE | SOF_TIMESTAMPING_RX_HARDWARE)) {
+					if (g_p_ib_ctx_handler_collection->get_ctx_time_conversion_mode() == TS_CONVERSION_MODE_DISABLE){
+						if (safe_mce_sys().hw_ts_conversion_mode ==  TS_CONVERSION_MODE_DISABLE) {
+							ret = SOCKOPT_NO_VMA_SUPPORT;
+							errno = EPERM;
+							si_logdbg("SOL_SOCKET, SOF_TIMESTAMPING_RAW_HARDWARE and SOF_TIMESTAMPING_RX_HARDWARE socket options were disabled (VMA_HW_TS_CONVERSION = %d) , errno set to EPERM", TS_CONVERSION_MODE_DISABLE);
+						} else {
+							ret = SOCKOPT_NO_VMA_SUPPORT;
+							errno = ENODEV;
+							si_logdbg("SOL_SOCKET, SOF_TIMESTAMPING_RAW_HARDWARE and SOF_TIMESTAMPING_RX_HARDWARE is not supported by device(s), errno set to ENODEV");
+						}
+					}
+				}
+
+				m_n_tsing_flags  = val;
+				si_logdbg("SOL_SOCKET, SO_TIMESTAMPING=%u", m_n_tsing_flags);
+			}
+			else {
+				si_logdbg("SOL_SOCKET, %s=\"???\" - NOT HANDLED, optval == NULL", setsockopt_so_opt_to_str(__optname));
+			}
+			break;
+		default:
+			break;
+		}
+	} else if (__level == IPPROTO_IP) {
+		switch(__optname) {
+		case IP_TTL:
+			if (__optlen < sizeof(m_n_uc_ttl)) {
+				ret = SOCKOPT_NO_VMA_SUPPORT;
+				errno = EINVAL;
+			} else {
+				int val = __optlen < sizeof(val) ?  (uint8_t) *(uint8_t *)__optval : (int) *(int *)__optval;
+				if (val != -1 && (val < 1 || val > 255)) {
+					ret = SOCKOPT_NO_VMA_SUPPORT;
+					errno = EINVAL;
+				} else {
+					m_n_uc_ttl = (val == -1) ? safe_mce_sys().sysctl_reader.get_net_ipv4_ttl() : (uint8_t) val;
+					header_ttl_updater du(m_n_uc_ttl, false);
+					update_header_field(&du);
+					si_logdbg("IPPROTO_IP, optname=IP_TTL (%d)", m_n_uc_ttl);
+				}
 			}
 			break;
 		default:
@@ -247,6 +378,7 @@ int sockinfo::setsockopt(int __level, int __optname, const void *__optval, sockl
 		}
 	}
 
+	si_logdbg("ret (%d)", ret);
 	return ret;
 }
 
@@ -265,7 +397,14 @@ int sockinfo::getsockopt(int __level, int __optname, void *__optval, socklen_t *
 				errno = EINVAL;
 			}
 		break;
-
+		case SO_VMA_FLOW_TAG:
+			if (*__optlen >= sizeof(uint32_t)) {
+				*(uint32_t*)__optval = m_flow_tag_id;
+				ret = 0;
+			} else {
+				errno = EINVAL;
+			}
+		break;
 		case SO_MAX_PACING_RATE:
 			if (*__optlen == sizeof(struct vma_rate_limit_t)) {
 				*(struct vma_rate_limit_t*)__optval = m_so_ratelimit;
@@ -577,10 +716,10 @@ net_device_resources_t* sockinfo::create_nd_resources(const ip_address ip_local)
 		unlock_rx_q();
 		m_rx_ring_map_lock.lock();
 		resource_allocation_key *key;
-		if (m_rx_ring_map.size()) {
+		if (m_rx_ring_map.size() && m_ring_alloc_logic.is_logic_support_migration()) {
 			key = m_ring_alloc_logic.get_key();
 		} else {
-			key = m_ring_alloc_logic.create_new_key();
+			key = m_ring_alloc_logic.create_new_key(ip_local.get_in_addr());
 		}
 		nd_resources.p_ring = nd_resources.p_ndv->reserve_ring(key);
 		m_rx_ring_map_lock.unlock();
@@ -647,7 +786,13 @@ bool sockinfo::destroy_nd_resources(const ip_address ip_local)
 		// Release ring reference
 		BULLSEYE_EXCLUDE_BLOCK_START
 		unlock_rx_q();
-		if (!p_nd_resources->p_ndv->release_ring(m_ring_alloc_logic.get_key())) {
+		resource_allocation_key *key;
+		if (m_ring_alloc_logic.is_logic_support_migration()) {
+			key = m_ring_alloc_logic.get_key();
+		} else {
+			key = m_ring_alloc_logic.create_new_key(ip_local.get_in_addr());
+		}
+		if (!p_nd_resources->p_ndv->release_ring(key)) {
 			lock_rx_q();
 			si_logerr("Failed to release ring for allocation key %s on ip %s",
 				  m_ring_alloc_logic.get_key()->to_str(),
@@ -1082,7 +1227,7 @@ void sockinfo::rx_del_ring_cb(flow_tuple_with_local_if &flow_key, ring* p_ring, 
 }
 
 // Move all owner's rx ready packets to 'toq'
-void sockinfo::move_owned_rx_ready_descs(const mem_buf_desc_owner* p_desc_owner, descq_t *toq)
+void sockinfo::move_owned_rx_ready_descs(ring* p_ring, descq_t *toq)
 {
 	// Assume locked by owner!!!
 
@@ -1091,7 +1236,7 @@ void sockinfo::move_owned_rx_ready_descs(const mem_buf_desc_owner* p_desc_owner,
 	for (size_t i = 0 ; i < size; i++) {
 		temp = get_front_m_rx_pkt_ready_list();
 		pop_front_m_rx_pkt_ready_list();
-		if (temp->p_desc_owner != p_desc_owner) {
+		if (!p_ring->is_member(temp->p_desc_owner)) {
 			push_back_m_rx_pkt_ready_list(temp);
 			continue;
 		}
@@ -1347,20 +1492,131 @@ int sockinfo::setsockopt_kernel(int __level, int __optname, const void *__optval
 	return ret;
 }
 
-void sockinfo::set_sockopt_prio(__const void *__optval, socklen_t __optlen)
+int sockinfo::set_sockopt_prio(__const void *__optval, socklen_t __optlen)
 {
-	int val = -1;
-
-	if (__optlen == 1) {
-		val = *(uint8_t*)__optval;
-	} else if (__optlen >= 1) {
-		val = *(int*)__optval;
-	} else {
-		/* error flow is handled in kernel setsockopt */
+	if (__optlen < sizeof(int)) {
 		si_logdbg("bad parameter size in set_sockopt_prio");
+		errno = EINVAL;
+		return -1;
 	}
-	if (val >= 0 && val <= 6) {
-		m_pcp = (uint8_t)val;
+	uint32_t val = *(uint32_t*)__optval;
+	if (m_pcp != val) {
+		m_pcp = val;
 		si_logdbg("set socket pcp to be %d", m_pcp);
+		header_pcp_updater du(m_pcp);
+		update_header_field(&du);
 	}
+	return 0;
+
+}
+
+/**
+ * Function to process SW & HW timestamps
+ */
+void sockinfo::process_timestamps(mem_buf_desc_t* p_desc)
+{
+	// keep the sw_timestamp the same to all sockets
+	if ((m_b_rcvtstamp ||
+		 (m_n_tsing_flags &
+		  (SOF_TIMESTAMPING_RX_SOFTWARE | SOF_TIMESTAMPING_SOFTWARE))) &&
+		!p_desc->rx.timestamps.sw.tv_sec) {
+		clock_gettime(CLOCK_REALTIME, &(p_desc->rx.timestamps.sw));
+	}
+
+	// convert hw timestamp to system time
+	if (m_n_tsing_flags & SOF_TIMESTAMPING_RAW_HARDWARE) {
+		ring_simple* owner_ring = (ring_simple*) p_desc->p_desc_owner;
+		if (owner_ring) {
+			owner_ring->convert_hw_time_to_system_time(p_desc->rx.hw_raw_timestamp, &p_desc->rx.timestamps.hw);
+		}
+	}
+}
+
+void sockinfo::handle_recv_timestamping(struct cmsg_state *cm_state)
+{
+	struct {
+		struct timespec systime;
+		struct timespec hwtimetrans;
+		struct timespec hwtimeraw;
+	} tsing;
+
+	memset(&tsing, 0, sizeof(tsing));
+
+	timestamps_t* packet_timestamps = get_socket_timestamps();
+	struct timespec* packet_systime = &packet_timestamps->sw;
+
+	// Only fill in SO_TIMESTAMPNS if both requested.
+	// This matches the kernel behavior.
+	if (m_b_rcvtstampns) {
+		insert_cmsg(cm_state, SOL_SOCKET, SO_TIMESTAMPNS, packet_systime, sizeof(*packet_systime));
+	} else if (m_b_rcvtstamp) {
+		struct timeval tv;
+		tv.tv_sec = packet_systime->tv_sec;
+		tv.tv_usec = packet_systime->tv_nsec/1000;
+		insert_cmsg(cm_state, SOL_SOCKET, SO_TIMESTAMP, &tv, sizeof(tv));
+	}
+
+	// Handle timestamping options
+	// Only support rx time stamps at this time
+	int support = m_n_tsing_flags & (SOF_TIMESTAMPING_SOFTWARE | SOF_TIMESTAMPING_RAW_HARDWARE);
+	if (!support) {
+		return;
+	}
+
+	if (m_n_tsing_flags & SOF_TIMESTAMPING_SOFTWARE) {
+		tsing.systime = packet_timestamps->sw;
+	}
+
+	if (m_n_tsing_flags & SOF_TIMESTAMPING_RAW_HARDWARE) {
+		tsing.hwtimeraw = packet_timestamps->hw;
+	}
+
+	insert_cmsg(cm_state, SOL_SOCKET, SO_TIMESTAMPING, &tsing, sizeof(tsing));
+}
+
+void sockinfo::insert_cmsg(struct cmsg_state * cm_state, int level, int type, void *data, int len)
+{
+	if (!cm_state->cmhdr ||
+	    cm_state->mhdr->msg_flags & MSG_CTRUNC)
+		return;
+
+	// Ensure there is enough space for the data payload
+	const unsigned int cmsg_len = CMSG_LEN(len);
+	if (cmsg_len > cm_state->mhdr->msg_controllen - cm_state->cmsg_bytes_consumed) {
+	    cm_state->mhdr->msg_flags |= MSG_CTRUNC;
+		return;
+	}
+
+	// Fill in the cmsghdr
+	cm_state->cmhdr->cmsg_level = level;
+	cm_state->cmhdr->cmsg_type = type;
+	cm_state->cmhdr->cmsg_len = cmsg_len;
+	memcpy(CMSG_DATA(cm_state->cmhdr), data, len);
+
+	// Update bytes consumed to update msg_controllen later
+	cm_state->cmsg_bytes_consumed += CMSG_SPACE(len);
+
+	// Advance to next cmsghdr
+	// can't simply use CMSG_NXTHDR() due to glibc bug 13500
+	struct cmsghdr *next = (struct cmsghdr*)((char*)cm_state->cmhdr +
+						 CMSG_ALIGN(cm_state->cmhdr->cmsg_len));
+	if ((char*)(next + 1) >
+	    ((char*)cm_state->mhdr->msg_control + cm_state->mhdr->msg_controllen))
+		cm_state->cmhdr = NULL;
+	else
+		cm_state->cmhdr = next;
+}
+
+void sockinfo::handle_cmsg(struct msghdr * msg)
+{
+	struct cmsg_state cm_state;
+
+	cm_state.mhdr = msg;
+	cm_state.cmhdr = CMSG_FIRSTHDR(msg);
+	cm_state.cmsg_bytes_consumed = 0;
+
+	if (m_b_pktinfo) handle_ip_pktinfo(&cm_state);
+	if (m_b_rcvtstamp || m_n_tsing_flags) handle_recv_timestamping(&cm_state);
+
+	cm_state.mhdr->msg_controllen = cm_state.cmsg_bytes_consumed;
 }

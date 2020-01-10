@@ -35,11 +35,9 @@
 #define BUFFER_POOL_H
 
 #include "utils/lock_wrapper.h"
-#include "vma/util/verbs_extra.h"
 #include "vma/util/vma_stats.h"
 #include "vma/proto/mem_buf_desc.h"
-#include "dev/allocator.h"
-
+#include "vma/dev/allocator.h"
 
 inline static void free_lwip_pbuf(struct pbuf_custom *pbuf_custom)
 {
@@ -56,7 +54,7 @@ public:
 	buffer_pool(size_t buffer_count, size_t size, pbuf_free_custom_fn custom_free_function);
 	~buffer_pool();
 
-	void register_memory();
+	void register_memory(ib_ctx_handler *p_ib_ctx_h);
 	void print_val_tbl();
 
 	uint32_t	find_lkey_by_ib_ctx_thread_safe(ib_ctx_handler* p_ib_ctx_h);
@@ -69,7 +67,7 @@ public:
 	 * @param lkey The registered memory lkey.
 	 * @return False if no buffers are available, else True.
 	 */
-	bool get_buffers_thread_safe(descq_t &pDeque, mem_buf_desc_owner* desc_owner, size_t count, uint32_t lkey);
+	bool get_buffers_thread_safe(descq_t &pDeque, ring_slave* desc_owner, size_t count, uint32_t lkey);
 
 	/**
 	 * Return buffers to the pool.

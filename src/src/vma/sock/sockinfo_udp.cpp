@@ -43,7 +43,6 @@
 
 #include "utils/bullseye.h"
 #include "utils/rdtsc.h"
-#include "vma/util/verbs_extra.h"
 #include "vma/util/libvma.h"
 #include "vma/sock/sock-redirect.h"
 #include "vma/sock/fd_collection.h"
@@ -63,35 +62,6 @@
 #include "vma/iomux/io_mux_call.h"
 #include "vma/util/instrumentation.h"
 #include "vma/dev/ib_ctx_handler_collection.h"
-
-#if DEFINED_MISSING_NET_TSTAMP
-enum {
-	SOF_TIMESTAMPING_TX_HARDWARE = (1<<0),
-	SOF_TIMESTAMPING_TX_SOFTWARE = (1<<1),
-	SOF_TIMESTAMPING_RX_HARDWARE = (1<<2),
-	SOF_TIMESTAMPING_RX_SOFTWARE = (1<<3),
-	SOF_TIMESTAMPING_SOFTWARE = (1<<4),
-	SOF_TIMESTAMPING_SYS_HARDWARE = (1<<5),
-	SOF_TIMESTAMPING_RAW_HARDWARE = (1<<6),
-	SOF_TIMESTAMPING_MASK =
-			(SOF_TIMESTAMPING_RAW_HARDWARE - 1) |
-			SOF_TIMESTAMPING_RAW_HARDWARE
-};
-#else
-#include <linux/net_tstamp.h>
-#endif
-
-#ifndef SO_TIMESTAMPNS
-#define SO_TIMESTAMPNS		35
-#endif
-
-#ifndef SO_TIMESTAMPING
-#define SO_TIMESTAMPING		37
-#endif
-
-#ifndef SO_REUSEPORT
-#define SO_REUSEPORT		15
-#endif
 
 /* useful debugging macros */
 
@@ -339,25 +309,6 @@ inline int sockinfo_udp::rx_wait(bool blocking)
 	return -1;
 }
 
-const char * setsockopt_so_opt_to_str(int opt)
-{
-	switch (opt) {
-	case SO_REUSEADDR: 		return "SO_REUSEADDR";
-	case SO_REUSEPORT: 		return "SO_REUSEPORT";
-	case SO_BROADCAST:	 	return "SO_BROADCAST";
-	case SO_RCVBUF:			return "SO_RCVBUF";
-	case SO_SNDBUF:			return "SO_SNDBUF";
-	case SO_TIMESTAMP:		return "SO_TIMESTAMP";
-	case SO_TIMESTAMPNS:		return "SO_TIMESTAMPNS";
-	case SO_BINDTODEVICE:		return "SO_BINDTODEVICE";
-	case SO_VMA_RING_ALLOC_LOGIC:	return "SO_VMA_RING_ALLOC_LOGIC";
-	case SO_MAX_PACING_RATE:	return "SO_MAX_PACING_RATE";
-	default:			break;
-	}
-	return "UNKNOWN SO opt";
-}
-
-
 const char * setsockopt_ip_opt_to_str(int opt)
 {
 	switch (opt) {
@@ -372,8 +323,6 @@ const char * setsockopt_ip_opt_to_str(int opt)
 	}
 	return "UNKNOWN IP opt";
 }
-
-
 
 // Throttle the amount of ring polling we do (remember last time we check for receive packets)
 tscval_t g_si_tscv_last_poll = 0;
@@ -391,10 +340,6 @@ sockinfo_udp::sockinfo_udp(int fd):
 	,m_port_map_lock("sockinfo_udp::m_ports_map_lock")
 	,m_port_map_index(0)
 	,m_p_last_dst_entry(NULL)
-	,m_b_pktinfo(false)
-	,m_b_rcvtstamp(false)
-	,m_b_rcvtstampns(false)
-	,m_n_tsing_flags(0)
 	,m_tos(0)
 	,m_n_sysvar_rx_poll_yield_loops(safe_mce_sys().rx_poll_yield_loops)
 	,m_n_sysvar_rx_udp_poll_os_ratio(safe_mce_sys().rx_udp_poll_os_ratio)
@@ -618,14 +563,15 @@ int sockinfo_udp::connect(const struct sockaddr *__to, socklen_t __tolen)
 			setPassthrough();
 			return 0;
 		}
-		socket_data data = { m_fd, m_tos, m_pcp};
 		// Create the new dst_entry
 		if (IN_MULTICAST_N(dst_ip)) {
+			socket_data data = { m_fd, m_n_mc_ttl, m_tos, m_pcp };
 			m_p_connected_dst_entry = new dst_entry_udp_mc(dst_ip, dst_port, src_port,
 					m_mc_tx_if ? m_mc_tx_if : m_bound.get_in_addr(),
-							m_b_mc_tx_loop, m_n_mc_ttl, data, m_ring_alloc_log_tx);
+							m_b_mc_tx_loop, data, m_ring_alloc_log_tx);
 		}
 		else {
+			socket_data data = { m_fd, m_n_uc_ttl, m_tos, m_pcp };
 			m_p_connected_dst_entry = new dst_entry_udp(dst_ip, dst_port,
 					src_port, data, m_ring_alloc_log_tx);
 		}
@@ -773,15 +719,17 @@ int sockinfo_udp::setsockopt(int __level, int __optname, __const void *__optval,
 {
 	si_udp_logfunc("level=%d, optname=%d", __level, __optname);
 
+	int ret = 0;
+
 	if (unlikely(m_b_closed) || unlikely(g_b_exit))
 		return orig_os_api.setsockopt(m_fd, __level, __optname, __optval, __optlen);
 
-	if (0 == sockinfo::setsockopt(__level, __optname, __optval, __optlen)) {
-		return 0;
-	}
-
 	auto_unlocker lock_tx(m_lock_snd);
 	auto_unlocker lock_rx(m_lock_rcv);
+
+	if ((ret = sockinfo::setsockopt(__level, __optname, __optval, __optlen)) != SOCKOPT_PASS_TO_OS) {
+		return ret;
+	}
 
 	bool supported = true;
 	switch (__level) {
@@ -796,7 +744,7 @@ int sockinfo_udp::setsockopt(int __level, int __optname, __const void *__optval,
 				break;
 
 			case SO_REUSEPORT:
-				set_reuseaddr(*(bool*)__optval);
+				set_reuseport(*(bool*)__optval);
 				si_udp_logdbg("SOL_SOCKET, %s=%s", setsockopt_so_opt_to_str(__optname), (*(bool*)__optval ? "true" : "false"));
 				break;
 
@@ -828,52 +776,6 @@ int sockinfo_udp::setsockopt(int __level, int __optname, __const void *__optval,
 					else
 						m_loops_timer.set_timeout_msec(-1);
 					si_udp_logdbg("SOL_SOCKET: SO_RCVTIMEO=%d", m_loops_timer.get_timeout_msec());
-				}
-				else {
-					si_udp_logdbg("SOL_SOCKET, %s=\"???\" - NOT HANDLED, optval == NULL", setsockopt_so_opt_to_str(__optname));
-				}
-				break;
-
-			case SO_TIMESTAMP:
-			case SO_TIMESTAMPNS:
-				if (__optval) {
-					m_b_rcvtstamp = *(bool*)__optval;
-					if (__optname == SO_TIMESTAMPNS)
-						m_b_rcvtstampns = m_b_rcvtstamp;
-					si_udp_logdbg("SOL_SOCKET, %s=%s", setsockopt_so_opt_to_str(__optname), (m_b_rcvtstamp ? "true" : "false"));
-				}
-				else {
-					si_udp_logdbg("SOL_SOCKET, %s=\"???\" - NOT HANDLED, optval == NULL", setsockopt_so_opt_to_str(__optname));
-				}
-				break;
-
-			case SO_TIMESTAMPING:
-				if (__optval) {
-					uint8_t val = *(uint8_t*)__optval;
-
-					// SOF_TIMESTAMPING_TX_SOFTWARE and SOF_TIMESTAMPING_TX_HARDWARE is NOT supported.
-					if (val & (SOF_TIMESTAMPING_TX_SOFTWARE | SOF_TIMESTAMPING_TX_HARDWARE)) {
-						errno = EOPNOTSUPP;
-						si_udp_logdbg("SOL_SOCKET, SOF_TIMESTAMPING_TX_SOFTWARE and SOF_TIMESTAMPING_TX_HARDWARE is not supported, errno set to EOPNOTSUPP");
-						return -1;
-					}
-
-					if (val & (SOF_TIMESTAMPING_RAW_HARDWARE | SOF_TIMESTAMPING_RX_HARDWARE)) {
-						if (g_p_ib_ctx_handler_collection->get_ctx_time_conversion_mode() == TS_CONVERSION_MODE_DISABLE){
-							if (safe_mce_sys().hw_ts_conversion_mode ==  TS_CONVERSION_MODE_DISABLE) {
-								errno = EPERM;
-								si_udp_logdbg("SOL_SOCKET, SOF_TIMESTAMPING_RAW_HARDWARE and SOF_TIMESTAMPING_RX_HARDWARE socket options were disabled (VMA_HW_TS_CONVERSION = %d) , errno set to EPERM", TS_CONVERSION_MODE_DISABLE);
-								return -1;
-							} else {
-								errno = ENODEV;
-								si_udp_logdbg("SOL_SOCKET, SOF_TIMESTAMPING_RAW_HARDWARE and SOF_TIMESTAMPING_RX_HARDWARE is not supported by device(s), errno set to ENODEV");
-								return -1;
-							}
-						}
-					}
-
-					m_n_tsing_flags  = val;
-					si_udp_logdbg("SOL_SOCKET, SO_TIMESTAMPING=%u", m_n_tsing_flags);
 				}
 				else {
 					si_udp_logdbg("SOL_SOCKET, %s=\"???\" - NOT HANDLED, optval == NULL", setsockopt_so_opt_to_str(__optname));
@@ -917,14 +819,14 @@ int sockinfo_udp::setsockopt(int __level, int __optname, __const void *__optval,
 						return set_ring_attr(attr);
 					}
 					else {
-						si_udp_logdbg("VMA_MP_RQ, %s=\"???\" - bad length expected %d got %d",
+						si_udp_logdbg("SOL_SOCKET, %s=\"???\" - bad length expected %d got %d",
 							      setsockopt_so_opt_to_str(__optname),
 							      sizeof(vma_ring_alloc_logic_attr), __optlen);
 						break;
 					}
 				}
 				else {
-					si_udp_logdbg("VMA_MP_RQ, %s=\"???\" - NOT HANDLED, optval == NULL", setsockopt_so_opt_to_str(__optname));
+					si_udp_logdbg("SOL_SOCKET, %s=\"???\" - NOT HANDLED, optval == NULL", setsockopt_so_opt_to_str(__optname));
 				}
 				break;
 			case SO_MAX_PACING_RATE:
@@ -980,7 +882,9 @@ int sockinfo_udp::setsockopt(int __level, int __optname, __const void *__optval,
 				}
 				break;
 			case SO_PRIORITY:
-				set_sockopt_prio(__optval, __optlen);
+				if (set_sockopt_prio(__optval, __optlen)) {
+					return -1;
+				}
 			break;
 			default:
 				si_udp_logdbg("SOL_SOCKET, optname=%s (%d)", setsockopt_so_opt_to_str(__optname), __optname);
@@ -1037,13 +941,20 @@ int sockinfo_udp::setsockopt(int __level, int __optname, __const void *__optval,
 			case IP_MULTICAST_TTL:
 				{
 					int n_mc_ttl = -1;
-					if (__optlen == 1)
+					if (__optlen == sizeof(m_n_mc_ttl))
 						n_mc_ttl = *(char*)__optval;
-					else if (__optlen >= 1)
+					else if (__optlen == sizeof(int))
 						n_mc_ttl = *(int*)__optval;
-
-					if (__optval && (n_mc_ttl >= 0 && n_mc_ttl <= 255)) {
+					else {
+						break;
+					}
+					if (n_mc_ttl == -1) {
+						n_mc_ttl = 1;
+					}
+					if (n_mc_ttl >= 0 && n_mc_ttl <= 255) {
 						m_n_mc_ttl = n_mc_ttl;
+						header_ttl_updater du(m_n_mc_ttl, true);
+						update_header_field(&du);
 						si_udp_logdbg("IPPROTO_IP, %s=%d", setsockopt_ip_opt_to_str(__optname), m_n_mc_ttl);
 					}
 					else {
@@ -1186,7 +1097,7 @@ int sockinfo_udp::setsockopt(int __level, int __optname, __const void *__optval,
 					// offloaded, check if need to pend
 					else if (INPORT_ANY == m_bound.get_in_port()) {
 						// Delay attaching to this MC group until we have bound UDP port
-						int ret = orig_os_api.setsockopt(m_fd, __level, __optname, __optval, __optlen);
+						ret = orig_os_api.setsockopt(m_fd, __level, __optname, __optval, __optlen);
 						if (ret) return ret;
 						mc_change_pending_mreq(&mcpram);
 					}
@@ -1197,7 +1108,7 @@ int sockinfo_udp::setsockopt(int __level, int __optname, __const void *__optval,
 					}
 
 					if (goto_os) {
-						int ret = orig_os_api.setsockopt(m_fd, __level, __optname, __optval, __optlen);
+						ret = orig_os_api.setsockopt(m_fd, __level, __optname, __optval, __optlen);
 						if (ret) return ret;
 					}
 
@@ -1214,8 +1125,21 @@ int sockinfo_udp::setsockopt(int __level, int __optname, __const void *__optval,
 				}
 				break;
 			case IP_TOS:
-				if (__optlen <= sizeof(int)) {
-					m_tos =(uint8_t) *(int *)__optval;
+				{
+					int val;
+					if (__optlen == sizeof(int)) {
+						val = *(int *)__optval;
+					} else if (__optlen == sizeof(uint8_t)) {
+						val = *(uint8_t *)__optval;
+					} else {
+						break;
+					}
+					m_tos =(uint8_t)val;
+					header_tos_updater du(m_tos);
+					update_header_field(&du);
+					// lists.openwall.net/netdev/2009/12/21/59
+					int new_prio = ip_tos2prio[IPTOS_TOS(m_tos) >> 1];
+					set_sockopt_prio(&new_prio, sizeof(new_prio));
 				}
 				break;
 			default:
@@ -1231,6 +1155,7 @@ int sockinfo_udp::setsockopt(int __level, int __optname, __const void *__optval,
 	case IPPROTO_UDP:
 		switch (__optname) {
 		case UDP_MAP_ADD:
+		{
 			if (! __optval) {
 				si_udp_loginfo("UDP_MAP_ADD __optval = NULL");
 				break;
@@ -1255,8 +1180,9 @@ int sockinfo_udp::setsockopt(int __level, int __optname, __const void *__optval,
 			}
 			m_port_map_lock.unlock();
 			return 0;
-
+		}
 		case UDP_MAP_REMOVE:
+		{
 			if (! __optval) {
 				si_udp_loginfo("UDP_MAP_REMOVE __optval = NULL");
 				break;
@@ -1275,6 +1201,11 @@ int sockinfo_udp::setsockopt(int __level, int __optname, __const void *__optval,
 			}
 			m_port_map_lock.unlock();
 			return 0;
+		}
+		default:
+			si_udp_logdbg("IPPROTO_UDP, optname=%s (%d)", setsockopt_ip_opt_to_str(__optname), __optname);
+			supported = false;
+			break;
 		} // case IPPROTO_UDP
 		break;
 
@@ -1533,53 +1464,6 @@ out:
 	return ret;
 }
 
-void sockinfo_udp::handle_recv_timestamping(struct cmsg_state *cm_state)
-{
-	struct {
-		struct timespec systime;
-		struct timespec hwtimetrans;
-		struct timespec hwtimeraw;
-	} tsing;
-
-	memset(&tsing, 0, sizeof(tsing));
-
-	mem_buf_desc_t* packet = m_rx_pkt_ready_list.front();
-	if (unlikely(!packet)) {
-		si_udp_logdbg("m_rx_pkt_ready_list empty");
-		return ;
-	}
-
-	struct timespec* packet_systime = &packet->rx.udp.sw_timestamp;
-
-	// Only fill in SO_TIMESTAMPNS if both requested.
-	// This matches the kernel behavior.
-	if (m_b_rcvtstampns) {
-		insert_cmsg(cm_state, SOL_SOCKET, SO_TIMESTAMPNS, packet_systime, sizeof(*packet_systime));
-	} else if (m_b_rcvtstamp) {
-		struct timeval tv;
-		tv.tv_sec = packet_systime->tv_sec;
-		tv.tv_usec = packet_systime->tv_nsec/1000;
-		insert_cmsg(cm_state, SOL_SOCKET, SO_TIMESTAMP, &tv, sizeof(tv));
-	}
-
-	// Handle timestamping options
-	// Only support rx time stamps at this time
-	int support = m_n_tsing_flags & (SOF_TIMESTAMPING_SOFTWARE | SOF_TIMESTAMPING_RAW_HARDWARE);
-	if (!support) {
-		return;
-	}
-
-	if (m_n_tsing_flags & SOF_TIMESTAMPING_SOFTWARE) {
-		tsing.systime = packet->rx.udp.sw_timestamp;
-	}
-
-	if (m_n_tsing_flags & SOF_TIMESTAMPING_RAW_HARDWARE) {
-		tsing.hwtimeraw = packet->rx.udp.hw_timestamp;
-	}
-
-	insert_cmsg(cm_state, SOL_SOCKET, SO_TIMESTAMPING, &tsing, sizeof(tsing));
-}
-
 void sockinfo_udp::handle_ip_pktinfo(struct cmsg_state * cm_state)
 {
 	struct in_pktinfo in_pktinfo;
@@ -1594,53 +1478,6 @@ void sockinfo_udp::handle_ip_pktinfo(struct cmsg_state * cm_state)
 	in_pktinfo.ipi_addr = p_desc->rx.dst.sin_addr;
 	in_pktinfo.ipi_spec_dst.s_addr = p_desc->rx.udp.local_if;
 	insert_cmsg(cm_state, IPPROTO_IP, IP_PKTINFO, &in_pktinfo, sizeof(struct in_pktinfo));
-}
-
-void sockinfo_udp::insert_cmsg(struct cmsg_state * cm_state, int level, int type, void *data, int len)
-{
-	if (!cm_state->cmhdr ||
-	    cm_state->mhdr->msg_flags & MSG_CTRUNC)
-		return;
-
-	// Ensure there is enough space for the data payload
-	const unsigned int cmsg_len = CMSG_LEN(len);
-	if (cmsg_len > cm_state->mhdr->msg_controllen - cm_state->cmsg_bytes_consumed) {
-	    cm_state->mhdr->msg_flags |= MSG_CTRUNC;
-		return;
-	}
-
-	// Fill in the cmsghdr
-	cm_state->cmhdr->cmsg_level = level;
-	cm_state->cmhdr->cmsg_type = type;
-	cm_state->cmhdr->cmsg_len = cmsg_len;
-	memcpy(CMSG_DATA(cm_state->cmhdr), data, len);
-
-	// Update bytes consumed to update msg_controllen later
-	cm_state->cmsg_bytes_consumed += CMSG_SPACE(len);
-
-	// Advance to next cmsghdr
-	// can't simply use CMSG_NXTHDR() due to glibc bug 13500
-	struct cmsghdr *next = (struct cmsghdr*)((char*)cm_state->cmhdr +
-						 CMSG_ALIGN(cm_state->cmhdr->cmsg_len));
-	if ((char*)(next + 1) >
-	    ((char*)cm_state->mhdr->msg_control + cm_state->mhdr->msg_controllen))
-		cm_state->cmhdr = NULL;
-	else
-		cm_state->cmhdr = next;
-}
-
-void sockinfo_udp::handle_cmsg(struct msghdr * msg)
-{
-	struct cmsg_state cm_state;
-
-	cm_state.mhdr = msg;
-	cm_state.cmhdr = CMSG_FIRSTHDR(msg);
-	cm_state.cmsg_bytes_consumed = 0;
-
-	if (m_b_pktinfo) handle_ip_pktinfo(&cm_state);
-	if (m_b_rcvtstamp || m_n_tsing_flags) handle_recv_timestamping(&cm_state);
-
-	cm_state.mhdr->msg_controllen = cm_state.cmsg_bytes_consumed;
 }
 
 // This function is relevant only for non-blocking socket
@@ -1833,20 +1670,20 @@ ssize_t sockinfo_udp::tx(const tx_call_t call_type, const iovec* p_iov, const ss
 					}
 				}
 				in_port_t src_port = m_bound.get_in_port();
-				socket_data data = { m_fd, m_tos, m_pcp};
 				// Create the new dst_entry
 				if (dst.is_mc()) {
+					socket_data data = { m_fd, m_n_mc_ttl, m_tos, m_pcp };
 					p_dst_entry = new dst_entry_udp_mc(
 							dst.get_in_addr(),
 							dst.get_in_port(),
 							src_port,
 							m_mc_tx_if ? m_mc_tx_if : m_bound.get_in_addr(),
 							m_b_mc_tx_loop,
-							m_n_mc_ttl,
 							data,
 							m_ring_alloc_log_tx);
 				}
 				else {
+					socket_data data = { m_fd, m_n_uc_ttl, m_tos, m_pcp };
 					p_dst_entry = new dst_entry_udp(
 							dst.get_in_addr(),
 							dst.get_in_port(),
@@ -2071,28 +1908,6 @@ inline bool sockinfo_udp::inspect_mc_packet(mem_buf_desc_t* p_desc)
 }
 
 /**
- * Function to process SW & HW timestamps
- */
-inline void sockinfo_udp::process_timestamps(mem_buf_desc_t* p_desc)
-{
-	// keep the sw_timestamp the same to all sockets
-	if ((m_b_rcvtstamp ||
-		 (m_n_tsing_flags &
-		  (SOF_TIMESTAMPING_RX_SOFTWARE | SOF_TIMESTAMPING_SOFTWARE))) &&
-		!p_desc->rx.udp.sw_timestamp.tv_sec) {
-		clock_gettime(CLOCK_REALTIME, &(p_desc->rx.udp.sw_timestamp));
-	}
-
-	// convert hw timestamp to system time
-	if (m_n_tsing_flags & SOF_TIMESTAMPING_RAW_HARDWARE) {
-		ring_simple* owner_ring = (ring_simple*) p_desc->p_desc_owner;
-		if (owner_ring) {
-			owner_ring->convert_hw_time_to_system_time(p_desc->rx.hw_raw_timestamp, &p_desc->rx.udp.hw_timestamp);
-		}
-	}
-}
-
-/**
  *	Performs inspection by registered user callback
  *
  */
@@ -2108,10 +1923,10 @@ inline vma_recv_callback_retval_t sockinfo_udp::inspect_by_user_cb(mem_buf_desc_
 	pkt_info.socket_ready_queue_byte_count = m_p_socket_stats->n_rx_ready_byte_count;
 
 	if (m_n_tsing_flags & SOF_TIMESTAMPING_RAW_HARDWARE) {
-		pkt_info.hw_timestamp = p_desc->rx.udp.hw_timestamp;
+		pkt_info.hw_timestamp = p_desc->rx.timestamps.hw;
 	}
-	if (p_desc->rx.udp.sw_timestamp.tv_sec) {
-		pkt_info.sw_timestamp = p_desc->rx.udp.sw_timestamp;
+	if (p_desc->rx.timestamps.sw.tv_sec) {
+		pkt_info.sw_timestamp = p_desc->rx.timestamps.sw;
 	}
 
 	// fill io vector array with data buffer pointers
@@ -2148,7 +1963,7 @@ inline void sockinfo_udp::fill_completion(mem_buf_desc_t* p_desc)
 	completion->src = p_desc->rx.src;
 
 	if (m_n_tsing_flags & SOF_TIMESTAMPING_RAW_HARDWARE) {
-		completion->packet.hw_timestamp = p_desc->rx.udp.hw_timestamp;
+		completion->packet.hw_timestamp = p_desc->rx.timestamps.hw;
 	}
 
 	for(mem_buf_desc_t *tmp_p=p_desc; tmp_p; tmp_p=tmp_p->p_next_desc) {
@@ -2674,7 +2489,7 @@ int sockinfo_udp::free_packets(struct vma_packet_t *pkts, size_t count)
 	m_lock_rcv.lock();
 	for(index=0; index < count; index++){
 		buff = (mem_buf_desc_t*)pkts[index].packet_id;
-		if (m_rx_ring_map.find(((ring*)buff->p_desc_owner)->get_parent()) == m_rx_ring_map.end()) {
+		if (m_rx_ring_map.find(buff->p_desc_owner->get_parent()) == m_rx_ring_map.end()) {
 			errno = ENOENT;
 			ret = -1;
 			break;
@@ -2695,6 +2510,15 @@ mem_buf_desc_t* sockinfo_udp::get_next_desc_peek(mem_buf_desc_t *p_desc, int& rx
 {
 	NOT_IN_USE(rx_pkt_ready_list_idx);
 	return p_desc->p_next_desc;
+}
+
+timestamps_t* sockinfo_udp::get_socket_timestamps()
+{
+	if (unlikely(m_rx_pkt_ready_list.empty())) {
+		si_udp_logdbg("m_rx_pkt_ready_list empty");
+		return NULL;
+	}
+	return &m_rx_pkt_ready_list.front()->rx.timestamps;
 }
 
 void sockinfo_udp::post_deqeue(bool release_buff)
@@ -2808,4 +2632,16 @@ bool sockinfo_udp::prepare_to_close(bool process_shutdown) {
 	m_lock_rcv.unlock();
 	NOT_IN_USE(process_shutdown);
 	return is_closable();
+}
+
+void sockinfo_udp::update_header_field(data_updater *updater)
+{
+	dst_entry_map_t::iterator dst_entry_iter = m_dst_entry_map.begin();
+	for (; dst_entry_iter != m_dst_entry_map.end(); dst_entry_iter++) {
+		updater->update_field(*dst_entry_iter->second);
+
+	}
+	if (m_p_connected_dst_entry) {
+		updater->update_field(*m_p_connected_dst_entry);
+	}
 }

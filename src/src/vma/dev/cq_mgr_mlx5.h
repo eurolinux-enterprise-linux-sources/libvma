@@ -37,7 +37,7 @@
 #include "cq_mgr.h"
 #include "qp_mgr_eth_mlx5.h"
 
-#ifdef HAVE_INFINIBAND_MLX5_HW_H
+#if defined(DEFINED_DIRECT_VERBS)
 class qp_mgr_eth_mlx5;
 
 /* Get CQE opcode. */
@@ -70,31 +70,34 @@ public:
 	void                        set_qp_rq(qp_mgr* qp);
 	virtual void                add_qp_tx(qp_mgr* qp);
 	virtual uint32_t            clean_cq();
-	virtual int                 request_notification(uint64_t poll_sn);
-	virtual int                 wait_for_notification_and_process_element(uint64_t* p_cq_poll_sn, void* pv_fd_ready_array = NULL);
 	virtual bool                fill_cq_hw_descriptors(struct hw_cq_data &data);
 
 protected:
+	qp_mgr_eth_mlx5*            m_qp;
+	vma_ib_mlx5_cq_t            m_mlx5_cq;
 	inline struct mlx5_cqe64*   check_cqe(void);
 
 	uint32_t                    m_cq_size;
-	uint32_t                    m_cq_cons_index;
 	void*                       m_cqes;
 	volatile uint32_t*          m_cq_dbell;
-	struct mlx5_wq*             m_rq;
 	int                         m_cqe_log_sz;
 
 private:
 	mem_buf_desc_t              *m_rx_hot_buffer;
 	uint64_t                    *m_p_rq_wqe_idx_to_wrid;
-	qp_mgr_eth_mlx5*            m_qp; //for tx
-	struct mlx5_cq*             m_mlx5_cq;
 
 	void                        cqe64_to_vma_wc(struct mlx5_cqe64 *cqe, vma_ibv_wc *wc);
 	inline struct mlx5_cqe64*   check_error_completion(struct mlx5_cqe64 *cqe, uint32_t *ci, uint8_t op_own);
-	inline void                 update_consumer_index();
 	inline void                 update_global_sn(uint64_t& cq_poll_sn, uint32_t rettotal);
+
+	virtual int	req_notify_cq() {
+		return vma_ib_mlx5_req_notify_cq(&m_mlx5_cq, 0);
+	};
+
+	virtual void	get_cq_event() {
+		vma_ib_mlx5_get_cq_event(&m_mlx5_cq);
+	};
 };
 
-#endif //HAVE_INFINIBAND_MLX5_HW_H
+#endif /* DEFINED_DIRECT_VERBS */
 #endif //CQ_MGR_MLX5_H

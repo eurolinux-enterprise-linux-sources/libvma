@@ -68,7 +68,6 @@ libvma_la_LIBADD = \
 	libconfig_parser.la
 	
 libvma_la_SOURCES := \
-	dev/ah_cleaner.cpp \
 	dev/allocator.cpp \
 	dev/buffer_pool.cpp \
 	dev/cq_mgr.cpp \
@@ -108,7 +107,11 @@ libvma_la_SOURCES := \
 	event/event_handler_manager.cpp \
 	event/vlogger_timer_handler.cpp \
 	event/netlink_event.cpp \
-	event/route_net_dev_event.cpp\
+	\
+	ib/base/verbs_extra.cpp \
+	ib/mlx5/ib_mlx5.cpp \
+	ib/mlx5/ib_mlx5_hw.cpp \
+	ib/mlx5/ib_mlx5_dv.cpp \
 	\
 	iomux/epfd_info.cpp \
 	iomux/epoll_wait_call.cpp \
@@ -159,15 +162,14 @@ libvma_la_SOURCES := \
 	util/wakeup_pipe.cpp \
 	util/match.cpp \
 	util/utils.cpp \
-	util/verbs_extra.cpp \
 	util/instrumentation.cpp \
 	util/sys_vars.cpp \
 	util/agent.cpp \
+	util/data_updater.cpp \
 	\
 	libvma.c \
 	main.cpp \
 	\
-	dev/ah_cleaner.h \
 	dev/allocator.h \
 	dev/buffer_pool.h \
 	dev/cq_mgr.h \
@@ -210,10 +212,14 @@ libvma_la_SOURCES := \
 	event/event_handler_manager.h \
 	event/event_handler_rdma_cm.h \
 	event/netlink_event.h \
-	event/route_net_dev_event.h \
 	event/timer_handler.h \
 	event/timers_group.h \
 	event/vlogger_timer_handler.h \
+	\
+	ib/base/verbs_extra.h \
+	ib/mlx5/ib_mlx5.h \
+	ib/mlx5/ib_mlx5_hw.h \
+	ib/mlx5/ib_mlx5_dv.h \
 	\
 	infra/sender.h \
 	infra/sender_info_dst.h \
@@ -288,7 +294,6 @@ libvma_la_SOURCES := \
 	util/if.h \
 	util/instrumentation.h \
 	util/libvma.h \
-	util/linked_unordered_map.h \
 	util/list.h \
 	util/sg_array.h \
 	util/sock_addr.h \
@@ -297,7 +302,6 @@ libvma_la_SOURCES := \
 	util/to_str.h \
 	util/utils.h \
 	util/valgrind.h \
-	util/verbs_extra.h \
 	util/vma_list.h \
 	util/vma_stats.h \
 	util/vtypes.h \
@@ -305,11 +309,11 @@ libvma_la_SOURCES := \
 	util/wakeup_pipe.h \
 	util/agent.h \
 	util/agent_def.h \
+	util/data_updater.h \
 	\
 	config_parser.h \
 	main.h \
-	vma_extra.h \
-	hw/mlx5/wqe.h
+	vma_extra.h
 
 libvma_la_DEPENDENCIES = \
 	$(top_builddir)/src/vlogger/libvlogger.la \

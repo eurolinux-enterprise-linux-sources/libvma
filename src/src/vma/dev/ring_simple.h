@@ -35,8 +35,9 @@
 
 #include "ring_slave.h"
 #include <vector>
+
+#include "vma/ib/base/verbs_extra.h"
 #include "vma/dev/gro_mgr.h"
-#include "vma/util/verbs_extra.h"
 #include "vma/util/utils.h"
 #include "vma/vma_extra.h"
 #include "vma/dev/net_device_table_mgr.h"
@@ -62,7 +63,7 @@ struct cq_moderation_info {
 class ring_simple : public ring_slave
 {
 public:
-	ring_simple(int if_index, ring* parent = NULL);
+	ring_simple(int if_index, ring* parent, ring_type_t type);
 	virtual ~ring_simple();
 
 	virtual int		request_notification(cq_type_t cq_type, uint64_t poll_sn);
@@ -77,11 +78,11 @@ public:
 	virtual bool		reclaim_recv_buffers(descq_t *rx_reuse);
 	virtual int		drain_and_proccess();
 	virtual int		wait_for_notification_and_process_element(int cq_channel_fd, uint64_t* p_cq_poll_sn, void* pv_fd_ready_array = NULL);
-	virtual void		mem_buf_desc_completion_with_error_rx(mem_buf_desc_t* p_rx_wc_buf_desc); // Assume locked...
 	// Tx completion handling at the qp_mgr level is just re listing the desc+data buffer in the free lists
-	virtual void		mem_buf_desc_completion_with_error_tx(mem_buf_desc_t* p_tx_wc_buf_desc); // Assume locked...
-	virtual void		mem_buf_desc_return_to_owner_rx(mem_buf_desc_t* p_mem_buf_desc, void* pv_fd_ready_array = NULL);
-	virtual void		mem_buf_desc_return_to_owner_tx(mem_buf_desc_t* p_mem_buf_desc);
+	void			mem_buf_desc_completion_with_error_tx(mem_buf_desc_t* p_tx_wc_buf_desc); // Assume locked...
+	void			mem_buf_desc_completion_with_error_rx(mem_buf_desc_t* p_rx_wc_buf_desc); // Assume locked...
+	void			mem_buf_desc_return_to_owner_tx(mem_buf_desc_t* p_mem_buf_desc);
+	void			mem_buf_desc_return_to_owner_rx(mem_buf_desc_t* p_mem_buf_desc, void* pv_fd_ready_array = NULL);
 	virtual int		get_max_tx_inline();
 	inline int		send_buffer(vma_ibv_send_wr* p_send_wqe, vma_wr_tx_packet_attr attr);
 	virtual bool		attach_flow(flow_tuple& flow_spec_5t, pkt_rcvr_sink* sink);
@@ -132,7 +133,6 @@ protected:
 	lock_spin_recursive	m_lock_ring_rx;
 	cq_mgr*			m_p_cq_mgr_tx;
 	lock_spin_recursive	m_lock_ring_tx;
-	bool			m_b_is_hypervisor;
 private:
 	inline void		send_status_handler(int ret, vma_ibv_send_wr* p_send_wqe);
 	inline mem_buf_desc_t*	get_tx_buffers(uint32_t n_num_mem_bufs);
@@ -181,8 +181,8 @@ class ring_eth : public ring_simple
 {
 public:
 	ring_eth(int if_index,
-			ring* parent = NULL, bool call_create_res = true):
-		ring_simple(if_index, parent) {
+			ring* parent = NULL, ring_type_t type = RING_ETH, bool call_create_res = true):
+		ring_simple(if_index, parent, type) {
 		net_device_val_eth* p_ndev =
 				dynamic_cast<net_device_val_eth *>(g_p_net_device_table_mgr->get_net_device_val(m_parent->get_if_index()));
 		if (p_ndev) {
@@ -208,7 +208,7 @@ class ring_ib : public ring_simple
 public:
 	ring_ib(int if_index,
 			ring* parent = NULL):
-		ring_simple(if_index, parent) {
+		ring_simple(if_index, parent, RING_IB) {
 		net_device_val_ib* p_ndev =
 				dynamic_cast<net_device_val_ib *>(g_p_net_device_table_mgr->get_net_device_val(m_parent->get_if_index()));
 		if (p_ndev) {

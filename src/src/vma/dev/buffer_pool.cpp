@@ -39,7 +39,6 @@
 #include "utils/bullseye.h"
 #include "vlogger/vlogger.h"
 #include "vma/util/sys_vars.h"
-#include "vma/util/verbs_extra.h"
 #include "vma/proto/mem_buf_desc.h"
 #include "ib_ctx_handler_collection.h"
 
@@ -138,9 +137,9 @@ void buffer_pool::free_bpool_resources()
 	__log_info_func("done");
 }
 
-void buffer_pool::register_memory()
+void buffer_pool::register_memory(ib_ctx_handler *p_ib_ctx_h)
 {
-	m_allocator.register_memory(m_size, NULL, VMA_IBV_ACCESS_LOCAL_WRITE);
+	m_allocator.register_memory(m_size, p_ib_ctx_h, VMA_IBV_ACCESS_LOCAL_WRITE);
 }
 
 void buffer_pool::print_val_tbl()
@@ -148,7 +147,7 @@ void buffer_pool::print_val_tbl()
 	__log_info_dbg("pool 0x%X size: %ld buffers: %lu", this, m_size, m_n_buffers);
 }
 
-bool buffer_pool::get_buffers_thread_safe(descq_t &pDeque, mem_buf_desc_owner* desc_owner, size_t count, uint32_t lkey)
+bool buffer_pool::get_buffers_thread_safe(descq_t &pDeque, ring_slave* desc_owner, size_t count, uint32_t lkey)
 {
 	auto_unlocker lock(m_lock_spin);
 

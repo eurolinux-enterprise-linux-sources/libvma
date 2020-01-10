@@ -173,6 +173,12 @@ again:
 			rc = proc_msg_exit(msg_hdr, len);
 			break;
 		case VMA_MSG_FLOW:
+			/* Note: special loopback logic, it
+			 * should be added first as far as observed issue with delay
+			 * in activation loopback filters in case two processes
+			 * communicate locally w/o SRIOV
+			 */
+			proc_msg_flow(msg_hdr, len, NULL);
 			rc = proc_msg_flow(msg_hdr, len, &peeraddr);
 			break;
 		default:
@@ -197,6 +203,7 @@ static int proc_msg_init(struct vma_hdr *msg_hdr, size_t size, struct sockaddr_u
 {
 	struct vma_msg_init *data;
 	struct store_pid *value;
+	size_t err = 0;
 
 	assert(msg_hdr);
 	assert(msg_hdr->code == VMA_MSG_INIT);
@@ -211,7 +218,8 @@ static int proc_msg_init(struct vma_hdr *msg_hdr, size_t size, struct sockaddr_u
 	if (data->hdr.ver > VMA_AGENT_VER) {
 		log_error("Protocol message mismatch (VMA_AGENT_VER = %d) errno %d (%s)\n",
 				VMA_AGENT_VER, errno, strerror(errno));
-		return -EBADMSG;
+		err = -EBADMSG;
+		goto send_response;
 	}
 
 	/* Allocate memory for this value in this place
@@ -246,6 +254,7 @@ static int proc_msg_init(struct vma_hdr *msg_hdr, size_t size, struct sockaddr_u
 
 	log_debug("[%d] put into the storage\n", data->hdr.pid);
 
+send_response:
 	data->hdr.code |= VMA_MSG_ACK;
 	data->hdr.ver = VMA_AGENT_VER;
 	if (0 > sys_sendto(daemon_cfg.sock_fd, data, sizeof(*data), 0,
@@ -254,7 +263,7 @@ static int proc_msg_init(struct vma_hdr *msg_hdr, size_t size, struct sockaddr_u
 				strerror(errno));
 	}
 
-	return (sizeof(*data));
+	return err ? err : (sizeof(*data));
 }
 
 static int proc_msg_exit(struct vma_hdr *msg_hdr, size_t size)
@@ -373,9 +382,10 @@ static int proc_msg_flow(struct vma_hdr *msg_hdr, size_t size, struct sockaddr_u
 	struct store_flow *cur_flow = NULL;
 	struct list_head *cur_entry = NULL;
 	int value_new = 0;
+	int ack = 0;
 
 	assert(msg_hdr);
-	assert(msg_hdr->code == VMA_MSG_FLOW);
+	assert((msg_hdr->code & ~VMA_MSG_ACK) == VMA_MSG_FLOW);
 	assert(size);
 
 	data = (struct vma_msg_flow *)msg_hdr;
@@ -383,6 +393,14 @@ static int proc_msg_flow(struct vma_hdr *msg_hdr, size_t size, struct sockaddr_u
 		rc = -EBADMSG;
 		goto err;
 	}
+
+	/* Note: special loopback logic */
+	if (NULL == peeraddr &&
+			data->type == VMA_MSG_FLOW_EGRESS) {
+		return 0;
+	}
+
+	ack = (1 == data->hdr.status);
 
 	pid_value = hash_get(daemon_cfg.ht, data->hdr.pid);
 	if (NULL == pid_value) {
@@ -410,6 +428,7 @@ static int proc_msg_flow(struct vma_hdr *msg_hdr, size_t size, struct sockaddr_u
 	value->flow.dst_port = data->flow.dst_port;
 
 	switch (data->type) {
+	case VMA_MSG_FLOW_EGRESS:
 	case VMA_MSG_FLOW_TCP_3T:
 	case VMA_MSG_FLOW_UDP_3T:
 		break;
@@ -422,6 +441,24 @@ static int proc_msg_flow(struct vma_hdr *msg_hdr, size_t size, struct sockaddr_u
 		log_error("Received unknown message errno %d (%s)\n", errno,
 				strerror(errno));
 		rc = -EPROTO;
+		goto err;
+	}
+
+	/* Note:
+	 * - special loopback logic when peeraddr is null
+	 * - avoid useless rules creation in case expected 5t traffic is local
+	 */
+	if (NULL == peeraddr) {
+		value->if_id = sys_lo_ifindex();
+		ack = 0;
+		if (value->if_id <= 0) {
+			rc = -EFAULT;
+			goto err;
+		}
+	} else if ((VMA_MSG_FLOW_TCP_5T == data->type ||
+			VMA_MSG_FLOW_UDP_5T == data->type) &&
+			sys_iplocal(value->flow.t5.src_ip)) {
+		rc = 0;
 		goto err;
 	}
 
@@ -466,7 +503,7 @@ static int proc_msg_flow(struct vma_hdr *msg_hdr, size_t size, struct sockaddr_u
 	}
 
 err:
-	if (1 == data->hdr.status) {
+	if (ack) {
 		data->hdr.code |= VMA_MSG_ACK;
 		data->hdr.status = (rc ? 1 : 0);
 		if (0 > sys_sendto(daemon_cfg.sock_fd, &data->hdr, sizeof(data->hdr), 0,

@@ -55,14 +55,17 @@ ring_slave::ring_slave(int if_index, ring* parent, ring_type_t type): ring()
 	}
 
 	p_slave = p_ndev->get_slave(get_if_index());
-	if (NULL == p_slave) {
-		ring_logpanic("Invalid if_index = %d", if_index);
-	}
 
 	/* Configure ring_slave() fields */
 	m_type = type;
 	m_transport_type = p_ndev->get_transport_type();
-	m_active = p_slave->active;
+	/* Set the same ring active status as related slave has for all ring types
+	 * excluding ring with type RING_TAP that does not have related slave device.
+	 * So it is marked as active just in case related netvsc device is absent.
+	 */
+	m_active = p_slave ?
+			p_slave->active :
+			p_ndev->get_slave_array().empty();
 
 	// use local copy of stats by default
 	m_p_ring_stat = &m_ring_stat;
@@ -91,7 +94,7 @@ void ring_slave::print_val()
 	ring_logdbg("%d: 0x%X: parent 0x%X type %s",
 			m_if_index, this,
 			((uintptr_t)this == (uintptr_t)m_parent ? 0 : m_parent),
-			(m_type == RING_SIMPLE ? "simple" : "tap"));
+			ring_type_str[m_type]);
 }
 
 void ring_slave::restart()
@@ -99,14 +102,14 @@ void ring_slave::restart()
 	ring_logpanic("Can't restart a slave ring");
 }
 
-bool ring_slave::is_active_member(mem_buf_desc_owner* rng, ring_user_id_t id)
+bool ring_slave::is_active_member(ring_slave* rng, ring_user_id_t id)
 {
 	NOT_IN_USE(id);
 
 	return (this == rng);
 }
 
-bool ring_slave::is_member(mem_buf_desc_owner* rng)
+bool ring_slave::is_member(ring_slave* rng)
 {
 	return (this == rng);
 }

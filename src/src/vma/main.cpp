@@ -49,7 +49,6 @@
 
 #include "vlogger/vlogger.h"
 #include "utils/rdtsc.h"
-#include "vma/util/verbs_extra.h"
 #include "vma/util/vma_stats.h"
 #include "vma/util/utils.h"
 #include "vma/event/event_handler_manager.h"
@@ -318,8 +317,8 @@ void check_flow_steering_log_num_mgm_entry_size()
 		vlog_printf(VLOG_WARNING, "* In order to enable flow steering please restart your VMA applications after running *\n");
 		vlog_printf(VLOG_WARNING, "* the following:                                                                      *\n");
 		vlog_printf(VLOG_WARNING, "* For your information the following steps will restart your network interface        *\n");
-		vlog_printf(VLOG_WARNING, "* 1. \"echo options mlx4_core log_num_mgm_entry_size=-1 > /etc/modprobe.d/mlnx.conf\" *\n");
-		vlog_printf(VLOG_WARNING, "* 2. \"/etc/init.d/openibd restart\"                                                  *\n");
+		vlog_printf(VLOG_WARNING, "* 1. \"echo options mlx4_core log_num_mgm_entry_size=-1 > /etc/modprobe.d/mlnx.conf\"   *\n");
+		vlog_printf(VLOG_WARNING, "* 2. Restart openibd or rdma service depending on your system configuration           *\n");
 		vlog_printf(VLOG_WARNING, "* Read more about the Flow Steering support in the VMA's User Manual                  *\n");
 		vlog_printf(VLOG_WARNING, "***************************************************************************************\n");
 	}

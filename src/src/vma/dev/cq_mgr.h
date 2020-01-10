@@ -34,24 +34,17 @@
 #ifndef CQ_MGR_H
 #define CQ_MGR_H
 
+#include "vma/ib/base/verbs_extra.h"
 #include "utils/atomic.h"
 #include "vma/dev/qp_mgr.h"
 #include "vma/dev/ib_ctx_handler.h"
 #include "vma/util/sys_vars.h"
-#include "vma/util/verbs_extra.h"
 #include "vma/util/hash_map.h"
 #include "vma/util/vma_stats.h"
 #include "vma/proto/mem_buf_desc.h"
 #include "vma/proto/vma_lwip.h"
-
-#if defined(HAVE_INFINIBAND_MLX5_HW_H)
-#include <infiniband/mlx5_hw.h>
-/* Get struct mlx5_cq* from struct ibv_cq* */
-#define _to_mxxx(xxx, type)\
-        ((struct mlx5_##type *)\
-        ((void *) ((uintptr_t)ib##xxx - offsetof(struct mlx5_##type, ibv_##xxx))))
-#endif
 #include "vma/vma_extra.h"
+
 
 #ifdef DEFINED_SOCKETXTREME
 	#define IS_SOCKETXTREME true
@@ -132,7 +125,7 @@ public:
 	 *         ==1 cq not armed (cq poll_sn out of sync)
 	 *         < 0 on error
 	 */
-	virtual int	request_notification(uint64_t poll_sn);
+	int	request_notification(uint64_t poll_sn);
 
 	/**
 	 * Block on the CQ's notification channel for the next event and process
@@ -142,12 +135,12 @@ public:
 	 *         < 0 error or if channel not armed or channel would block
 	 *             (on non-blocked channel) (some other thread beat you to it)
 	 */
-	virtual int	wait_for_notification_and_process_element(uint64_t* p_cq_poll_sn,
+	int	wait_for_notification_and_process_element(uint64_t* p_cq_poll_sn,
 	   	                                          void* pv_fd_ready_array = NULL);
 #ifdef DEFINED_SOCKETXTREME
 	inline volatile struct mlx5_cqe64 *mlx5_get_cqe64(void);
 	inline volatile struct mlx5_cqe64 *mlx5_get_cqe64(volatile struct mlx5_cqe64 **cqe_err);
-	volatile struct mlx5_cqe64 *mlx5_check_error_completion(volatile struct mlx5_cqe64 *cqe, volatile uint16_t *ci, uint8_t op_own);
+	volatile struct mlx5_cqe64 *mlx5_check_error_completion(volatile struct mlx5_cqe64 *cqe, uint32_t *ci, uint8_t op_own);
 	inline void mlx5_cqe64_to_vma_wc(volatile struct mlx5_cqe64 *cqe, vma_ibv_wc *wce);
 	int mlx5_poll_and_process_error_element_rx(volatile struct mlx5_cqe64 *cqe, void* pv_fd_ready_array);
 #endif // DEFINED_SOCKETXTREME
@@ -190,8 +183,6 @@ public:
 
 	//unmaps the qpn and vlan id
 	void 	unmap_vlan_and_qpn(int qp_num, uint16_t vlan_id);
-
-	void 	modify_cq_moderation(uint32_t period, uint32_t count);
 
 	virtual bool fill_cq_hw_descriptors(struct hw_cq_data &data) {NOT_IN_USE(data);return false;};
 
@@ -250,18 +241,18 @@ private:
 #ifdef DEFINED_SOCKETXTREME
 	mem_buf_desc_t* 	m_rx_hot_buff;
 	qp_mgr*			m_qp;
-	struct mlx5_cq* 	m_mlx5_cq;
+	vma_ib_mlx5_cq_t  m_mlx5_cq;
 	int 			m_cq_sz;
-	uint16_t		m_cq_ci;
 	volatile struct		mlx5_cqe64 	(*m_mlx5_cqes)[];
 	volatile uint32_t 	*m_cq_db;
 #endif // DEFINED_SOCKETXTREME
 protected:
 	ib_ctx_handler*		m_p_ib_ctx_handler;
-private:
-	const uint32_t		m_n_sysvar_rx_num_wr_to_post_recv;
 	struct ibv_comp_channel *m_comp_event_channel;
 	bool			m_b_notification_armed;
+private:
+	const uint32_t		m_n_sysvar_rx_num_wr_to_post_recv;
+
 	const uint32_t		m_n_sysvar_qp_compensation_level;
 	const uint32_t		m_rx_lkey;
 	const bool		m_b_sysvar_cq_keep_qp_full;
@@ -295,6 +286,12 @@ private:
 	inline void	find_buff_dest_vma_if_ctx(mem_buf_desc_t * buff);
 
 	void		process_cq_element_log_helper(mem_buf_desc_t* p_mem_buf_desc, vma_ibv_wc* p_wce);
+
+	virtual int	req_notify_cq() {
+		return ibv_req_notify_cq(m_p_ibv_cq, 0);
+	};
+
+	virtual void	get_cq_event() {};
 };
 
 // Helper gunction to extract the Tx cq_mgr from the CQ event,

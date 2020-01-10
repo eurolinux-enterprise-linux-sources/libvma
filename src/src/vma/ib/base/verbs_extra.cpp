@@ -31,12 +31,13 @@
  */
 
 
+#include "vma/ib/base/verbs_extra.h"
+
 #include <errno.h>
 #include <vlogger/vlogger.h>
 
-#include "verbs_extra.h"
 #include "vma_extra.h"
-#include "valgrind.h"
+#include "vma/util/valgrind.h"
 
 #undef  MODULE_NAME
 #define MODULE_NAME 		"verbs_extra:"
@@ -275,7 +276,7 @@ int priv_ibv_query_flow_tag_supported(struct ibv_qp *qp, uint8_t port_num)
 	NOT_IN_USE(port_num);
 	int res = -1;
 
-#ifdef DEFINED_IBV_EXP_FLOW_TAG
+#ifdef DEFINED_IBV_FLOW_TAG
 
 	// Create
 	struct __attribute__ ((packed)) {
@@ -312,7 +313,38 @@ int priv_ibv_query_flow_tag_supported(struct ibv_qp *qp, uint8_t port_num)
 		res = 0;
 		vma_ibv_destroy_flow(ibv_flow);
 	}
-#endif // DEFINED_IBV_EXP_FLOW_TAG
+#endif // DEFINED_IBV_FLOW_TAG
+
+	return res;
+}
+
+int priv_ibv_create_flow_supported(struct ibv_qp *qp, uint8_t port_num)
+{
+	int res = -1;
+
+	struct __attribute__ ((packed)) {
+		vma_ibv_flow_attr             attr;
+		vma_ibv_flow_spec_ipv4        ipv4;
+		vma_ibv_flow_spec_tcp_udp     tcp_udp;
+	} cf_attr;
+
+	// Initialize
+	memset(&cf_attr, 0, sizeof(cf_attr));
+	cf_attr.attr.size = sizeof(cf_attr);
+	cf_attr.attr.num_of_specs = 2;
+	cf_attr.attr.type = VMA_IBV_FLOW_ATTR_NORMAL;
+	cf_attr.attr.priority = 1; // almost highest priority, 0 is used for 5-tuple later
+	cf_attr.attr.port = port_num;
+
+	ibv_flow_spec_ipv4_set(&cf_attr.ipv4, INADDR_LOOPBACK, INADDR_LOOPBACK); // L3 filter
+	ibv_flow_spec_tcp_udp_set(&cf_attr.tcp_udp, true, 0, 0); // L4 filter
+
+	// Create flow
+	vma_ibv_flow *ibv_flow = vma_ibv_create_flow(qp, &cf_attr.attr);
+	if (ibv_flow) {
+		res = 0;
+		vma_ibv_destroy_flow(ibv_flow);
+	}
 
 	return res;
 }
@@ -373,3 +405,25 @@ int priv_ibv_modify_qp_ratelimit(struct ibv_qp *qp, struct vma_rate_limit_t &rat
 	return 0;
 #endif
 }
+
+void priv_ibv_modify_cq_moderation(struct ibv_cq* cq, uint32_t period, uint32_t count)
+{
+#ifdef DEFINED_IBV_CQ_ATTR_MODERATE
+	vma_ibv_cq_attr cq_attr;
+	memset(&cq_attr, 0, sizeof(cq_attr));
+	vma_cq_attr_mask(cq_attr) = VMA_IBV_CQ_MODERATION;
+	vma_cq_attr_moderation(cq_attr).cq_count = count;
+	vma_cq_attr_moderation(cq_attr).cq_period = period;
+
+	vlog_printf(VLOG_FUNC, "modify cq moderation, period=%d, count=%d\n", period, count);
+
+	IF_VERBS_FAILURE_EX(vma_ibv_modify_cq(cq, &cq_attr, VMA_IBV_CQ_MODERATION), EIO) {
+		vlog_printf(VLOG_DEBUG, "Failure modifying cq moderation (errno=%d %m)\n", errno);
+	} ENDIF_VERBS_FAILURE;
+#else
+	NOT_IN_USE(cq);
+	NOT_IN_USE(count);
+	NOT_IN_USE(period);
+#endif
+}
+

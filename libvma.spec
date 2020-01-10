@@ -1,5 +1,5 @@
 Name: libvma
-Version: 8.6.10
+Version: 8.7.5
 Release: 1%{?dist}
 Summary: A library for boosting TCP and UDP traffic (over RDMA hardware)
 
@@ -84,6 +84,10 @@ mv $RPM_BUILD_ROOT%{_sysconfdir}/systemd/system/vma.service $RPM_BUILD_ROOT%{_un
 %{_bindir}/vma_stats
 
 %changelog
+* Wed Jan 23 2019 Jarod Wilson <jarod@redhat.com> - 8.7.5-1
+- Rebase to upstream v8.7.5 release
+- Resolves: rhbz#1641922
+
 * Mon Aug 20 2018 Jarod Wilson <jarod@redhat.com> - 8.6.10-1
 - Rebase to upstream v8.6.10 release
 - Resolves: rhbz#1613018

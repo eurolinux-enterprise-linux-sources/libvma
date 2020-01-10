@@ -242,7 +242,6 @@ extern tcp_state_observer_fn external_tcp_state_observer;
  * members common to struct tcp_pcb and struct tcp_listen_pcb
  */
 #define TCP_PCB_COMMON(type) \
-  type *next; /* for the linked list */ \
   enum tcp_state private_state; /* TCP state - should only be touched thru get/set functions */ \
   u8_t prio; \
   void *callback_arg; \
@@ -410,10 +409,6 @@ struct tcp_pcb {
   tcp_syn_handled_fn syn_handled_cb;
   tcp_clone_conn_fn clone_conn;
 
-#if TCP_LISTEN_BACKLOG
-  u8_t backlog;
-  u8_t accepts_pending;
-#endif /* TCP_LISTEN_BACKLOG */
 #endif /* VMA_NO_TCP_PCB_LISTEN_STRUCT */
 
   /* Delayed ACK control: number of quick acks */
@@ -433,11 +428,6 @@ struct tcp_pcb_listen {
   TCP_PCB_COMMON(struct tcp_pcb_listen);
   tcp_syn_handled_fn syn_handled_cb;
   tcp_clone_conn_fn clone_conn;
-
-#if TCP_LISTEN_BACKLOG
-  u8_t backlog;
-  u8_t accepts_pending;
-#endif /* TCP_LISTEN_BACKLOG */
 };
 #endif /* VMA_NO_TCP_PCB_LISTEN_STRUCT */
 
@@ -460,9 +450,9 @@ err_t lwip_tcp_event(void *arg, struct tcp_pcb *pcb,
 
 #endif /* LWIP_EVENT_API */
 
-/* Application program's interface: */
-struct tcp_pcb * tcp_new     (void);
-/* Application program's interface: */
+#if defined(__GNUC__) && (((__GNUC__ == 4) && (__GNUC_MINOR__ >= 4)) || (__GNUC__ > 4))
+#pragma GCC visibility push(hidden)
+#endif
 
 /*Initialization of tcp_pcb structure*/
 void tcp_pcb_init (struct tcp_pcb* pcb, u8_t prio);
@@ -484,14 +474,8 @@ void             tcp_err     		(struct tcp_pcb *pcb, tcp_err_fn err);
 #define          tcp_nagle_enable(pcb)    ((pcb)->flags &= ~TF_NODELAY)
 #define          tcp_nagle_disabled(pcb)  (((pcb)->flags & TF_NODELAY) != 0)
 
-#if TCP_LISTEN_BACKLOG
-#define          tcp_accepted(pcb) do { \
-  LWIP_ASSERT("get_tcp_state(pcb) == LISTEN (called for wrong pcb?)", get_tcp_state(pcb) == LISTEN); \
-  (((struct tcp_pcb_listen *)(pcb))->accepts_pending--); } while(0)
-#else  /* TCP_LISTEN_BACKLOG */
 #define          tcp_accepted(pcb) LWIP_ASSERT("get_tcp_state(pcb) == LISTEN (called for wrong pcb?)", \
 		get_tcp_state(pcb) == LISTEN)
-#endif /* TCP_LISTEN_BACKLOG */
 
 void             tcp_recved  (struct tcp_pcb *pcb, u32_t len);
 err_t            tcp_bind    (struct tcp_pcb *pcb, ip_addr_t *ipaddr,
@@ -499,8 +483,7 @@ err_t            tcp_bind    (struct tcp_pcb *pcb, ip_addr_t *ipaddr,
 err_t            tcp_connect (struct tcp_pcb *pcb, ip_addr_t *ipaddr,
                               u16_t port, tcp_connected_fn connected);
 
-err_t			tcp_listen_with_backlog(struct tcp_pcb_listen *listen_pcb, struct tcp_pcb *conn_pcb, u8_t backlog);
-#define			tcp_listen(listen_pcb, conn_pcb) tcp_listen_with_backlog(listen_pcb, conn_pcb, TCP_DEFAULT_LISTEN_BACKLOG)
+err_t            tcp_listen(struct tcp_pcb_listen *listen_pcb, struct tcp_pcb *conn_pcb);
 
 void             tcp_abort (struct tcp_pcb *pcb);
 err_t            tcp_close   (struct tcp_pcb *pcb);
@@ -513,8 +496,6 @@ err_t            tcp_shutdown(struct tcp_pcb *pcb, int shut_rx, int shut_tx);
 err_t            tcp_write   (struct tcp_pcb *pcb, const void *dataptr, u32_t len,
                               u8_t is_dummy);
 
-void             tcp_setprio (struct tcp_pcb *pcb, u8_t prio);
-
 #define TCP_PRIO_MIN    1
 #define TCP_PRIO_NORMAL 64
 #define TCP_PRIO_MAX    127
@@ -523,11 +504,12 @@ err_t            tcp_output  (struct tcp_pcb *pcb);
 
 s32_t            tcp_is_wnd_available(struct tcp_pcb *pcb, u32_t data_len);
 
+#if defined(__GNUC__) && (((__GNUC__ == 4) && (__GNUC_MINOR__ >= 4)) || (__GNUC__ > 4))
+#pragma GCC visibility pop
+#endif
+
 #define get_tcp_state(pcb) ((pcb)->private_state)
 #define set_tcp_state(pcb, state) external_tcp_state_observer((pcb)->my_container, (pcb)->private_state = state)
-
-const char* tcp_debug_state_str(enum tcp_state s);
-
 
 #ifdef __cplusplus
 }

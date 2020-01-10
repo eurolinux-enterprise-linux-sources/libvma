@@ -33,10 +33,10 @@
 
 #include <stdlib.h>
 #include <vlogger/vlogger.h>
-#include "vma/util/verbs_extra.h"
 #include "vma/event/event_handler_manager.h"
 #include <vma/util/sys_vars.h>
 #include "time_converter_ib_ctx.h"
+#include "vma/ib/base/verbs_extra.h"
 
 #define MODULE_NAME             "time_converter_ib_ctx"
 
@@ -52,13 +52,10 @@
 
 #define IB_CTX_TC_DEVIATION_THRESHOLD 10
 
-#define IBV_EXP_QUERY_DEVICE_SUPPORTED (1 << 0)
-#define IBV_EXP_QUERY_VALUES_SUPPORTED (1 << 1)
-
 time_converter_ib_ctx::time_converter_ib_ctx(struct ibv_context* ctx, ts_conversion_mode_t ctx_time_converter_mode, uint64_t hca_core_clock) :
-	m_timer_handle(NULL), m_p_ibv_context(ctx), m_ctx_parmeters_id(0)
+	m_p_ibv_context(ctx), m_ctx_parmeters_id(0)
 {
-#ifdef DEFINED_IBV_EXP_CQ_TIMESTAMP
+#ifdef DEFINED_IBV_CQ_TIMESTAMP
 	if (ctx_time_converter_mode != TS_CONVERSION_MODE_DISABLE) {
 		ctx_timestamping_params_t* current_parameters_set = &m_ctx_convert_parmeters[m_ctx_parmeters_id];
 
@@ -84,15 +81,13 @@ time_converter_ib_ctx::time_converter_ib_ctx(struct ibv_context* ctx, ts_convers
 	}
 }
 
-time_converter_ib_ctx::~time_converter_ib_ctx() {
-	if (m_timer_handle) {
-		g_p_event_handler_manager->unregister_timer_event(this, m_timer_handle);
-		m_timer_handle = NULL;
-	}
-}
-
 void time_converter_ib_ctx::handle_timer_expired(void* user_data) {
 	NOT_IN_USE(user_data);
+
+	if (is_cleaned()) {
+		return;
+	}
+
 	fix_hw_clock_deviation();
 }
 
@@ -101,17 +96,18 @@ uint64_t time_converter_ib_ctx::get_hca_core_clock(){
 }
 
 
-#ifdef DEFINED_IBV_EXP_CQ_TIMESTAMP
+#ifdef DEFINED_IBV_CQ_TIMESTAMP
 bool time_converter_ib_ctx::sync_clocks(struct timespec* st, uint64_t* hw_clock){
 	struct timespec st1, st2, diff, st_min = TIMESPEC_INITIALIZER;
-	struct ibv_exp_values queried_values;
+	vma_ts_values queried_values;
 	int64_t interval, best_interval = 0;
 	uint64_t hw_clock_min = 0;
 
 	memset(&queried_values, 0, sizeof(queried_values));
+	queried_values.comp_mask = VMA_IBV_VALUES_MASK_RAW_CLOCK;
 	for (int i = 0 ; i < 10 ; i++) {
 		clock_gettime(CLOCK_REALTIME, &st1);
-		if (ibv_exp_query_values(m_p_ibv_context,IBV_EXP_VALUES_HW_CLOCK, &queried_values) || !queried_values.hwclock) {
+		if (vma_ibv_query_values(m_p_ibv_context, &queried_values) || !vma_get_ts_val(queried_values)) {
 			return false;
 		}
 
@@ -120,7 +116,7 @@ bool time_converter_ib_ctx::sync_clocks(struct timespec* st, uint64_t* hw_clock)
 
 		if (!best_interval || interval < best_interval) {
 			best_interval = interval;
-			hw_clock_min = queried_values.hwclock;
+			hw_clock_min = vma_get_ts_val(queried_values);
 
 			interval /= 2;
 			diff.tv_sec = interval / NSEC_PER_SEC;

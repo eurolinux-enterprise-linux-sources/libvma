@@ -34,7 +34,6 @@
 #include <netinet/tcp.h>
 #include <netinet/udp.h>
 #include <netinet/igmp.h>
-#include <linux/if_tun.h>
 
 #include "utils/bullseye.h"
 #include "vma/util/utils.h"
@@ -179,7 +178,7 @@ void ring_bond::restart()
 				int rc = 0;
 				size_t i, j, k;
 
-				if (slaves.size() == 1) {
+				if (slaves.empty()) {
 					num_ring_rx_fds = p_ring_bond_netvsc->m_vf_ring->get_num_resources();
 					ring_rx_fds_array = p_ring_bond_netvsc->m_vf_ring->get_rx_channel_fds();
 
@@ -216,7 +215,7 @@ void ring_bond::restart()
 					p_ring_tap->set_vf_ring(NULL);
 				} else {
 					for (i = 0; i < slaves.size(); i++) {
-						if (slaves[i]->if_index != p_ndev->get_tap_if_index()) {
+						if (slaves[i]->if_index != p_ring_tap->get_if_index()) {
 							p_ring_tap->m_active = false;
 							slave_create(slaves[i]->if_index);
 							p_ring_tap->set_vf_ring(p_ring_bond_netvsc->m_vf_ring);
@@ -377,7 +376,7 @@ int ring_bond::mem_buf_tx_release(mem_buf_desc_t* p_mem_buf_desc_list, bool b_ac
 
 void ring_bond::mem_buf_desc_return_single_to_owner_tx(mem_buf_desc_t* p_mem_buf_desc)
 {
-	((ring_slave*)p_mem_buf_desc->p_desc_owner)->mem_buf_desc_return_single_to_owner_tx(p_mem_buf_desc);
+	p_mem_buf_desc->p_desc_owner->mem_buf_desc_return_single_to_owner_tx(p_mem_buf_desc);
 }
 
 void ring_bond::send_ring_buffer(ring_user_id_t id, vma_ibv_send_wr* p_send_wqe, vma_wr_tx_packet_attr attr)
@@ -633,7 +632,7 @@ int ring_bond::devide_buffers_helper(mem_buf_desc_t *p_mem_buf_desc_list, mem_bu
 {
 	mem_buf_desc_t* buffers_last[MAX_NUM_RING_RESOURCES];
 	mem_buf_desc_t *head, *current, *temp;
-	mem_buf_desc_owner* last_owner;
+	ring_slave* last_owner;
 	int count = 0;
 	int ret = 0;
 
@@ -675,32 +674,6 @@ int ring_bond::devide_buffers_helper(mem_buf_desc_t *p_mem_buf_desc_list, mem_bu
 	return ret;
 }
 
-/* TODO consider only ring_simple to inherit mem_buf_desc_owner */
-void ring_bond::mem_buf_desc_completion_with_error_rx(mem_buf_desc_t* p_rx_wc_buf_desc)
-{
-	NOT_IN_USE(p_rx_wc_buf_desc);
-	ring_logpanic("programming error, how did we got here?");
-}
-
-void ring_bond::mem_buf_desc_completion_with_error_tx(mem_buf_desc_t* p_tx_wc_buf_desc)
-{
-	NOT_IN_USE(p_tx_wc_buf_desc);
-	ring_logpanic("programming error, how did we got here?");
-}
-
-void ring_bond::mem_buf_desc_return_to_owner_rx(mem_buf_desc_t* p_mem_buf_desc, void* pv_fd_ready_array /*NULL*/)
-{
-	NOT_IN_USE(p_mem_buf_desc);
-	NOT_IN_USE(pv_fd_ready_array);
-	ring_logpanic("programming error, how did we got here?");
-}
-
-void ring_bond::mem_buf_desc_return_to_owner_tx(mem_buf_desc_t* p_mem_buf_desc)
-{
-	NOT_IN_USE(p_mem_buf_desc);
-	ring_logpanic("programming error, how did we got here?");
-}
-
 void ring_bond::popup_active_rings()
 {
 	ring_slave *cur_slave = NULL;
@@ -728,12 +701,12 @@ void ring_bond::update_rx_channel_fds()
 	}
 }
 
-bool ring_bond::is_active_member(mem_buf_desc_owner* rng, ring_user_id_t id)
+bool ring_bond::is_active_member(ring_slave* rng, ring_user_id_t id)
 {
 	return (m_bond_rings[id] == rng && m_bond_rings[id]->m_active);
 }
 
-bool ring_bond::is_member(mem_buf_desc_owner* rng)
+bool ring_bond::is_member(ring_slave* rng)
 {
 	for (uint32_t i = 0; i < m_bond_rings.size(); i++) {
 		if (m_bond_rings[i]->is_member(rng)) {
@@ -876,7 +849,7 @@ void ring_bond_netvsc::slave_create(int if_index)
 		ring_logpanic("Error creating bond ring");
 	}
 
-	if (if_index == p_ndev->get_tap_if_index()) {
+	if (if_index == p_ndev->get_if_idx()) {
 		cur_slave = new ring_tap(if_index, this);
 		m_tap_ring = cur_slave;
 	} else {

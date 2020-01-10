@@ -301,7 +301,9 @@ size_t get_local_ll_addr(const char* ifname, unsigned char* addr, int addr_len, 
 bool get_bond_active_slave_name(IN const char* bond_name, OUT char* active_slave_name, IN int sz);
 bool get_bond_slave_state(IN const char* slave_name, OUT char* curr_state, IN int sz);
 bool get_bond_slaves_name_list(IN const char* bond_name, OUT char* slaves_list, IN int sz);
+bool check_bond_roce_lag_exist(OUT char* bond_roce_lag_path, int sz, IN const char* slave_name);
 bool check_device_exist(const char* ifname, const char *path);
+bool check_device_name_ib_name(const char* ifname, const char* ibname);
 bool check_netvsc_device_exist(const char* ifname);
 bool get_netvsc_slave(IN const char* ifname, OUT char* slave_name, OUT unsigned int &slave_flags);
 bool get_interface_oper_state(IN const char* interface_name, OUT char* slaves_list, IN int sz);
@@ -311,6 +313,8 @@ int validate_ipoib_prop(const char* ifname, unsigned int ifflags,
 		int val_size, char *filename, char* base_ifname);
 
 int validate_raw_qp_privliges();
+
+bool validate_user_has_cap_net_raw_privliges();
 
 static inline int get_procname(int pid, char *proc, size_t size)
 {

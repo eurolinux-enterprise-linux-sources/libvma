@@ -167,15 +167,15 @@ public:
 	virtual void        restart();
 
 	virtual int         get_num_resources() const { return 1; };
-	virtual bool        is_member(mem_buf_desc_owner* rng);
-	virtual bool        is_active_member(mem_buf_desc_owner* rng, ring_user_id_t id);
+	virtual bool        is_member(ring_slave* rng);
+	virtual bool        is_active_member(ring_slave* rng, ring_user_id_t id);
 	virtual ring_user_id_t	generate_id();
 	virtual ring_user_id_t	generate_id(const address_t src_mac, const address_t dst_mac, uint16_t eth_proto, uint16_t encap_proto, uint32_t src_ip, uint32_t dst_ip, uint16_t src_port, uint16_t dst_port);
 	virtual bool        is_up() = 0;
 	virtual void        inc_tx_retransmissions(ring_user_id_t id);
 	virtual bool        rx_process_buffer(mem_buf_desc_t* p_rx_wc_buf_desc, void* pv_fd_ready_array) = 0;
 
-	ring_type_t         get_type() const { return m_type; }
+	inline bool         is_simple() const { return m_type != RING_TAP; }
 	transport_type_t    get_transport_type() const { return m_transport_type; }
 
 

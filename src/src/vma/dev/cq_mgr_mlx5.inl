@@ -36,7 +36,7 @@
 
 #include "dev/cq_mgr_mlx5.h"
 
-#ifdef HAVE_INFINIBAND_MLX5_HW_H
+#if defined(DEFINED_DIRECT_VERBS)
 
 /**/
 /** inlining functions can only help if they are implemented before their usage **/
@@ -44,19 +44,19 @@
 inline struct mlx5_cqe64* cq_mgr_mlx5::check_cqe(void)
 {
 	struct mlx5_cqe64* cqe = (struct mlx5_cqe64 *)(((uint8_t *)m_cqes) +
-			((m_cq_cons_index & (m_cq_size - 1)) << m_cqe_log_sz));
+			((m_mlx5_cq.cq_ci & (m_cq_size - 1)) << m_cqe_log_sz));
 	/*
 	 * CQE ownership is defined by Owner bit in the CQE.
 	 * The value indicating SW ownership is flipped every
 	 *  time CQ wraps around.
 	 * */
 	if (likely((MLX5_CQE_OPCODE(cqe->op_own)) != MLX5_CQE_INVALID) &&
-	    !((MLX5_CQE_OWNER(cqe->op_own)) ^ !!(m_cq_cons_index & m_cq_size))) {
+	    !((MLX5_CQE_OWNER(cqe->op_own)) ^ !!(m_mlx5_cq.cq_ci & m_cq_size))) {
 		return cqe;
 	}
 
 	return NULL;
 }
 
-#endif //HAVE_INFINIBAND_MLX5_HW_H
+#endif /* DEFINED_DIRECT_VERBS */
 #endif//CQ_MGR_MLX5_INL_H

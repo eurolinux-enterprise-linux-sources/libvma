@@ -37,6 +37,7 @@
 #include "vlogger/vlogger.h"
 #include "utils/lock_wrapper.h"
 #include "vma/vma_extra.h"
+#include "vma/util/data_updater.h"
 #include "vma/util/sock_addr.h"
 #include "vma/util/vma_stats.h"
 #include "vma/util/sys_vars.h"
@@ -45,7 +46,7 @@
 #include "vma/proto/mem_buf_desc.h"
 #include "vma/proto/dst_entry.h"
 #include "vma/dev/net_device_table_mgr.h"
-#include "vma/dev/ring.h"
+#include "vma/dev/ring_simple.h"
 #include "vma/dev/ring_allocation_logic.h"
 
 #include "socket_fd_api.h"
@@ -59,6 +60,42 @@
 #define SI_RX_EPFD_EVENT_MAX		16
 #define BYTE_TO_KB(byte_value)		((byte_value) / 125)
 #define KB_TO_BYTE(kbit_value)		((kbit_value) * 125)
+
+#if DEFINED_MISSING_NET_TSTAMP
+enum {
+	SOF_TIMESTAMPING_TX_HARDWARE = (1<<0),
+	SOF_TIMESTAMPING_TX_SOFTWARE = (1<<1),
+	SOF_TIMESTAMPING_RX_HARDWARE = (1<<2),
+	SOF_TIMESTAMPING_RX_SOFTWARE = (1<<3),
+	SOF_TIMESTAMPING_SOFTWARE = (1<<4),
+	SOF_TIMESTAMPING_SYS_HARDWARE = (1<<5),
+	SOF_TIMESTAMPING_RAW_HARDWARE = (1<<6),
+	SOF_TIMESTAMPING_MASK =
+			(SOF_TIMESTAMPING_RAW_HARDWARE - 1) |
+			SOF_TIMESTAMPING_RAW_HARDWARE
+};
+#else
+#include <linux/net_tstamp.h>
+#endif
+
+#ifndef SO_TIMESTAMPNS
+#define SO_TIMESTAMPNS		35
+#endif
+
+#ifndef SO_TIMESTAMPING
+#define SO_TIMESTAMPING		37
+#endif
+
+#ifndef SO_REUSEPORT
+#define SO_REUSEPORT		15
+#endif
+
+struct cmsg_state
+{
+	struct msghdr	*mhdr;
+	struct cmsghdr	*cmhdr;
+	size_t		cmsg_bytes_consumed;
+};
 
 struct buff_info_t {
 		buff_info_t(){
@@ -79,6 +116,12 @@ typedef struct {
 
 typedef std::tr1::unordered_map<in_addr_t, net_device_resources_t> rx_net_device_map_t;
 
+/*
+ * Sockinfo setsockopt() return values
+ */
+#define	SOCKOPT_INTERNAL_VMA_SUPPORT  0    // Internal socket option, should not pass request to OS.
+#define	SOCKOPT_NO_VMA_SUPPORT       -1    // Socket option was found but not supported, error should be returned to user.
+#define	SOCKOPT_PASS_TO_OS            1	   // Should pass to TCP/UDP level or OS.
 
 namespace std { namespace tr1 {
 template<>
@@ -100,6 +143,14 @@ typedef struct {
 } ring_info_t;
 
 typedef std::tr1::unordered_map<ring*, ring_info_t*> rx_ring_map_t;
+
+// see route.c in Linux kernel
+const uint8_t ip_tos2prio[16] = {
+	0, 0, 0, 0,
+	2, 2, 2, 2,
+	6, 6, 6, 6,
+	4, 4, 4, 4
+};
 
 class sockinfo : public socket_fd_api, public pkt_rcvr_sink, public pkt_sndr_source, public wakeup_pipe
 {
@@ -123,11 +174,14 @@ public:
 
 	inline bool tcp_flow_is_5t(void) { return m_tcp_flow_is_5t; }
 	inline void set_tcp_flow_is_5t(void) { m_tcp_flow_is_5t = true; }
-	inline void set_flow_tag(int flow_tag_id) {
-		if ( flow_tag_id && (flow_tag_id != FLOW_TAG_MASK)) {
+	inline bool set_flow_tag(uint32_t flow_tag_id) {
+		if (flow_tag_id && (flow_tag_id != FLOW_TAG_MASK)) {
 			m_flow_tag_id = flow_tag_id;
 			m_flow_tag_enabled = true;
+			return true;
 		}
+		m_flow_tag_id = FLOW_TAG_MASK;
+		return false;
 	}
 	inline bool flow_tag_enabled(void) { return m_flow_tag_enabled; }
 	inline int get_rx_epfd(void) { return m_rx_epfd; }
@@ -136,17 +190,20 @@ public:
 	virtual int* get_rings_fds(int &res_length);
 	virtual int get_rings_num();
 	virtual int get_socket_network_ptr(void *ptr, uint16_t &len);
-
 #ifdef DEFINED_SOCKETXTREME
 	virtual bool check_rings() {return m_p_rx_ring ? true: false;}
 #else
 	virtual bool check_rings() {return true;}
 	virtual void statistics_print(vlog_levels_t log_level = VLOG_DEBUG);
 #endif
-
+	uint32_t get_flow_tag_val() { return m_flow_tag_id; }
 protected:
 	bool			m_b_closed;
 	bool 			m_b_blocking;
+	bool 			m_b_pktinfo;
+	bool 			m_b_rcvtstamp;
+	bool 			m_b_rcvtstampns;
+	uint8_t 		m_n_tsing_flags;
 	in_protocol_t		m_protocol;
 
 	lock_spin_recursive	m_lock_rcv;
@@ -190,7 +247,7 @@ protected:
 	const int32_t				m_n_sysvar_rx_poll_num;
 	ring_alloc_logic_attr			m_ring_alloc_log_rx;
 	ring_alloc_logic_attr			m_ring_alloc_log_tx;
-	uint8_t					m_pcp;
+	uint32_t				m_pcp;
 #ifdef DEFINED_SOCKETXTREME
 	/* Track internal events to return in socketxtreme_poll()
 	 * Current design support single event for socket at a particular time
@@ -207,6 +264,7 @@ protected:
 	void*			m_fd_context; // Context data stored with socket
 	uint32_t		m_flow_tag_id;	// Flow Tag for this socket
 	bool			m_flow_tag_enabled; // for this socket
+	uint8_t			m_n_uc_ttl; // time to live
 	bool			m_tcp_flow_is_5t; // to bypass packet analysis
 
 	int*			m_p_rings_fds;
@@ -230,9 +288,11 @@ protected:
 	void 			save_stats_rx_offload(int nbytes);
 
 	virtual int             rx_verify_available_data() = 0;
+	virtual void            update_header_field(data_updater *updater) = 0;
 	virtual mem_buf_desc_t *get_next_desc (mem_buf_desc_t *p_desc) = 0;
 	virtual	mem_buf_desc_t* get_next_desc_peek(mem_buf_desc_t *p_desc, int& rx_pkt_ready_list_idx) = 0;
-	
+	virtual timestamps_t* get_socket_timestamps() = 0;
+	virtual void          update_socket_timestamps(timestamps_t * ts) = 0;
 	virtual void 	post_deqeue (bool release_buff) = 0;
 	
 	virtual int 	zero_copy_rx (iovec *p_iov, mem_buf_desc_t *pdesc, int *p_flags) = 0;
@@ -263,8 +323,14 @@ protected:
 	void 			destructor_helper();
 	int 			modify_ratelimit(dst_entry* p_dst_entry, struct vma_rate_limit_t &rate_limit);
 
-	void 			move_owned_rx_ready_descs(const mem_buf_desc_owner* p_desc_owner, descq_t* toq); // Move all owner's rx ready packets ro 'toq'
-	void			set_sockopt_prio(__const void *__optval, socklen_t __optlen);
+	void 			move_owned_rx_ready_descs(ring* p_ring, descq_t* toq); // Move all owner's rx ready packets ro 'toq'
+	int			set_sockopt_prio(__const void *__optval, socklen_t __optlen);
+
+	virtual void    handle_ip_pktinfo(struct cmsg_state *cm_state) = 0;
+	inline  void    handle_recv_timestamping(struct cmsg_state *cm_state);
+	void            insert_cmsg(struct cmsg_state *cm_state, int level, int type, void *data, int len);
+	void            handle_cmsg(struct msghdr * msg);
+	void            process_timestamps(mem_buf_desc_t* p_desc);
 
 	virtual bool try_un_offloading(); // un-offload the socket if possible
 #ifdef DEFINED_SOCKETXTREME	
@@ -380,10 +446,11 @@ protected:
 					m_rx_pkt_ready_offset += nbytes;
 					bytes_left -= nbytes;
 					iov_base = (uint8_t*)iov_base + nbytes;
+					if (m_b_rcvtstamp || m_n_tsing_flags) update_socket_timestamps(&pdesc->rx.timestamps);
 					if(bytes_left <= 0) {
 						if (unlikely(is_peek)) {
 							pdesc = get_next_desc_peek(pdesc, rx_pkt_ready_list_idx);
-						}else {
+						} else {
 							pdesc = get_next_desc(pdesc);
 						}
 						m_rx_pkt_ready_offset = 0;
@@ -417,7 +484,7 @@ protected:
     inline void reuse_buffer(mem_buf_desc_t *buff)
     {
     	set_rx_reuse_pending(false);
-    	ring* p_ring = ((ring*)(buff->p_desc_owner))->get_parent();
+    	ring* p_ring = buff->p_desc_owner->get_parent();
     	rx_ring_map_t::iterator iter = m_rx_ring_map.find(p_ring);
     	if(likely(iter != m_rx_ring_map.end())){
             descq_t *rx_reuse = &iter->second->rx_reuse_info.rx_reuse;
@@ -485,7 +552,7 @@ protected:
 	    }
     }
 
-    inline void move_owned_descs(ring* p_desc_owner, descq_t *toq, descq_t *fromq)
+    inline void move_owned_descs(ring* p_ring, descq_t *toq, descq_t *fromq)
     {
     	// Assume locked by owner!!!
 
@@ -494,14 +561,33 @@ protected:
     	for (size_t i = 0 ; i < size; i++) {
     		temp = fromq->front();
     		fromq->pop_front();
-    		if (p_desc_owner->is_member(temp->p_desc_owner))
+    		if (p_ring->is_member(temp->p_desc_owner))
     			toq->push_back(temp);
     		else
     			fromq->push_back(temp);
     	}
     }
 
-    inline void move_not_owned_descs(ring* p_desc_owner, descq_t *toq, descq_t *fromq)
+    static const char * setsockopt_so_opt_to_str(int opt)
+    {
+    	switch (opt) {
+    	case SO_REUSEADDR: 		return "SO_REUSEADDR";
+    	case SO_REUSEPORT: 		return "SO_REUSEPORT";
+    	case SO_BROADCAST:	 	return "SO_BROADCAST";
+    	case SO_RCVBUF:			return "SO_RCVBUF";
+    	case SO_SNDBUF:			return "SO_SNDBUF";
+    	case SO_TIMESTAMP:		return "SO_TIMESTAMP";
+    	case SO_TIMESTAMPNS:		return "SO_TIMESTAMPNS";
+    	case SO_BINDTODEVICE:		return "SO_BINDTODEVICE";
+    	case SO_VMA_RING_ALLOC_LOGIC:	return "SO_VMA_RING_ALLOC_LOGIC";
+    	case SO_MAX_PACING_RATE:	return "SO_MAX_PACING_RATE";
+    	case SO_VMA_FLOW_TAG:           return "SO_VMA_FLOW_TAG";
+    	default:			break;
+    	}
+    	return "UNKNOWN SO opt";
+    }
+
+    inline void move_not_owned_descs(ring* p_ring, descq_t *toq, descq_t *fromq)
     {
     	// Assume locked by owner!!!
 
@@ -510,7 +596,7 @@ protected:
     	for (size_t i = 0 ; i < size; i++) {
     		temp = fromq->front();
     		fromq->pop_front();
-    		if (p_desc_owner->is_member(temp->p_desc_owner))
+    		if (p_ring->is_member(temp->p_desc_owner))
     			fromq->push_back(temp);
     		else
     			toq->push_back(temp);

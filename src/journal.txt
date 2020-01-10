@@ -1,3 +1,135 @@
+Version 8.7.5-0:
+Date + Time 2018-11-15
+=============================================================
+Added:
+        - RM #1571657 Suppress failure error of ibv_get_async_event
+Fixed:
+        - RM #1571899 Fix a typo in bond warning message
+        - RM #1566916 Fix CQ cleanup ordering issue
+
+Version 8.7.4-0:
+Date + Time 2018-11-13
+=============================================================
+Added:
+        - RM #1438405 Parse vlan priority mapping file
+        - RM #1438405 Allow dynamic updating header bits after ring creation
+        - RM #1557652 BF is not supported for upstream on VMs
+        - RM #1557652 Check MLX5_SHUT_UP_BF env
+        - RM #1178933 Print warning while mlx5 RoCE lag is enabled
+        - RM #1540213 Print warning while mlx4 RoCE lag is enabled
+        - RM #1521396 Reduce MP_RQ allocated size when stripping
+        - RM #1563104 Print error while No IB capable devices found
+        - RM #1554637 Modify NetVSC device detection
+        - RM #1072998 Update valgrind suppression file
+        - RM #1523707 Improve plugout processing
+        - RM #1552382 Redirect ioctl SIOCGIFVLAN
+Fixed:
+        - RM #1557668 Fix infinite polling loop during plugout
+        - RM #1564259 Fix IP_TTL socket option inheritance
+        - RM #1557681 Fix timer converter Segmentation fault
+        - RM #1521396 Fix user memory passing to socket
+        - RM #1557786 Protect vma_ib_mlx5_get_cq()
+        - RM #1556067 Add sanity check in clean_cq()
+        - RM #1554167 Fix symbol lookup error for mlx5dv
+        - RM #1523707 Fix deadlock collision for ring_tap
+
+Version 8.7.3-0:
+Date + Time 2018-11-01
+=============================================================
+Added:
+        - RM #1471639 Add TCP Rx Timestamp support
+        - RM #1471639 Move Rx timestamp handling to sockinfo
+        - RM #1541702 Change the visibility of global TCP names
+        - RM #1513181 Increased FID_MAX for daemon
+        - RM #1521601 Allow user to change the flow_id
+        - RM #1542628 Do not use memic on devices w/o blue flame
+        - RM #1512054 Enable direct mlx5 processing on VMs
+        - RM #1540484 Add UDP Rx Hw timestamp support for upstream
+        - RM #1540484 Add ibv_device_attr_ex support
+        - RM #1540483 Add flow tag support for upstream
+        - RM #1536822 Add Daemon version to help output
+        - RM #1521396 Add external memory for MP_RQ ring
+        - RM #1536838 Enable plugin on upstream after reboot
+Fixed:
+        - RM #1521601 Fix user defined flow tag handling
+        - RM #1541163 Fix return value from sockinfo:setsockopt()
+        - RM #1526810 Fix stride calculation when using KLM
+        - RM #1541768 Fix bad operator== in ring_profile
+        - RM #1498311 Fix crash during CQ creation on upstream
+
+Version 8.7.2-0:
+Date + Time 2018-10-18
+=============================================================
+Added:
+        - RM #1537043 Improve qp_mgr_mlx5 class
+        - RM #1537043 Add mlx5 req_notify_cq()
+        - RM #1537043 Enable socketxtreme mode for rdma-core (upstream)
+        - RM #1537043 Support direct verbs
+        - RM #1537043 Detect direct ring support during configure
+        - RM #1537043 Remove MLX5_CQE_SIG_ERR usage
+        - RM #1537043 Introduce access to head and tail of qp.rq
+        - RM #1537043 Introduce vma_ib_mlx5_qp_t
+        - RM #1537043 Introduce vma_ib_mlx5_cq_t
+        - RM #1537043 Use to_mqp() to convert ibv_qp to mlx5_qp
+        - RM #1537043 Introduce ib layer
+        - RM #1537043 Start direct mlx5 support since MOFED 3.4
+        - RM #1537043 Add direct verbs support for upstream OFED
+        - RM #1537043 Cleanup hw/mlx5 folder
+        - RM #1537043 Cleanup MLX5_HW_ETH_WQE_HEADER definition
+        - RM #915305 Add connection with daemon on the fly
+        - RM #807132 Clean unused code from lwip pbuf.c and tcp.c
+        - RM #807132 Remove all LWIP Non TCP related options
+        - RM #807132 Remove LWIP BACKLOG handling which is not in use
+        - RM #807132 Remove LWIP pcbs lists which are not in use
+        - RM #1522890 Update valgrind suppression file
+
+Version 8.7.1-0:
+Date + Time 2018-09-12
+=============================================================
+Added:
+        - RM #1510731 Enhance IPoIB devices validation process
+        - RM #1390052 Add Windows Hypervisor VMs to Jenkins
+        - RM #1441462 Add mlx5 IPoIB support for upstream
+        - RM #1417620 Enable UDP/TCP connection on same VM w/o SRIOV
+        - RM #1507004 General code cleanup
+        - RM #1498330 Update driver restart recommendations
+        - RM #1469556 Add sendfile/sendfile64 support
+        - RM #1491767 Increase SO_RCVTIMEO for agent socket
+        - RM #1471640 Add inbox OFED detection during VMA configuration
+        - RM #1471640 Improve OFED location detection
+        - RM #1498320 Set RDMAV_ALLOW_DISASSOC_DESTROY env for upstream
+        - RM #1489419 Use macro to detect exp arguments in verbs.m4
+        - RM #1480982 Add cq_moderation support for upstream
+Fixed:
+        - RM #1516726 Fix bond traffic not offloaded over IPoIB
+        - RM #1175479 Inherit missing properties from the parent
+        - RM #1087466 Fix VMA_EXCEPTION_HANDLING=2 mode handling
+
+Version 8.7.0-0:
+Date + Time 2018-07-31
+=============================================================
+Added:
+        - RM #1465058 Introduce ring per ip-address logic
+        - RM #1427836 Register memory of single context
+        - RM #1427835 Update update_netvsc_slaves() by parameter
+        - RM #1427833 Update ib_ctx collection table by parameter
+        - RM #1394737 Remove mem_buf_desc_owner
+        - RM #1475467 Remove virtual functions from mem_buf_desc_owner
+        - RM #1384362 Report version mismatch between vmad and agent
+        - RM #1469960 Add iterator shortcut to vma_list_t
+        - RM #1463833 Improve peer notification capability
+        - RM #1388840 Support ring allocation methods for ring tap
+        - RM #1467248 Remove ah_cleaner class
+        - RM #1322101 Add support for IP_TTL socket option
+        - RM #1450325 Enhance vma_stats output to monitor ring_type
+        - RM #1178933 Print warning while RoCE lag is enabled
+        - RM #1449421 Suppress warning in case flow attach is interrupted
+Fixed:
+        - RM #1480511 Fix TCP client hangs while connecting to local ip
+        - RM #1477680 Fix issue with loopback detection
+        - RM #1475443 Fix getsockname/getpeername returned data
+        - RM #1452014 Fix gcc8 stringop-truncation warning
+
 Version 8.6.10-0:
 Date + Time 2018-06-27
 =============================================================

@@ -30,42 +30,15 @@
  * SOFTWARE.
  */
 
+#ifndef SRC_VMA_IB_MLX5_DV_H_
+#define SRC_VMA_IB_MLX5_DV_H_
 
-#ifndef AH_CLEANER_H
-#define AH_CLEANER_H
-
-#include <netinet/in.h>
-#include "vma/proto/mem_buf_desc.h"
-
-class mem_buf_desc_t;
-class ring;
-
-#if _BullseyeCoverage
-    #pragma BullseyeCoverage off
+#ifndef SRC_VMA_IB_MLX5_H_
+#error "Use <vma/ib/mlx5/ib_mlx5.h> instead."
 #endif
 
-class ah_cleaner: public mem_buf_desc_owner
-{
-public:
-	ah_cleaner(struct ibv_ah* ah, ring* p_ring);
+#if defined(DEFINED_DIRECT_VERBS) && (DEFINED_DIRECT_VERBS == 3)
 
-	// Call back function
-	virtual void		mem_buf_desc_completion_with_error_tx(mem_buf_desc_t* p_rx_wc_buf_desc);
-	virtual void		mem_buf_desc_completion_with_error_rx(mem_buf_desc_t*) {} // ah is relevant only in TX flow
-	virtual void		mem_buf_desc_return_to_owner_tx(mem_buf_desc_t* p_mem_buf_desc);
-	virtual void		mem_buf_desc_return_to_owner_rx(mem_buf_desc_t*, void*){} // ah is relevant only in RX flow
-	mem_buf_desc_owner*	m_next_owner;
+#endif /* (DEFINED_DIRECT_VERBS == 3) */
 
-private:
-	void			destroy_ah_n_return_to_owner(mem_buf_desc_t* p_mem_buf_desc);
-	struct ibv_ah*		m_ah;
-	ring*			m_p_ring;
-};
-
-#if _BullseyeCoverage
-    #pragma BullseyeCoverage on
-#endif
-
-#endif
-
-
+#endif /* SRC_VMA_IB_MLX5_DV_H_ */

@@ -49,7 +49,6 @@
 
 #include "vlogger/vlogger.h"
 #include "utils/rdtsc.h"
-#include "vma/util/verbs_extra.h"
 #include "vma/util/vma_stats.h"
 #include "vma/util/utils.h"
 #include "vma/event/event_handler_manager.h"
@@ -990,7 +989,7 @@ void mce_sys_var::get_env_params()
 	if ((env_ptr = getenv(SYS_VAR_SELECT_SKIP_OS)) != NULL)
 		select_skip_os_fd_check = (uint32_t)atoi(env_ptr);
 
-#ifdef DEFINED_IBV_EXP_CQ_MODERATION
+#ifdef DEFINED_IBV_CQ_ATTR_MODERATE
 	if (rx_poll_num < 0 ||  select_poll_num < 0) {
 		cq_moderation_enable = false;
 	}
@@ -1045,7 +1044,7 @@ void mce_sys_var::get_env_params()
 	if ((env_ptr = getenv(SYS_VAR_CQ_AIM_INTERRUPTS_RATE_PER_SEC)) != NULL) {
 		vlog_printf(VLOG_WARNING,"'%s' is not supported on this environment\n", SYS_VAR_CQ_AIM_INTERRUPTS_RATE_PER_SEC);
 	}
-#endif /*DEFINED_IBV_EXP_CQ_MODERATION*/
+#endif /* DEFINED_IBV_CQ_ATTR_MODERATE */
 
 	if ((env_ptr = getenv(SYS_VAR_CQ_POLL_BATCH_MAX)) != NULL)
 		cq_poll_batch_max = (uint32_t)atoi(env_ptr);
@@ -1187,7 +1186,7 @@ void mce_sys_var::get_env_params()
 
 	if ((env_ptr = getenv(SYS_VAR_MEM_ALLOC_TYPE)) != NULL)
 		mem_alloc_type = (alloc_mode_t)atoi(env_ptr);
-	if (mem_alloc_type < 0 || mem_alloc_type >= ALLOC_TYPE_LAST)
+	if (mem_alloc_type < 0 || mem_alloc_type >= ALLOC_TYPE_LAST_ALLOWED_TO_USE)
 		mem_alloc_type = MCE_DEFAULT_MEM_ALLOC_TYPE;
 	if (mce_sys_var::HYPER_MSHV == hypervisor && mem_alloc_type == ALLOC_TYPE_CONTIG) {
 		char mem_str[sizeof(int) + 1] = {0};
@@ -1251,13 +1250,14 @@ void set_env_params()
 	//setenv("MLX4_SINGLE_THREADED", "1", 0);
 
 	/*
-	 * MLX4_DEVICE_FATAL_CLEANUP/MLX5_DEVICE_FATAL_CLEANUP tells
-	 * ibv_destroy functions we want to get success errno value
+	 * MLX4_DEVICE_FATAL_CLEANUP/MLX5_DEVICE_FATAL_CLEANUP/RDMAV_ALLOW_DISASSOC_DESTROY
+	 * tells ibv_destroy functions we want to get success errno value
 	 * in case of calling them when the device was removed.
 	 * It helps to destroy resources in DEVICE_FATAL state
 	 */
 	setenv("MLX4_DEVICE_FATAL_CLEANUP", "1", 1);
 	setenv("MLX5_DEVICE_FATAL_CLEANUP", "1", 1);
+	setenv("RDMAV_ALLOW_DISASSOC_DESTROY", "1", 1);
 
 	if (safe_mce_sys().handle_bf) {
 		setenv("MLX4_POST_SEND_PREFER_BF", "1", 1);

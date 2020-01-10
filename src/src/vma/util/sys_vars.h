@@ -41,7 +41,8 @@
 
 #include "vtypes.h"
 #include "config.h"
-#include "verbs_extra.h"
+
+#include "vma/ib/base/verbs_extra.h"
 #include "vma/util/sysctl_reader.h"
 #include "vma/vma_extra.h"
 
@@ -64,7 +65,8 @@ typedef enum {
 	ALLOC_TYPE_ANON = 0,
 	ALLOC_TYPE_CONTIG,
 	ALLOC_TYPE_HUGEPAGES,
-	ALLOC_TYPE_LAST,
+	ALLOC_TYPE_LAST_ALLOWED_TO_USE,
+	ALLOC_TYPE_EXTERNAL, /* not allowed as a global parameter */
 } alloc_mode_t;
 
 typedef enum {
@@ -80,6 +82,7 @@ static inline bool is_ring_logic_valid(ring_logic_t logic)
 {
 	switch (logic) {
 	case RING_LOGIC_PER_INTERFACE:
+	case RING_LOGIC_PER_IP:
 	case RING_LOGIC_PER_SOCKET:
 	case RING_LOGIC_PER_THREAD:
 	case RING_LOGIC_PER_CORE:
@@ -94,6 +97,7 @@ static inline const char* ring_logic_str(ring_logic_t logic)
 {
 	switch (logic) {
 	case RING_LOGIC_PER_INTERFACE:		return "(Ring per interface)";
+	case RING_LOGIC_PER_IP:			return "(Ring per ip)";
 	case RING_LOGIC_PER_SOCKET:		return "(Ring per socket)";
 	case RING_LOGIC_PER_THREAD:		return "(Ring per thread)";
 	case RING_LOGIC_PER_CORE:		return "(Ring per core)";
@@ -615,11 +619,12 @@ extern mce_sys_var & safe_mce_sys();
 #define MCE_DEFAULT_SELECT_SKIP_OS			(4)
 #define MCE_DEFAULT_SELECT_CPU_USAGE_STATS		(false)
 
-#ifdef DEFINED_IBV_EXP_CQ_MODERATION
+#ifdef DEFINED_IBV_CQ_ATTR_MODERATE
 #define MCE_DEFAULT_CQ_MODERATION_ENABLE               (true)
 #else
 #define MCE_DEFAULT_CQ_MODERATION_ENABLE               (false)
 #endif
+
 #define MCE_DEFAULT_CQ_MODERATION_COUNT			(48)
 #define MCE_DEFAULT_CQ_MODERATION_PERIOD_USEC		(50)
 #define MCE_DEFAULT_CQ_AIM_MAX_COUNT			(560)
@@ -703,6 +708,7 @@ extern mce_sys_var & safe_mce_sys();
 #define BONDING_ACTIVE_SLAVE_PARAM_FILE			"/sys/class/net/%s/bonding/active_slave"
 #define BONDING_FAILOVER_MAC_PARAM_FILE			"/sys/class/net/%s/bonding/fail_over_mac"
 #define BONDING_XMIT_HASH_POLICY_PARAM_FILE		"/sys/class/net/%s/bonding/xmit_hash_policy"
+#define BONDING_ROCE_LAG_FILE				"/sys/class/net/%s/device/roce_lag_enable"
 /* BONDING_SLAVE_STATE_PARAM_FILE is for kernel  > 3.14 or RH7.2 and higher */
 #define BONDING_SLAVE_STATE_PARAM_FILE			"/sys/class/net/%s/bonding_slave/state"
 #define L2_ADDR_FILE_FMT                                "/sys/class/net/%.*s/address"

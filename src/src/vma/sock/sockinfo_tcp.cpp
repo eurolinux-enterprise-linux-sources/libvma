@@ -40,7 +40,6 @@
 #include "vlogger/vlogger.h"
 #include "utils/lock_wrapper.h"
 #include "utils/rdtsc.h"
-#include "vma/util/verbs_extra.h"
 #include "vma/util/libvma.h"
 #include "vma/util/instrumentation.h"
 #include "vma/util/list.h"
@@ -54,6 +53,7 @@
 #include "sock-redirect.h"
 #include "fd_collection.h"
 #include "sockinfo_tcp.h"
+
 
 // debugging macros
 #define MODULE_NAME 		"si_tcp"
@@ -78,6 +78,42 @@
 tcp_seg_pool *g_tcp_seg_pool = NULL;
 tcp_timers_collection* g_tcp_timers_collection = NULL;
 
+/*
+ * The following socket options are inherited by a connected TCP socket from the listening socket:
+ * SO_DEBUG, SO_DONTROUTE, SO_KEEPALIVE, SO_LINGER, SO_OOBINLINE, SO_RCVBUF, SO_RCVLOWAT, SO_SNDBUF,
+ * SO_SNDLOWAT, TCP_MAXSEG, TCP_NODELAY.
+ */
+static bool is_inherited_option(int __level, int __optname)
+{
+	bool ret = false;
+	if (__level == SOL_SOCKET) {
+		switch (__optname) {
+		case SO_DEBUG:
+		case SO_DONTROUTE:
+		case SO_KEEPALIVE:
+		case SO_LINGER:
+		case SO_OOBINLINE:
+		case SO_RCVBUF:
+		case SO_RCVLOWAT:
+		case SO_SNDBUF:
+		case SO_SNDLOWAT:
+			ret = true;
+		}
+	} else if (__level == IPPROTO_TCP) {
+		switch (__optname) {
+		case TCP_MAXSEG:
+		case TCP_NODELAY:
+			ret = true;
+		}
+	} else if (__level == IPPROTO_IP) {
+		switch (__optname) {
+		case IP_TTL:
+			ret = true;
+		}
+	}
+
+	return ret;
+}
 
 /**/
 /** inlining functions can only help if they are implemented before their usage **/
@@ -209,6 +245,8 @@ sockinfo_tcp::sockinfo_tcp(int fd):
 	m_protocol = PROTO_TCP;
 	m_p_socket_stats->socket_type = SOCK_STREAM;
 
+	memset(&m_rx_timestamps, 0, sizeof(m_rx_timestamps));
+
 	m_sock_state = TCP_SOCK_INITED;
 	m_conn_state = TCP_CONN_INIT;
 	m_conn_timeout = CONNECT_DEFAULT_TIMEOUT_MS;
@@ -275,6 +313,7 @@ sockinfo_tcp::sockinfo_tcp(int fd):
 	}
 
 	si_tcp_logdbg("TCP PCB FLAGS: 0x%x", m_pcb.flags);
+	g_p_agent->register_cb((agent_cb_t)&sockinfo_tcp::put_agent_msg, (void *)this);
 	si_tcp_logfunc("done");
 }
 
@@ -302,19 +341,14 @@ sockinfo_tcp::~sockinfo_tcp()
 	if (m_tcp_seg_count) {
 		g_tcp_seg_pool->put_tcp_segs(m_tcp_seg_list);
 	}
-	unlock_tcp_con();
 
-	// hack to close conn as our tcp state machine is not really persistent
-	// give a chance for remote to respond with FIN ACK or
-	// else remote can be stack in LAST_ACK for about 2 min
-#if 0  // can not do this now because tcp flow entry is nuked. will miss wakeup as the result
-	sleep(1);
-	int poll_cnt;
-	poll_cnt = 0;
-	rx_wait_helper(poll_cnt, false);
-	//g_p_lwip->do_timers();
-#endif
-	//close(m_rx_epfd);
+	while (!m_socket_options_list.empty()) {
+		socket_option_t* opt = m_socket_options_list.front();
+		m_socket_options_list.pop_front();
+		delete(opt);
+	}
+
+	unlock_tcp_con();
 
 	BULLSEYE_EXCLUDE_BLOCK_START
 	if (m_call_orig_close_on_dtor) {
@@ -326,6 +360,8 @@ sockinfo_tcp::~sockinfo_tcp()
 	if (m_n_rx_pkt_ready_list_count || m_rx_ready_byte_count || m_rx_pkt_ready_list.size() || m_rx_ring_map.size() || m_rx_reuse_buff.n_buff_num || m_rx_reuse_buff.rx_reuse.size() || m_rx_cb_dropped_list.size() || m_rx_ctl_packets_list.size() || m_rx_peer_packets.size() || m_rx_ctl_reuse_list.size())
 		si_tcp_logerr("not all buffers were freed. protocol=TCP. m_n_rx_pkt_ready_list_count=%d, m_rx_ready_byte_count=%d, m_rx_pkt_ready_list.size()=%d, m_rx_ring_map.size()=%d, m_rx_reuse_buff.n_buff_num=%d, m_rx_reuse_buff.rx_reuse.size=%d, m_rx_cb_dropped_list.size=%d, m_rx_ctl_packets_list.size=%d, m_rx_peer_packets.size=%d, m_rx_ctl_reuse_list.size=%d",
 				m_n_rx_pkt_ready_list_count, m_rx_ready_byte_count, (int)m_rx_pkt_ready_list.size() ,(int)m_rx_ring_map.size(), m_rx_reuse_buff.n_buff_num, m_rx_reuse_buff.rx_reuse.size(), m_rx_cb_dropped_list.size(), m_rx_ctl_packets_list.size(), m_rx_peer_packets.size(), m_rx_ctl_reuse_list.size());
+
+	g_p_agent->unregister_cb((agent_cb_t)&sockinfo_tcp::put_agent_msg, (void *)this);
 
 	si_tcp_logdbg("sock closed");
 }
@@ -553,7 +589,7 @@ void sockinfo_tcp::force_close()
 void sockinfo_tcp::create_dst_entry()
 {
 	if (!m_p_connected_dst_entry) {
-		socket_data data = { m_fd, m_pcb.tos, m_pcp};
+		socket_data data = { m_fd, m_n_uc_ttl, m_pcb.tos, m_pcp };
 		m_p_connected_dst_entry = new dst_entry_tcp(m_connected.get_in_addr(),
 					m_connected.get_in_port(),
 					m_bound.get_in_port(),
@@ -665,6 +701,30 @@ bool sockinfo_tcp::check_dummy_send_conditions(const int flags, const iovec* p_i
 		p_iov->iov_len <= max_len && // Data will not be split into more then one segment
 		wnd && // Window is not empty
 		(p_iov->iov_len + m_pcb.snd_lbb - m_pcb.lastack) <= wnd; // Window allows the dummy packet it to be sent
+}
+
+void sockinfo_tcp::put_agent_msg(void *arg)
+{
+	sockinfo_tcp *p_si_tcp = (sockinfo_tcp *)arg;
+	struct vma_msg_state data;
+
+	/* Ignore listen socket at the moment */
+	if (p_si_tcp->is_server() || get_tcp_state(&p_si_tcp->m_pcb) == LISTEN) {
+		return ;
+	}
+
+	data.hdr.code = VMA_MSG_STATE;
+	data.hdr.ver = VMA_AGENT_VER;
+	data.hdr.pid = getpid();
+	data.fid = p_si_tcp->get_fd();
+	data.state = get_tcp_state(&p_si_tcp->m_pcb);
+	data.type = SOCK_STREAM;
+	data.src_ip = p_si_tcp->m_bound.get_in_addr();
+	data.src_port = p_si_tcp->m_bound.get_in_port();
+	data.dst_ip = p_si_tcp->m_connected.get_in_addr();
+	data.dst_port = p_si_tcp->m_connected.get_in_port();
+
+	g_p_agent->put((const void*)&data, sizeof(data), (intptr_t)data.fid);
 }
 
 ssize_t sockinfo_tcp::tx(const tx_call_t call_type, const iovec* p_iov, const ssize_t sz_iov, const int flags, const struct sockaddr *__to, const socklen_t __tolen)
@@ -980,28 +1040,8 @@ err_t sockinfo_tcp::ip_output_syn_ack(struct pbuf *p, void* v_p_conn, int is_rex
 	p_si_tcp->m_p_socket_stats->tcp_state = new_state;
 
 	/* Update daemon about actual state for offloaded connection */
-	if (likely((p_si_tcp->m_sock_offload == TCP_SOCK_LWIP) &&
-			(AGENT_ACTIVE == g_p_agent->state()))) {
-		agent_msg_t *msg = NULL;
-
-		msg = g_p_agent->get_msg();
-		if (msg) {
-			struct vma_msg_state *data = NULL;
-
-			msg->length = sizeof(*data);
-			data = (struct vma_msg_state*)&msg->data;
-			data->hdr.code = VMA_MSG_STATE;
-			data->hdr.ver = VMA_AGENT_VER;
-			data->hdr.pid = getpid();
-			data->fid = p_si_tcp->get_fd();
-			data->state = new_state;
-			data->type = SOCK_STREAM;
-			data->src_ip = p_si_tcp->m_bound.get_in_addr();
-			data->src_port = p_si_tcp->m_bound.get_in_port();
-			data->dst_ip = p_si_tcp->m_connected.get_in_addr();
-			data->dst_port = p_si_tcp->m_connected.get_in_port();
-			g_p_agent->put_msg(msg);
-		}
+	if (likely(p_si_tcp->m_sock_offload == TCP_SOCK_LWIP)) {
+		p_si_tcp->put_agent_msg((void *)p_si_tcp);
 	}
 }
 
@@ -1386,7 +1426,7 @@ int sockinfo_tcp::handle_child_FIN(sockinfo_tcp* child_conn)
 {
 	lock_tcp_con();
 
-	list_iterator_t<sockinfo_tcp, sockinfo_tcp::accepted_conns_node_offset> conns_iter;
+	sock_list_t::iterator conns_iter;
 	for(conns_iter = m_accepted_conns.begin(); conns_iter != m_accepted_conns.end(); conns_iter++) {
 		if (*(conns_iter) == child_conn) {
 			unlock_tcp_con();
@@ -1535,6 +1575,7 @@ err_t sockinfo_tcp::rx_lwip_cb(void *arg, struct tcp_pcb *pcb,
 		p_curr_desc->rx.frag.iov_base = p_curr_buff->payload;
 		p_curr_desc->rx.frag.iov_len = p_curr_buff->len;
 		p_curr_desc->p_next_desc = (mem_buf_desc_t *)p_curr_buff->next;
+		conn->process_timestamps(p_curr_desc);
 		p_curr_buff = p_curr_buff->next;
 		p_curr_desc = p_curr_desc->p_next_desc;
 	}
@@ -1552,6 +1593,13 @@ err_t sockinfo_tcp::rx_lwip_cb(void *arg, struct tcp_pcb *pcb,
 		pkt_info.dst = &p_first_desc->rx.dst;
 		pkt_info.socket_ready_queue_pkt_count = conn->m_p_socket_stats->n_rx_ready_pkt_count;
 		pkt_info.socket_ready_queue_byte_count = conn->m_p_socket_stats->n_rx_ready_byte_count;
+
+		if (conn->m_n_tsing_flags & SOF_TIMESTAMPING_RAW_HARDWARE) {
+			pkt_info.hw_timestamp = p_first_desc->rx.timestamps.hw;
+		}
+		if (p_first_desc->rx.timestamps.sw.tv_sec) {
+			pkt_info.sw_timestamp = p_first_desc->rx.timestamps.sw;
+		}
 
 		// fill io vector array with data buffer pointers
 		iovec iov[p_first_desc->rx.n_frags];
@@ -1590,6 +1638,11 @@ err_t sockinfo_tcp::rx_lwip_cb(void *arg, struct tcp_pcb *pcb,
 			completion->packet.total_len = p->tot_len;
 			completion->src = p_first_desc->rx.src;
 			completion->packet.num_bufs = p_first_desc->rx.n_frags;
+
+			if (conn->m_n_tsing_flags & SOF_TIMESTAMPING_RAW_HARDWARE) {
+				completion->packet.hw_timestamp = p_first_desc->rx.timestamps.hw;
+			}
+
 			NOTIFY_ON_EVENTS(conn, VMA_SOCKETXTREME_PACKET);
 			conn->save_stats_rx_offload(completion->packet.total_len);
 		}
@@ -1772,6 +1825,7 @@ ssize_t sockinfo_tcp::rx(const rx_call_t call_type, iovec* p_iov, ssize_t sz_iov
 	si_tcp_logfunc("something in rx queues: %d %p", m_n_rx_pkt_ready_list_count, m_rx_pkt_ready_list.front());
 
 	total_rx = dequeue_packet(p_iov, sz_iov, (sockaddr_in *)__from, __fromlen, in_flags, &out_flags);
+	if (__msg) handle_cmsg(__msg);
 
 	/*
 	* RCVBUFF Accounting: Going 'out' of the internal buffer: if some bytes are not tcp_recved yet  - do that.
@@ -1959,38 +2013,6 @@ bool sockinfo_tcp::rx_input_cb(mem_buf_desc_t* p_rx_pkt_mem_buf_desc_info, void*
 
 	return true;
 }
-
-#if _BullseyeCoverage
-    #pragma BullseyeCoverage off
-#endif
-int sockinfo_tcp::prepareConnect(const sockaddr *, socklen_t ){
-//int tcp_sockinfo::prepareConnect(const sockaddr *__to, socklen_t __tolen){
-
-#if 0
-	transport_t target_family;
-	si_tcp_logfuncall("");
-
-	if (m_sock_offload == TCP_SOCK_PASSTHROUGH)
-		return 1; //passthrough
-
-	/* obtain the target address family */
-	target_family = __vma_match_tcp_client(TRANS_VMA, __to, __tolen, safe_mce_sys().app_id);
-	si_tcp_logdbg("TRANSPORT: %s",__vma_get_transport_str(target_family));
-	if (target_family == TRANS_OS) {
-		setPassthrough();
-		return 1; //passthrough
-	}
-
-	// if (target_family == USE_VMA || target_family == USE_ULP || arget_family == USE_DEFAULT)
-
-	// find our local address
-	setPassthrough(false);
-#endif
-	return 0; //offloaded
-}
-#if _BullseyeCoverage
-    #pragma BullseyeCoverage on
-#endif
 
 /**
  *  try to connect to the dest over RDMA cm
@@ -2292,47 +2314,6 @@ int sockinfo_tcp::listen(int backlog)
 {
 	si_tcp_logfuncall("");
 
-#if 0
-	transport_t target_family;
-	struct sockaddr_storage tmp_sin;
-	socklen_t tmp_sinlen = sizeof(tmp_sin);
-
-	if (m_sock_offload == TCP_SOCK_PASSTHROUGH)
-		return orig_os_api.listen(m_fd, backlog);
-
-	if (m_sock_state != TCP_SOCK_BOUND) {
-		// print error so we can better track apps not following our assumptions ;)
-		si_tcp_logerr("socket is in wrong state for connect: %d", m_sock_state);
-		errno = EINVAL;
-		return -1;
-	}
-
-	if (orig_os_api.getsockname(m_fd, (struct sockaddr *) &tmp_sin, &tmp_sinlen)) {
-		si_tcp_logerr("get sockname failed");
-		return -1;
-	}
-
-	lock();
-	target_family = __vma_match_tcp_server(TRANS_VMA, (struct sockaddr *) &tmp_sin, sizeof(tmp_sin), safe_mce_sys().app_id);
-	si_tcp_logdbg("TRANSPORT: %s", __vma_get_transport_str(target_family));
-	si_tcp_logdbg("sock state = %d", m_sock->state);
-
-	if (target_family == TRANS_OS) {
-		if (orig_os_api.listen(m_fd, backlog) < 0) {
-			unlock();
-			return -1;
-		}
-		setPassthrough();
-		m_sock_state = TCP_SOCK_ACCEPT_READY;
-		unlock();
-		return 0;
-	}
-	// if (target_family == USE_VMA || target_family == USE_ULP || arget_family == USE_DEFAULT)
-	setPassthrough(false);
-	//TODO unlock();
-#endif
-	//
-
 	int orig_backlog = backlog;
 
 	if (backlog > safe_mce_sys().sysctl_reader.get_listen_maxconn()) {
@@ -2368,11 +2349,11 @@ int sockinfo_tcp::listen(int backlog)
 
 	if (get_tcp_state(&m_pcb) != LISTEN) {
 
-		//Now we know that it is listen socket so we have to treate m_pcb as listen pcb
-		//and update the relevant fields of tcp_listen_pcb.
+		// Now we know that it is listen socket so we have to treat m_pcb as listen pcb
+		// and update the relevant fields of tcp_listen_pcb.
 		struct tcp_pcb tmp_pcb;
 		memcpy(&tmp_pcb, &m_pcb, sizeof(struct tcp_pcb));
-		tcp_listen_with_backlog((struct tcp_pcb_listen*)(&m_pcb), &tmp_pcb, backlog);
+		tcp_listen((struct tcp_pcb_listen*)(&m_pcb), &tmp_pcb);
 	}
 
 	m_sock_state = TCP_SOCK_ACCEPT_READY;
@@ -2481,14 +2462,14 @@ int sockinfo_tcp::accept_helper(struct sockaddr *__addr, socklen_t *__addrlen, i
 			return orig_os_api.accept(m_fd, __addr, __addrlen);
 	}
 
+	si_tcp_logdbg("socket accept, __addr = %p, __addrlen = %p, *__addrlen = %d", __addr, __addrlen, __addrlen ? *__addrlen : 0);
+
 	if (!is_server()) {
 		// print error so we can better track apps not following our assumptions ;)
 		si_tcp_logdbg("socket is in wrong state for accept: %d", m_sock_state);
 		errno = EINVAL;
 		return -1;
 	}
-
-	si_tcp_logdbg("socket accept");
 
 	lock_tcp_con();
 
@@ -2569,8 +2550,13 @@ int sockinfo_tcp::accept_helper(struct sockaddr *__addr, socklen_t *__addrlen, i
 
 	ns->lock_tcp_con();
 
-	if (__addr && __addrlen)
-		ns->getpeername(__addr, __addrlen);	
+	if (__addr && __addrlen) {
+		if ((ret = ns->getpeername(__addr, __addrlen)) < 0) {
+			ns->unlock_tcp_con();
+			close(ns->get_fd());
+			return ret;
+		}
+	}
 
 	ns->m_p_socket_stats->connected_ip = ns->m_connected.get_in_addr();
 	ns->m_p_socket_stats->connected_port = ns->m_connected.get_in_port();
@@ -2893,17 +2879,11 @@ err_t sockinfo_tcp::syn_received_lwip_cb(void *arg, struct tcp_pcb *newpcb, err_
 	/* Inherite properties from the parent */
 	new_sock->set_conn_properties_from_pcb();
 
-	new_sock->m_so_bindtodevice_ip = listen_sock->m_so_bindtodevice_ip;
-	new_sock->m_linger = listen_sock->m_linger;
-
 	new_sock->m_rcvbuff_max = MAX(listen_sock->m_rcvbuff_max, 2 * new_sock->m_pcb.mss);
 	new_sock->fit_rcv_wnd(true);
 
-	new_sock->m_sndbuff_max = listen_sock->m_sndbuff_max;
-	if (listen_sock->m_sndbuff_max) {
-		new_sock->m_sndbuff_max = MAX(listen_sock->m_sndbuff_max, 2 * new_sock->m_pcb.mss);
-		new_sock->fit_snd_bufs(new_sock->m_sndbuff_max);
-	}
+	// Socket socket options
+	listen_sock->set_sock_options(new_sock);
 
 	listen_sock->m_tcp_con_lock.unlock();
 
@@ -2978,6 +2958,20 @@ void sockinfo_tcp::set_conn_properties_from_pcb()
 	m_bound.set_sa_family(AF_INET);
 }
 
+void sockinfo_tcp::set_sock_options(sockinfo_tcp *new_sock)
+{
+	si_tcp_logdbg("Applying all socket options on %p, fd %d", new_sock, new_sock->get_fd());
+
+	socket_options_list_t::iterator options_iter;
+	for (options_iter = m_socket_options_list.begin(); options_iter != m_socket_options_list.end(); options_iter++) {
+		socket_option_t* opt = *options_iter;
+		new_sock->setsockopt(opt->level, opt->optname, opt->optval, opt->optlen);
+	}
+	errno = 0;
+
+	si_tcp_logdbg("set_sock_options completed");
+}
+
 err_t sockinfo_tcp::connect_lwip_cb(void *arg, struct tcp_pcb *tpcb, err_t err)
 {
 	sockinfo_tcp *conn = (sockinfo_tcp *)arg;
@@ -3036,6 +3030,11 @@ int sockinfo_tcp::wait_for_conn_ready()
 		 */
 		if (rx_wait(poll_count, m_b_blocking) < 0) {
 			si_tcp_logdbg("connect interrupted");
+			return -1;
+		}
+
+		if (unlikely(g_b_exit)) {
+			errno = EINTR;
 			return -1;
 		}
 	}
@@ -3448,24 +3447,42 @@ int sockinfo_tcp::setsockopt(int __level, int __optname,
                               __const void *__optval, socklen_t __optlen)
 {
 	//todo check optlen and set proper errno on failure
+	si_tcp_logfunc("level=%d, optname=%d", __level, __optname);
 
 	int val, ret = 0;
 	bool supported = true;
 	bool allow_privileged_sock_opt = false;
 
-	if (0 == sockinfo::setsockopt(__level, __optname, __optval, __optlen)) {
-		return 0;
+	if ((ret = sockinfo::setsockopt(__level, __optname, __optval, __optlen)) != SOCKOPT_PASS_TO_OS) {
+		return ret;
 	}
+
+	ret = 0;
 
 	if (__level == IPPROTO_IP) {
 		switch(__optname) {
 		case IP_TOS: /* might be missing ECN logic */
-			if (__optlen <= sizeof(int)) {
-				val = *(int *)__optval;
-				val &= ~INET_ECN_MASK;
-				m_pcb.tos |= val & INET_ECN_MASK;
-			}
 			ret = SOCKOPT_HANDLE_BY_OS;
+			if (__optlen == sizeof(int)) {
+				val = *(int *)__optval;
+			} else if (__optlen == sizeof(uint8_t)) {
+				val = *(uint8_t *)__optval;
+			} else {
+				break;
+			}
+			val &= ~INET_ECN_MASK;
+			val |= m_pcb.tos & INET_ECN_MASK;
+			if (m_pcb.tos != val) {
+				lock_tcp_con();
+				m_pcb.tos = val;
+				header_tos_updater du(m_pcb.tos);
+				update_header_field(&du);
+				// lists.openwall.net/netdev/2009/12/21/59
+				int new_prio = ip_tos2prio[IPTOS_TOS(m_pcb.tos) >> 1];
+				set_sockopt_prio(&new_prio, sizeof(new_prio));
+				unlock_tcp_con();
+
+			}
 		break;
 		default:
 			ret = SOCKOPT_HANDLE_BY_OS;
@@ -3645,7 +3662,12 @@ int sockinfo_tcp::setsockopt(int __level, int __optname,
 			return ret;
 		}
 		case SO_PRIORITY: {
-			set_sockopt_prio(__optval, __optlen);
+			lock_tcp_con();
+			if (set_sockopt_prio(__optval, __optlen)) {
+				unlock_tcp_con();
+				return -1;
+			}
+			unlock_tcp_con();
 			ret = SOCKOPT_HANDLE_BY_OS;
 			break;
 		}
@@ -3655,6 +3677,9 @@ int sockinfo_tcp::setsockopt(int __level, int __optname,
 			break;
 		}
 	}
+
+	if (m_sock_state <= TCP_SOCK_ACCEPT_READY && __optval != NULL && is_inherited_option(__level, __optname))
+		m_socket_options_list.push_back(new socket_option_t(__level, __optname,__optval, __optlen));
 
 	if (safe_mce_sys().avoid_sys_calls_on_tcp_fd && ret != SOCKOPT_HANDLE_BY_OS && is_connected())
 		return ret;
@@ -3724,7 +3749,7 @@ int sockinfo_tcp::getsockopt_offload(int __level, int __optname, void *__optval,
 			break;
 		case SO_KEEPALIVE:
 			if (*__optlen >= sizeof(int)) {
-				*(int *)__optval = m_pcb.so_options & SOF_KEEPALIVE;
+				*(int *)__optval = (bool)(m_pcb.so_options & SOF_KEEPALIVE);
 				si_tcp_logdbg("(SO_KEEPALIVE) keepalive: %d", *(int *)__optval);
 				ret = 0;
 			} else {
@@ -3750,8 +3775,8 @@ int sockinfo_tcp::getsockopt_offload(int __level, int __optname, void *__optval,
 			}
 			break;
 		case SO_LINGER:
-			if (*__optlen >= sizeof(struct linger)) {
-				*(struct linger *)__optval = m_linger;
+			if (*__optlen > 0) {
+				memcpy(__optval, &m_linger, std::min<size_t>(*__optlen , sizeof(struct linger)));
 				si_tcp_logdbg("(SO_LINGER) l_onoff = %d, l_linger = %d", m_linger.l_onoff, m_linger.l_linger);
 				ret = 0;
 			} else {
@@ -3842,21 +3867,22 @@ int sockinfo_tcp::getsockname(sockaddr *__name, socklen_t *__namelen)
 		return orig_os_api.getsockname(m_fd, __name, __namelen);
 	}
 
-/* TODO ALEXR
-	if (!m_addr_local) {
-		// if not a server socket get local address from LWIP
-		errno = EINVAL;
-		return -1;
-	}
-*/
 	// according to man address should be truncated if given struct is too small
-	if (__name && __namelen && (*__namelen >= m_bound.get_socklen())) {
-		m_bound.get_sa(__name);
-		return 0;
+	if (__name && __namelen) {
+		if ((int)*__namelen < 0) {
+			si_tcp_logdbg("negative __namelen is not supported: %d", *__namelen);
+			errno = EINVAL;
+			return -1;
+		}
+
+		if (*__namelen) {
+			m_bound.get_sa(__name, *__namelen);
+		}
+
+		*__namelen = m_bound.get_socklen();
 	}
 
-	errno = EINVAL;
-	return -1;
+	return 0;
 }
 
 int sockinfo_tcp::getpeername(sockaddr *__name, socklen_t *__namelen)
@@ -3868,45 +3894,28 @@ int sockinfo_tcp::getpeername(sockaddr *__name, socklen_t *__namelen)
 		return orig_os_api.getpeername(m_fd, __name, __namelen);
 	}
 
-	/* TODO ALEXR
-	if (!m_addr_peer) {
-		// if not a server socket get local address from LWIP
-		errno = EINVAL;
-		return -1;
-	}
-*/
 	if (m_conn_state != TCP_CONN_CONNECTED) {
 		errno = ENOTCONN;
 		return -1;
 	}
 
 	// according to man address should be truncated if given struct is too small
-	if (__name && __namelen && (*__namelen >= m_connected.get_socklen())) {
-		m_connected.get_sa(__name);
-		return 0;
-	}
-	errno = EINVAL;
-	return -1;
-}
+	if (__name && __namelen) {
+		if ((int)*__namelen < 0) {
+			si_tcp_logdbg("negative __namelen is not supported: %d", *__namelen);
+			errno = EINVAL;
+			return -1;
+		}
 
-//code coverage
-#if 0
-struct sockaddr *sockinfo_tcp::sockaddr_realloc(struct sockaddr *old_addr, 
-		socklen_t & old_len, socklen_t new_len)
-{
-	BULLSEYE_EXCLUDE_BLOCK_START
-	if (old_addr && old_len != new_len) {
-		if (old_addr == 0) { si_tcp_logpanic("old_addr != 0"); }
-		delete old_addr;
-		old_addr = 0;
+		if (*__namelen) {
+			m_connected.get_sa(__name, *__namelen);
+		}
+
+		*__namelen = m_connected.get_socklen();
 	}
-	BULLSEYE_EXCLUDE_BLOCK_END
-	if (old_addr == 0)
-		old_addr = (struct sockaddr *)new char [new_len];
-	old_len = new_len;
-	return old_addr;
+
+	return 0;
 }
-#endif
 
 int sockinfo_tcp::rx_wait_helper(int &poll_count, bool is_blocking)
 {
@@ -3954,12 +3963,6 @@ int sockinfo_tcp::rx_wait_helper(int &poll_count, bool is_blocking)
 	}
 
 	// if in blocking accept state skip poll phase and go to sleep directly
-#if 0
-	if (unlikely(is_server() && is_blocking == true)) {
-		si_tcp_logdbg("skip poll on accept!");
-		goto skip_poll;
-	}
-#endif
         if (m_loops_timer.is_timeout() || !is_blocking) {
 		errno = EAGAIN;
 		return -1;
@@ -3973,6 +3976,7 @@ int sockinfo_tcp::rx_wait_helper(int &poll_count, bool is_blocking)
 	// if we polling too much - go to sleep
 	si_tcp_logfuncall("%d: too many polls without data blocking=%d", m_fd, is_blocking);
 	if (g_b_exit) {
+		errno = EINTR;
 		return -1;
 	}
 
@@ -4104,6 +4108,11 @@ mem_buf_desc_t* sockinfo_tcp::get_next_desc_peek(mem_buf_desc_t *pdesc, int& rx_
 	}
 
 	return pdesc;
+}
+
+timestamps_t* sockinfo_tcp::get_socket_timestamps()
+{
+	return &m_rx_timestamps;
 }
 
 void sockinfo_tcp::post_deqeue(bool release_buff)
@@ -4349,12 +4358,12 @@ int sockinfo_tcp::free_packets(struct vma_packet_t *pkts, size_t count)
 		vma_packet_t *p_pkts = (vma_packet_t *)(buf + offset);
 		buff = (mem_buf_desc_t*)p_pkts->packet_id;
 
-		if (m_p_rx_ring && !m_p_rx_ring->is_member((ring*)buff->p_desc_owner)){
+		if (m_p_rx_ring && !m_p_rx_ring->is_member(buff->p_desc_owner)) {
 			errno = ENOENT;
 			ret = -1;
 			break;
 		}
-		else if (m_rx_ring_map.find(((ring*)buff->p_desc_owner)->get_parent()) == m_rx_ring_map.end()) {
+		else if (m_rx_ring_map.find(buff->p_desc_owner->get_parent()) == m_rx_ring_map.end()) {
 			errno = ENOENT;
 			ret = -1;
 			break;
@@ -4594,9 +4603,7 @@ void tcp_timers_collection::handle_timer_expired(void* user_data)
 	m_n_location = (m_n_location + 1) % m_n_intervals_size;
 
 	/* Processing all messages for the daemon */
-	if (AGENT_ACTIVE == g_p_agent->state()) {
-		g_p_agent->progress();
-	}
+	g_p_agent->progress();
 }
 
 void tcp_timers_collection::add_new_timer(timer_node_t* node, timer_handler* handler, void* user_data)
@@ -4650,4 +4657,15 @@ void tcp_timers_collection::remove_timer(timer_node_t* node)
 	__log_dbg("TCP timer handler [%p] was removed", node->handler);
 
 	free(node);
+}
+
+void sockinfo_tcp::update_header_field(data_updater *updater)
+{
+	lock_tcp_con();
+
+	if (m_p_connected_dst_entry) {
+		updater->update_field(*m_p_connected_dst_entry);
+	}
+
+	unlock_tcp_con();
 }

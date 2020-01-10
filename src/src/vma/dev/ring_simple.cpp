@@ -51,7 +51,7 @@
 #include "vma/dev/rfs_uc.h"
 #include "vma/dev/rfs_uc_tcp_gro.h"
 #include "vma/dev/cq_mgr.h"
-#if defined(HAVE_INFINIBAND_MLX5_HW_H)
+#if defined(DEFINED_DIRECT_VERBS)
 #include "qp_mgr_eth_mlx5.h"
 #endif
 
@@ -102,8 +102,8 @@ inline void ring_simple::send_status_handler(int ret, vma_ibv_send_wr* p_send_wq
 
 qp_mgr* ring_eth::create_qp_mgr(const ib_ctx_handler* ib_ctx, uint8_t port_num, struct ibv_comp_channel* p_rx_comp_event_channel)
 {
-#if defined(HAVE_INFINIBAND_MLX5_HW_H)
-	if (!m_b_is_hypervisor && qp_mgr::is_lib_mlx5(((ib_ctx_handler*)ib_ctx)->get_ibname())) {
+#if defined(DEFINED_DIRECT_VERBS)
+	if (qp_mgr::is_lib_mlx5(((ib_ctx_handler*)ib_ctx)->get_ibname())) {
 		return new qp_mgr_eth_mlx5(this, ib_ctx, port_num, p_rx_comp_event_channel, get_tx_num_wr(), get_partition());
 	}
 #endif
@@ -131,15 +131,14 @@ bool ring_ib::is_ratelimit_supported(struct vma_rate_limit_t &rate_limit)
 	return false;
 }
 
-ring_simple::ring_simple(int if_index, ring* parent /*=NULL*/):
-	ring_slave(if_index, parent, RING_SIMPLE),
+ring_simple::ring_simple(int if_index, ring* parent, ring_type_t type):
+	ring_slave(if_index, parent, type),
 	m_p_ib_ctx(NULL),
 	m_p_qp_mgr(NULL),
 	m_p_cq_mgr_rx(NULL),
 	m_lock_ring_rx("ring_simple:lock_rx"),
 	m_p_cq_mgr_tx(NULL),
 	m_lock_ring_tx("ring_simple:lock_tx"),
-	m_b_is_hypervisor(safe_mce_sys().hypervisor),
 	m_lock_ring_tx_buf_wait("ring:lock_tx_buf_wait"), m_tx_num_bufs(0), m_tx_num_wr(0), m_tx_num_wr_free(0),
 	m_b_qp_tx_first_flushed_completion_handled(false), m_missing_buf_ref_count(0),
 	m_tx_lkey(0),
@@ -360,36 +359,17 @@ bool ring_simple::attach_flow(flow_tuple& flow_spec_5t, pkt_rcvr_sink *sink)
 	rfs* p_rfs;
 	rfs* p_tmp_rfs = NULL;
 	sockinfo* si = static_cast<sockinfo*> (sink);
-	uint32_t flow_tag_id = 0; // spec will not be attached to rule
 
-	ring_logdbg("flow: %s, with sink (%p), m_flow_tag_enabled: %d",
-		    flow_spec_5t.to_str(), si, m_flow_tag_enabled);
-
-	if( si == NULL )
+	if (si == NULL)
 		return false;
 
-	// If m_flow_tag_enabled==true then flow tag is supported and flow_tag_id is guaranteed
-	// to have a !0 value which will results in a flow id being added to the flow spec.
-	// Otherwise, flow tag is not supported, flow_tag_id=0 and no flow id will be set in the flow spec.
-	if (m_flow_tag_enabled) {
-		// sockfd=0 is valid too but flow_tag_id=0 is invalid, increment it
-		// effectively limiting our sockfd range to FLOW_TAG_MASK-1
-		int flow_tag_id_candidate = si->get_fd() + 1;
-		if (flow_tag_id_candidate > 0) {
-			flow_tag_id = flow_tag_id_candidate & FLOW_TAG_MASK;
-			if ((uint32_t)flow_tag_id_candidate != flow_tag_id) {
-				// tag_id is out of the range by mask, will not use it
-				ring_logdbg("flow_tag disabled as tag_id: %d is out of mask (%x) range!",
-					    flow_tag_id, FLOW_TAG_MASK);
-				flow_tag_id = FLOW_TAG_MASK;
-			}
-			ring_logdbg("sock_fd:%d enabled:%d with id:%d",
-				    flow_tag_id_candidate-1, m_flow_tag_enabled, flow_tag_id);
-		} else {
-			flow_tag_id = FLOW_TAG_MASK; // FLOW_TAG_MASK - modal, FT to be attached but will not be used
-			ring_logdbg("flow_tag:%d disabled as flow_tag_id_candidate:%d", flow_tag_id, flow_tag_id_candidate);
-		}
+	uint32_t flow_tag_id = si->get_flow_tag_val(); // spec will not be attached to rule
+	if (!m_flow_tag_enabled) {
+		flow_tag_id = 0;
 	}
+	ring_logdbg("flow: %s, with sink (%p), flow tag id %d "
+		    "m_flow_tag_enabled: %d", flow_spec_5t.to_str(), si,
+		    flow_tag_id, m_flow_tag_enabled);
 
 	/*
 	 * //auto_unlocker lock(m_lock_ring_rx);
@@ -469,13 +449,11 @@ bool ring_simple::attach_flow(flow_tuple& flow_spec_5t, pkt_rcvr_sink *sink)
 			} catch(vma_exception& e) {
 				ring_logerr("%s", e.message);
 				return false;
-			}
-			BULLSEYE_EXCLUDE_BLOCK_START
-			if (p_tmp_rfs == NULL) {
+			} catch(const std::bad_alloc &e) {
+				NOT_IN_USE(e);
 				ring_logerr("Failed to allocate rfs!");
 				return false;
 			}
-			BULLSEYE_EXCLUDE_BLOCK_END
 			m_lock_ring_rx.lock();
 			p_rfs = m_flow_udp_mc_map.get(key_udp_mc, NULL);
 			if (p_rfs) {
@@ -513,10 +491,10 @@ bool ring_simple::attach_flow(flow_tuple& flow_spec_5t, pkt_rcvr_sink *sink)
 					flow_tag_id = FLOW_TAG_MASK;
 					ring_logdbg("flow_tag_id = %d is disabled to enable TCP GRO socket to be processed on RFS!", flow_tag_id);
 				}
-				p_tmp_rfs = new rfs_uc_tcp_gro(&flow_spec_5t, this, tcp_dst_port_filter, flow_tag_id);
+				p_tmp_rfs = new (std::nothrow)rfs_uc_tcp_gro(&flow_spec_5t, this, tcp_dst_port_filter, flow_tag_id);
 			} else {
 				try {
-					p_tmp_rfs = new rfs_uc(&flow_spec_5t, this, tcp_dst_port_filter, flow_tag_id);
+					p_tmp_rfs = new (std::nothrow)rfs_uc(&flow_spec_5t, this, tcp_dst_port_filter, flow_tag_id);
 				} catch(vma_exception& e) {
 					ring_logerr("%s", e.message);
 					return false;
@@ -1799,7 +1777,7 @@ void ring_simple::modify_cq_moderation(uint32_t period, uint32_t count)
 	m_p_ring_stat->simple.n_rx_cq_moderation_count = count;
 
 	//todo all cqs or just active? what about HA?
-	m_p_cq_mgr_rx->modify_cq_moderation(period, count);
+	priv_ibv_modify_cq_moderation(m_p_cq_mgr_rx->get_ibv_cq_hndl(), period, count);
 }
 
 void ring_simple::adapt_cq_moderation()

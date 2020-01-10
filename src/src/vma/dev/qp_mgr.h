@@ -37,24 +37,19 @@
 #include <errno.h>
 #include <ifaddrs.h>
 
+#include "vma/ib/base/verbs_extra.h"
 #include "vlogger/vlogger.h"
 #include "utils/atomic.h"
 #include "vma/util/vtypes.h"
 #include "vma/util/sys_vars.h"
 #include "vma/util/libvma.h"
-#include "vma/util/verbs_extra.h"
 #include "vma/util/if.h"
 #include "vma/util/hash_map.h"
 #include "vma/lwip/opt.h"
 #include "vma/proto/mem_buf_desc.h"
 #include "vma/infra/sender.h"
 #include "vma/dev/ib_ctx_handler.h"
-#include "vma/dev/ah_cleaner.h"
 #include "vma/dev/cq_mgr.h"
-
-#ifdef HAVE_INFINIBAND_MLX5_HW_H
-#include <infiniband/mlx5_hw.h>
-#endif // HAVE_INFINIBAND_MLX5_HW_H
 
 class buffer_pool;
 class cq_mgr;
@@ -109,7 +104,7 @@ public:
 	virtual void        up();
 	virtual void        down();
 
-	void                post_recv_buffer(mem_buf_desc_t* p_mem_buf_desc); // Post for receive single mem_buf_desc
+	virtual void        post_recv_buffer(mem_buf_desc_t* p_mem_buf_desc); // Post for receive single mem_buf_desc
 	void                post_recv_buffers(descq_t* p_buffers, size_t count); // Post for receive a list of mem_buf_desc
 	int                 send(vma_ibv_send_wr* p_send_wqe, vma_wr_tx_packet_attr attr);
 
@@ -133,9 +128,6 @@ public:
 	// chain of calls may serve as cache warm for dummy send feature.
 	inline bool         get_hw_dummy_send_support() {return m_hw_dummy_send_support; }
 
-	// create a AH cleaner object which will be linked to the following post send (if any)
-	void                ah_cleanup(struct ibv_ah* ah);
-
 	virtual void        modify_qp_to_ready_state() = 0;
 	void                modify_qp_to_error_state();
 
@@ -152,16 +144,13 @@ protected:
 	uint64_t            m_rq_wqe_counter;
 	uint64_t*           m_rq_wqe_idx_to_wrid;
 #ifdef DEFINED_SOCKETXTREME
-	struct mlx5_qp*	    m_mlx5_hw_qp;
+	vma_ib_mlx5_qp_t    m_mlx5_qp;
 #endif // DEFINED_SOCKETXTREME
 	struct ibv_qp*      m_qp;
 
 	ring_simple*        m_p_ring;
 	uint8_t             m_port_num;
 	ib_ctx_handler*     m_p_ib_ctx_handler;
-
-	ah_cleaner*         m_p_ahc_head;
-	ah_cleaner*         m_p_ahc_tail;
 
 	uint32_t            m_max_inline_data;
 	uint32_t            m_max_qp_wr;
@@ -203,6 +192,8 @@ protected:
 
 	virtual cq_mgr* init_rx_cq_mgr(struct ibv_comp_channel* p_rx_comp_event_channel);
 	virtual cq_mgr* init_tx_cq_mgr(void);
+
+	cq_mgr* handle_cq_initialization(uint32_t *num_wr, struct ibv_comp_channel* comp_event_channel, bool is_rx);
 
 	virtual int     post_qp_create(void) { return 0;};
 	virtual int     send_to_wire(vma_ibv_send_wr* p_send_wqe, vma_wr_tx_packet_attr attr, bool request_comp);

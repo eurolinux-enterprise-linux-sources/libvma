@@ -50,6 +50,9 @@
 #define SO_VMA_GET_API		2800
 #define SO_VMA_USER_DATA	2801
 #define SO_VMA_RING_ALLOC_LOGIC 2810
+#define SO_VMA_RING_USER_MEMORY 2811
+#define SO_VMA_FLOW_TAG	2820
+
 /*
  * Flags for Dummy send API
  */
@@ -206,8 +209,9 @@ typedef int vma_ring_profile_key;
 
 typedef enum {
 	RING_LOGIC_PER_INTERFACE = 0,           //!< RING_LOGIC_PER_INTERFACE
+	RING_LOGIC_PER_IP = 1,                  //!< RING_LOGIC_PER_IP
 	RING_LOGIC_PER_SOCKET = 10,             //!< RING_LOGIC_PER_SOCKET
-	RING_LOGIC_PER_USER_ID = 11,             //!< RING_LOGIC_PER_USER_ID
+	RING_LOGIC_PER_USER_ID = 11,            //!< RING_LOGIC_PER_USER_ID
 	RING_LOGIC_PER_THREAD = 20,             //!< RING_LOGIC_PER_THREAD
 	RING_LOGIC_PER_CORE = 30,               //!< RING_LOGIC_PER_CORE
 	RING_LOGIC_PER_CORE_ATTACH_THREADS = 31,//!< RING_LOGIC_PER_CORE_ATTACH_THREADS

@@ -37,7 +37,6 @@
 #include "utils/bullseye.h"
 #include "vlogger/vlogger.h"
 #include "vma/util/vtypes.h"
-#include "vma/util/verbs_extra.h"
 #include "vma/util/utils.h"
 #include "vma/dev/ib_ctx_handler_collection.h"
 #include "vma/proto/neighbour.h"
@@ -185,26 +184,26 @@ neigh_entry::neigh_entry(neigh_key key, transport_type_t _type, bool is_init_res
 	m_err_counter(0),
 	m_timer_handle(NULL),
 	m_arp_counter(0),
-	m_p_dev(NULL),
+	m_p_dev(key.get_net_device_val()),
 	m_p_ring(NULL),
 	m_is_loopback(false),
 	m_to_str(std::string(priv_vma_transport_type_str(m_trans_type)) + ":" + get_key().to_str()), m_id(0),
 	m_is_first_send_arp(true), m_n_sysvar_neigh_wait_till_send_arp_msec(safe_mce_sys().neigh_wait_till_send_arp_msec),
 	m_n_sysvar_neigh_uc_arp_quata(safe_mce_sys().neigh_uc_arp_quata),
-	m_n_sysvar_neigh_num_err_retries(safe_mce_sys().neigh_num_err_retries),
-	m_res_key(NULL)
+	m_n_sysvar_neigh_num_err_retries(safe_mce_sys().neigh_num_err_retries)
 {
 	m_val = NULL;
-	m_p_dev = key.get_net_device_val();
 
 	BULLSEYE_EXCLUDE_BLOCK_START
 	if (m_p_dev == NULL) {
 		neigh_logpanic("get_net_dev return NULL");
 	}
 
+	ring_alloc_logic_attr ring_attr(safe_mce_sys().ring_allocation_logic_tx);
+	m_ring_allocation_logic = ring_allocation_logic_tx(m_p_dev->get_local_addr(), ring_attr, this);
+
 	if(is_init_resources) {
-		m_res_key = new resource_allocation_key;
-		m_p_ring = m_p_dev->reserve_ring(m_res_key);
+		m_p_ring = m_p_dev->reserve_ring(m_ring_allocation_logic.get_key());
 		if (m_p_ring == NULL) {
 			neigh_logpanic("reserve_ring return NULL");
 		}
@@ -223,9 +222,18 @@ neigh_entry::neigh_entry(neigh_key key, transport_type_t _type, bool is_init_res
 	memset(&m_send_wqe, 0, sizeof(m_send_wqe));
 	memset(&m_sge, 0, sizeof(m_sge));
 
-	if (m_dst_addr.sin_addr.s_addr == m_src_addr.sin_addr.s_addr) {
-		neigh_logdbg("This is loopback neigh");
-		m_is_loopback = true;
+	/* Verify if neigh is local (loopback) checking into account
+	 * primary and secondary ip-addresses
+	 */
+	{
+		const ip_data_vector_t& ip = m_p_dev->get_ip_array();
+		for (size_t i = 0; i < ip.size(); i++) {
+			if (ip[i]->local_addr == m_dst_addr.sin_addr.s_addr) {
+				neigh_logdbg("This is loopback neigh");
+				m_is_loopback = true;
+				break;
+			}
+		}
 	}
 
 	neigh_logdbg("Created new neigh_entry");
@@ -239,10 +247,9 @@ neigh_entry::~neigh_entry()
 		delete m_state_machine;
 		m_state_machine = NULL;
 	}
-	if (m_p_dev && m_p_ring && m_res_key) {
-		m_p_dev->release_ring(m_res_key);
+	if (m_p_dev && m_p_ring) {
+		m_p_dev->release_ring(m_ring_allocation_logic.get_key());
 		m_p_ring = NULL;
-		delete m_res_key;
 	}
 	if (m_val) {
 		delete m_val;

@@ -45,6 +45,9 @@ extern "C" {
 #define tcp_init() /* Compatibility define, no init needed. */
 
 /* Functions for interfacing with TCP: */
+#if defined(__GNUC__) && (((__GNUC__ == 4) && (__GNUC_MINOR__ >= 4)) || (__GNUC__ > 4))
+#pragma GCC visibility push(hidden)
+#endif
 
 void             tcp_tmr     (struct tcp_pcb* pcb);  /* Must be called every (slow_tmr_interval / 2) ms. */
 /* It is also possible to call these two functions at the right
@@ -62,11 +65,17 @@ void             tcp_tx_preallocted_buffers_free(struct tcp_pcb * pcb);
 void             tcp_tx_pbuf_free(struct tcp_pcb * pcb, struct pbuf * pbuf);
 void             tcp_abandon (struct tcp_pcb *pcb, int reset);
 err_t            tcp_send_empty_ack(struct tcp_pcb *pcb);
+void             tcp_split_segment(struct tcp_pcb *pcb, struct tcp_seg *seg, u32_t wnd);
 void             tcp_rexmit  (struct tcp_pcb *pcb);
 void             tcp_rexmit_rto  (struct tcp_pcb *pcb);
 void             tcp_rexmit_fast (struct tcp_pcb *pcb);
 u32_t            tcp_update_rcv_ann_wnd(struct tcp_pcb *pcb);
 void             set_tmr_resolution(u32_t v);
+
+#if defined(__GNUC__) && (((__GNUC__ == 4) && (__GNUC_MINOR__ >= 4)) || (__GNUC__ > 4))
+#pragma GCC visibility pop
+#endif
+
 /**
  * This is the Nagle algorithm: try to combine user data to send as few TCP
  * segments as possible. Only send if
@@ -324,26 +333,8 @@ extern u32_t tcp_ticks;
 extern ip_route_mtu_fn external_ip_route_mtu;
 
 
-/* The TCP PCB lists. */
-union tcp_listen_pcbs_t { /* List of all TCP PCBs in LISTEN state. */
-  struct tcp_pcb_listen *listen_pcbs; 
-  struct tcp_pcb *pcbs;
-};
-extern struct tcp_pcb *tcp_bound_pcbs;
-extern union tcp_listen_pcbs_t tcp_listen_pcbs;
-extern struct tcp_pcb *tcp_active_pcbs;  /* List of all TCP PCBs that are in a
-              state in which they accept or send
-              data. */
-extern struct tcp_pcb *tcp_tw_pcbs;      /* List of all TCP PCBs in TIME-WAIT. */
-
 extern struct tcp_pcb *tcp_tmp_pcb;      /* Only used for temporary storage. */
 
-/* Axioms about the above lists:   
-   1) Every TCP PCB that is not CLOSED is in one of the lists.
-   2) A PCB is only in one of the lists.
-   3) All PCBs in the tcp_listen_pcbs list is in LISTEN state.
-   4) All PCBs in the tcp_tw_pcbs list is in TIME-WAIT state.
-*/
 /* Define two macros, TCP_REG and TCP_RMV that registers a TCP PCB
    with a PCB list or removes a PCB from a list, respectively. */
 #ifndef TCP_DEBUG_PCB_LISTS
@@ -358,7 +349,7 @@ extern struct tcp_pcb *tcp_tmp_pcb;      /* Only used for temporary storage. */
         tcp_tmp_pcb = tcp_tmp_pcb->next) { \
                                 LWIP_ASSERT("TCP_REG: already registered\n", tcp_tmp_pcb != (npcb)); \
                             } \
-                            LWIP_ASSERT("TCP_REG: get_tcp_state(pcb) != CLOSED", ((pcbs) == &tcp_bound_pcbs) || ((npcb)->state != CLOSED)); \
+                            LWIP_ASSERT("TCP_REG: get_tcp_state(pcb) != CLOSED", ((npcb)->state != CLOSED)); \
                             (npcb)->next = *(pcbs); \
                             LWIP_ASSERT("TCP_REG: npcb->next != npcb", (npcb)->next != (npcb)); \
                             *(pcbs) = (npcb); \
@@ -409,6 +400,9 @@ extern struct tcp_pcb *tcp_tmp_pcb;      /* Only used for temporary storage. */
 
 #endif /* LWIP_DEBUG */
 
+#if defined(__GNUC__) && (((__GNUC__ == 4) && (__GNUC_MINOR__ >= 4)) || (__GNUC__ > 4))
+#pragma GCC visibility push(hidden)
+#endif
 /* Internal functions: */
 struct tcp_pcb *tcp_pcb_copy(struct tcp_pcb *pcb);
 void tcp_pcb_purge(struct tcp_pcb *pcb);
@@ -476,6 +470,9 @@ s16_t tcp_pcbs_sane(void);
  * that a timer is needed (i.e. active- or time-wait-pcb found). */
 void tcp_timer_needed(void);
 
+#if defined(__GNUC__) && (((__GNUC__ == 4) && (__GNUC_MINOR__ >= 4)) || (__GNUC__ > 4))
+#pragma GCC visibility pop
+#endif
 
 #ifdef __cplusplus
 }

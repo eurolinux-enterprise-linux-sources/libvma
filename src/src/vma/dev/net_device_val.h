@@ -44,7 +44,6 @@
 
 #include "utils/lock_wrapper.h"
 #include "vma/util/sys_vars.h"
-#include "vma/util/verbs_extra.h"
 #include "vma/event/event_handler_ibverbs.h"
 #include "vma/event/event_handler_rdma_cm.h"
 #include "vma/dev/ib_ctx_handler.h"
@@ -66,16 +65,20 @@ public:
 	ring_alloc_logic_attr(const ring_alloc_logic_attr &other);
 	void set_ring_alloc_logic(ring_logic_t logic);
 	void set_ring_profile_key(vma_ring_profile_key profile);
+	void set_memory_descriptor(iovec &mem_desc);
 	void set_user_id_key(uint64_t user_id_key);
 	inline ring_logic_t get_ring_alloc_logic() { return m_ring_alloc_logic;}
 	inline vma_ring_profile_key get_ring_profile_key() { return m_ring_profile_key;}
+	inline iovec* get_memory_descriptor() { return &m_mem_desc;}
 	inline uint64_t get_user_id_key() { return m_user_id_key;}
 
 	bool operator==(const ring_alloc_logic_attr& other) const
 	{
 		return (m_ring_alloc_logic == other.m_ring_alloc_logic &&
 			m_ring_profile_key == other.m_ring_profile_key &&
-			m_user_id_key == other.m_user_id_key);
+			m_user_id_key == other.m_user_id_key &&
+			m_mem_desc.iov_base == other.m_mem_desc.iov_base &&
+			m_mem_desc.iov_len == other.m_mem_desc.iov_len);
 	}
 
 	bool operator!=(const ring_alloc_logic_attr& other) const
@@ -90,6 +93,8 @@ public:
 			m_ring_profile_key = other.m_ring_profile_key;
 			m_user_id_key = other.m_user_id_key;
 			m_hash = other.m_hash;
+			m_mem_desc.iov_base = other.m_mem_desc.iov_base;
+			m_mem_desc.iov_len = other.m_mem_desc.iov_len;
 			snprintf(m_str, RING_ALLOC_STR_SIZE, "%s", other.m_str);
 		}
 		return *this;
@@ -119,6 +124,7 @@ private:
 	/* either user_idx or key as defined in ring_logic_t */
 	uint64_t		m_user_id_key;
 	char			m_str[RING_ALLOC_STR_SIZE];
+	iovec			m_mem_desc;
 	void			init();
 };
 
@@ -171,7 +177,8 @@ typedef struct ip_data {
 
 typedef std::vector<ip_data_t*> ip_data_vector_t;
 
-
+#define VMA_DEFAULT_ENGRESS_MAP_PRIO	(0)
+typedef std::tr1::unordered_map<uint32_t, uint32_t> tc_class_priority_map;
 /*
  * Represents Offloading capable device such as eth4, ib1, eth3.5, eth5:6
  */
@@ -243,9 +250,6 @@ public:
 	void set_str();
 	void print_val();
 
-	inline int get_tap_if_index() { return m_netvsc.tap_if_index; }
-	inline int get_tap_fd() { return m_netvsc.tap_fd; }
-
 	ring*                   reserve_ring(resource_allocation_key*); // create if not exists
 	bool 			release_ring(resource_allocation_key*); // delete from m_hash if ref_cnt == 0
 	state                   get_state() const  { return m_state; } // not sure, look at state init at c'tor
@@ -263,10 +267,10 @@ public:
 	inline bond_type  get_is_bond() { return m_bond; }
 	inline bond_xmit_hash_policy get_bond_xmit_hash_policy() { return m_bond_xmit_hash_policy; }
 	bool 			update_active_slaves();
-	bool 			update_netvsc_slaves();
+	void 			update_netvsc_slaves(int if_index, int if_flags);
 	void 			register_to_ibverbs_events(event_handler_ibverbs *handler);
 	void 			unregister_to_ibverbs_events(event_handler_ibverbs *handler);
-
+	int			get_priority_by_tc_class(uint32_t tc_class);
 protected:
 
 	void set_slave_array();
@@ -278,20 +282,20 @@ protected:
 	L2_address* 		m_p_br_addr;
 	transport_type_t	m_transport_type;
 	lock_mutex_recursive	m_lock;
-	rings_hash_map_t        m_h_ring_map;
+	rings_hash_map_t	m_h_ring_map;
 	rings_key_redirection_hash_map_t        m_h_ring_key_redirection_map;
 
-	state            m_state;          /* device current state */
-	bond_type        m_bond;           /* type of the device as simple, bond, etc */
+	state			m_state;          /* device current state */
+	bond_type		m_bond;           /* type of the device as simple, bond, etc */
 	slave_data_vector_t	m_slaves;      /* array of slaves */
-	int              m_if_active;      /* ifindex of active slave (only for active-backup) */
-	bond_xmit_hash_policy m_bond_xmit_hash_policy;
-	int m_bond_fail_over_mac;
+	int			m_if_active;      /* ifindex of active slave (only for active-backup) */
+	bond_xmit_hash_policy	m_bond_xmit_hash_policy;
+	int			m_bond_fail_over_mac;
+	tc_class_priority_map	m_class_prio_map;
 
 private:
-	bool 			verify_ipoib_mode();
 	void 			verify_bonding_mode();
-	bool 			verify_eth_qp_creation(const char* ifname);
+	bool 			verify_qp_creation(const char* ifname, enum ibv_qp_type qp_type);
 	bool 			verify_bond_ipoib_or_eth_qp_creation();
 	bool 			verify_ipoib_or_eth_qp_creation(const char* interface_name);
 	bool 			verify_enable_ipoib(const char* ifname);
@@ -300,8 +304,6 @@ private:
 	resource_allocation_key* ring_key_redirection_release(resource_allocation_key *key);
 
 	bool get_up_and_active_slaves(bool* up_and_active_slaves, size_t size);
-	int netvsc_create();
-	void netvsc_destroy();
 
 	/* See: RFC 3549 2.3.3.1. */
 	int              m_if_idx;         /* Uniquely identifies interface (not unique: eth4 and eth4:5 has the same idx) */
@@ -318,12 +320,6 @@ private:
 	std::string      m_name;           /* container for ifname */
 	char             m_str[BUFF_SIZE]; /* detailed information about device */
 	char             m_base_name[IFNAMSIZ]; /* base name of device basing ifname */
-
-	/* These fields are NETVSC mode specific */
-	struct {
-		int tap_if_index;              /* if_index of tap device */
-		int tap_fd;                    /* file descriptor of tap device */
-	} m_netvsc;
 };
 
 class net_device_val_eth : public net_device_val
@@ -341,7 +337,7 @@ public:
 
 protected:
 	virtual ring*		create_ring(resource_allocation_key *key);
-
+	void			parse_prio_egress_map();
 private:
 	void			configure();
 	L2_address*		create_L2_address(const char* ifname);

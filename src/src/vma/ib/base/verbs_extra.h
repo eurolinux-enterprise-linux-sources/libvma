@@ -38,15 +38,15 @@
 #include <config.h>
 #include <infiniband/verbs.h>
 #include "vma/util/vtypes.h"
-#ifndef DEFINED_IBV_OLD_VERBS_MLX_OFED
+#if defined(DEFINED_VERBS_VERSION) && (DEFINED_VERBS_VERSION == 2)
 #include <infiniband/verbs_exp.h>
 #endif
 #include <string.h>
 #include <netinet/in.h>
 #include <linux/if_ether.h>
-#ifdef HAVE_INFINIBAND_MLX5_HW_H
-# include <infiniband/mlx5_hw.h>
-#endif //HAVE_INFINIBAND_MLX5_HW_H
+#if defined(DEFINED_DIRECT_VERBS)
+#include "vma/ib/mlx5/ib_mlx5.h"
+#endif /* DEFINED_DIRECT_VERBS */
 
 #ifndef DEFINED_IBV_WC_WITH_VLAN
 //#warning probaly you are trying to compile on OFED which doesnt support VLAN for RAW QP.
@@ -98,6 +98,8 @@ int priv_ibv_query_qp_state(struct ibv_qp *qp);
 // change  ib rate limit
 int priv_ibv_modify_qp_ratelimit(struct ibv_qp *qp, struct vma_rate_limit_t &rate_limit, uint32_t rl_changes);
 
+// Modify cq moderation
+void priv_ibv_modify_cq_moderation(struct ibv_cq* cq, uint32_t period, uint32_t count);
 
 #ifndef VLAN_VID_MASK
 #define VLAN_VID_MASK      0xFFF	/* define vlan range: 1-4095. taken from <linux/if_vlan.h> */
@@ -109,18 +111,43 @@ int priv_ibv_modify_qp_ratelimit(struct ibv_qp *qp, struct vma_rate_limit_t &rat
 
 #define FLOW_TAG_MASK     ((1 << 20) -1)
 int priv_ibv_query_flow_tag_supported(struct ibv_qp *qp, uint8_t port_num);
+int priv_ibv_create_flow_supported(struct ibv_qp *qp, uint8_t port_num);
 
-//old MLNX_OFED verbs (2.1 and older)
-#ifdef DEFINED_IBV_OLD_VERBS_MLX_OFED
+/* DEFINED_VERBS_VERSION:
+ * 1 - Legacy Verbs API
+ * 2 - Experimental Verbs API
+ * 3 - Upstream Verbs API
+ */
+#if defined(DEFINED_VERBS_VERSION) && (DEFINED_VERBS_VERSION == 1 || DEFINED_VERBS_VERSION == 3)
 //ibv_create_qp
-#define vma_ibv_create_qp(pd, attr)             ibv_create_qp(pd, attr)
-typedef struct ibv_qp_init_attr                 vma_ibv_qp_init_attr;
-#define vma_ibv_qp_init_attr_comp_mask(_pd, _attr)	\
-	{ NOT_IN_USE(_pd); NOT_IN_USE(_attr); }
+#ifdef DEFINED_IBV_QP_INIT_SOURCE_QPN
+#define vma_ibv_create_qp(pd, attr)                ibv_create_qp_ex((pd)->context, attr)
+typedef struct ibv_qp_init_attr_ex                 vma_ibv_qp_init_attr;
+#define vma_ibv_qp_create_flags(attr)              (attr).create_flags
+#define vma_ibv_qp_source_qpn(attr)                (attr).source_qpn
+#define VMA_IBV_QP_INIT_QPN_CREATE_FLAGS           IBV_QP_CREATE_SOURCE_QPN
+#define VMA_IBV_QP_INIT_QPN_MASK                   IBV_QP_INIT_ATTR_CREATE_FLAGS
+#define vma_ibv_qp_init_attr_comp_mask(_pd, _attr) { (_attr).pd = _pd; (_attr).comp_mask |= IBV_QP_INIT_ATTR_PD; }
+#else
+#define vma_ibv_create_qp(pd, attr)                 ibv_create_qp(pd, attr)
+typedef struct ibv_qp_init_attr                     vma_ibv_qp_init_attr;
+#define vma_ibv_qp_init_attr_comp_mask(_pd, _attr)  { NOT_IN_USE(_pd); NOT_IN_USE(_attr); }
+#endif
+
 //ibv_query_device
-#define vma_ibv_query_device(context, attr)	ibv_query_device(context, attr)
-typedef struct ibv_device_attr			vma_ibv_device_attr;
-#define vma_ibv_device_attr_comp_mask(attr)	NOT_IN_USE(attr)
+#define vma_ibv_device_attr_comp_mask(attr)   NOT_IN_USE(attr)
+typedef struct ibv_device_attr                vma_ibv_device_attr;
+
+#ifdef DEFINED_IBV_DEVICE_ATTR_EX
+#define vma_ibv_query_device(context, attr)   ibv_query_device_ex(context, NULL, attr)
+typedef struct ibv_device_attr_ex             vma_ibv_device_attr_ex;
+#define vma_get_device_orig_attr(device_attr) &device_attr->orig_attr
+#else
+#define vma_ibv_query_device(context, attr)   ibv_query_device(context, attr)
+typedef vma_ibv_device_attr                   vma_ibv_device_attr_ex;
+#define vma_get_device_orig_attr(device_attr) device_attr
+#endif
+
 //ibv_modify_qp
 #define vma_ibv_modify_qp(qp, attr, mask)	ibv_modify_qp(qp, attr, mask)
 typedef struct ibv_qp_attr			vma_ibv_qp_attr;
@@ -143,8 +170,17 @@ typedef int            vma_ibv_cq_init_attr;
 #define vma_ibv_create_cq(context, cqe, cq_context, channel, comp_vector, attr) ibv_create_cq(context, cqe, cq_context, channel, comp_vector)
 
 //rx hw timestamp
-#define VMA_IBV_WC_WITH_TIMESTAMP              0
-#define vma_wc_timestamp(wc)			0
+#define VMA_IBV_WC_WITH_TIMESTAMP             0
+#define vma_wc_timestamp(wc)                  0
+#define vma_ibv_cq_init_ts_attr(attr)         { NOT_IN_USE(attr); }
+
+#ifdef DEFINED_IBV_CQ_TIMESTAMP
+#define VMA_IBV_DEVICE_ATTR_HCA_CORE_CLOCK    0
+#define VMA_IBV_VALUES_MASK_RAW_CLOCK         IBV_VALUES_MASK_RAW_CLOCK
+#define vma_ibv_query_values(ctx, values)     ibv_query_rt_values_ex(ctx, values)
+#define vma_get_ts_val(values)                values.raw_clock.tv_nsec
+typedef struct ibv_values_ex                  vma_ts_values;
+#endif
 
 //ibv_post_send
 #define VMA_IBV_SEND_SIGNALED			IBV_SEND_SIGNALED
@@ -186,19 +222,45 @@ typedef struct ibv_flow_spec_ib			vma_ibv_flow_spec_ib;
 typedef struct ibv_flow_spec_eth		vma_ibv_flow_spec_eth;
 typedef struct ibv_flow_spec_ipv4		vma_ibv_flow_spec_ipv4;
 typedef struct ibv_flow_spec_tcp_udp		vma_ibv_flow_spec_tcp_udp;
-#define vma_get_flow_tag			0
-typedef struct ibv_exp_flow_spec_action_tag_dummy {}	vma_ibv_flow_spec_action_tag;
-#else //new MLNX_OFED verbs (2.2 and newer)
 
+// Flow tag
+#ifdef DEFINED_IBV_FLOW_TAG
+#define VMA_IBV_FLOW_SPEC_ACTION_TAG               IBV_FLOW_SPEC_ACTION_TAG
+typedef struct ibv_flow_spec_action_tag            vma_ibv_flow_spec_action_tag;
+#define vma_get_flow_tag(cqe)                      ntohl((uint32_t)(cqe->sop_drop_qpn))
+#else
+typedef struct ibv_flow_spec_action_tag_dummy {}   vma_ibv_flow_spec_action_tag;
+#define vma_get_flow_tag(cqe)                      0
+#endif // DEFINED_IBV_FLOW_TAG
+
+#ifdef DEFINED_IBV_CQ_ATTR_MODERATE
+typedef struct ibv_modify_cq_attr               vma_ibv_cq_attr;
+#define vma_ibv_modify_cq(cq, cq_attr, mask)    ibv_modify_cq(cq, cq_attr)
+#define vma_cq_attr_mask(cq_attr)               (cq_attr).attr_mask
+#define vma_cq_attr_moderation(cq_attr)         (cq_attr).moderate
+#define VMA_IBV_CQ_MODERATION                   IBV_CQ_ATTR_MODERATE
+#endif
+
+#else /* DEFINED_VERBS_VERSION */
+
+//ibv_create_qp
 #define vma_ibv_create_qp(pd, attr)             ibv_exp_create_qp((pd)->context, attr)
 typedef struct ibv_exp_qp_init_attr             vma_ibv_qp_init_attr;
-#define vma_ibv_qp_init_attr_comp_mask(_pd, _attr)	\
-	{ (_attr).pd = _pd; (_attr).comp_mask |= IBV_EXP_QP_INIT_ATTR_PD; }
-//ibv_query_device
-#define vma_ibv_query_device(context, attr)	ibv_exp_query_device(context, attr)
-typedef struct ibv_exp_device_attr		vma_ibv_device_attr;
+#define vma_ibv_qp_init_attr_comp_mask(_pd, _attr)	{ (_attr).pd = _pd; (_attr).comp_mask |= IBV_EXP_QP_INIT_ATTR_PD; }
 
-#define vma_ibv_device_attr_comp_mask(attr)	{ (attr)->comp_mask = IBV_EXP_DEVICE_ATTR_RESERVED - 1; }
+#ifdef DEFINED_IBV_QP_INIT_SOURCE_QPN
+#define vma_ibv_qp_create_flags(attr)              (attr).exp_create_flags
+#define vma_ibv_qp_source_qpn(attr)                (attr).associated_qpn
+#define VMA_IBV_QP_INIT_QPN_CREATE_FLAGS           0
+#define VMA_IBV_QP_INIT_QPN_MASK                   IBV_EXP_QP_INIT_ATTR_ASSOCIATED_QPN
+#endif
+
+//ibv_query_device
+#define vma_ibv_query_device(context, attr)   ibv_exp_query_device(context, attr)
+typedef struct ibv_exp_device_attr            vma_ibv_device_attr;
+typedef vma_ibv_device_attr                   vma_ibv_device_attr_ex;
+#define vma_get_device_orig_attr(device_attr) device_attr
+#define vma_ibv_device_attr_comp_mask(attr)   { (attr)->comp_mask = IBV_EXP_DEVICE_ATTR_RESERVED - 1; }
 
 #ifdef DEFINED_IBV_EXP_DEVICE_RX_CSUM_L4_PKT
 #define vma_is_rx_hw_csum_supported(attr)	(((attr)->exp_device_cap_flags & IBV_EXP_DEVICE_RX_CSUM_L3_PKT) \
@@ -250,12 +312,27 @@ typedef int            vma_ibv_cq_init_attr;
 #endif
 
 //rx hw timestamp
-#ifdef DEFINED_IBV_EXP_CQ_TIMESTAMP
-#define VMA_IBV_WC_WITH_TIMESTAMP              IBV_EXP_WC_WITH_TIMESTAMP
-#define vma_wc_timestamp(wc)			(wc).timestamp
+#ifdef DEFINED_IBV_CQ_TIMESTAMP
+#define VMA_IBV_WC_WITH_TIMESTAMP             IBV_EXP_WC_WITH_TIMESTAMP
+#define vma_wc_timestamp(wc)                  (wc).timestamp
+#define VMA_IBV_DEVICE_ATTR_HCA_CORE_CLOCK    IBV_EXP_DEVICE_ATTR_WITH_HCA_CORE_CLOCK
+#define VMA_IBV_VALUES_MASK_RAW_CLOCK         0
+#define vma_ibv_query_values(ctx, values)     ibv_exp_query_values(ctx, IBV_EXP_VALUES_HW_CLOCK, values)
+#define vma_get_ts_val(values)                values.hwclock
+typedef struct ibv_exp_values                 vma_ts_values;
+#define vma_ibv_cq_init_ts_attr(attr)         { (attr)->flags |= IBV_EXP_CQ_TIMESTAMP; (attr)->comp_mask |= IBV_EXP_CQ_INIT_ATTR_FLAGS; }
 #else
-#define VMA_IBV_WC_WITH_TIMESTAMP		0
-#define vma_wc_timestamp(wc)			0
+#define VMA_IBV_WC_WITH_TIMESTAMP             0
+#define vma_wc_timestamp(wc)                  0
+#define vma_ibv_cq_init_ts_attr(attr)         { NOT_IN_USE(attr); }
+#endif
+
+#ifdef DEFINED_IBV_CQ_ATTR_MODERATE
+typedef struct ibv_exp_cq_attr                  vma_ibv_cq_attr;
+#define vma_ibv_modify_cq(cq, cq_attr, mask)    ibv_exp_modify_cq(cq, cq_attr,mask)
+#define vma_cq_attr_mask(cq_attr)               (cq_attr).comp_mask
+#define vma_cq_attr_moderation(cq_attr)         (cq_attr).moderation
+#define VMA_IBV_CQ_MODERATION                   IBV_EXP_CQ_ATTR_MODERATION
 #endif
 
 //ibv_post_send
@@ -304,17 +381,21 @@ typedef struct ibv_exp_flow_spec_ib		vma_ibv_flow_spec_ib;
 typedef struct ibv_exp_flow_spec_eth		vma_ibv_flow_spec_eth;
 typedef struct ibv_exp_flow_spec_ipv4		vma_ibv_flow_spec_ipv4;
 typedef struct ibv_exp_flow_spec_tcp_udp	vma_ibv_flow_spec_tcp_udp;
-//Flow tag
-#ifdef DEFINED_IBV_EXP_FLOW_TAG
-#define vma_get_flow_tag(wc)			ntohl((uint32_t)(wc->sop_drop_qpn))
-typedef struct ibv_exp_flow_spec_action_tag	vma_ibv_flow_spec_action_tag;
-#else
-#define vma_get_flow_tag(cqe)			0
-typedef struct ibv_exp_flow_spec_action_tag_dummy {}	vma_ibv_flow_spec_action_tag;
-#endif //DEFINED_IBV_EXP_FLOW_TAG
-#endif /* DEFINED_IBV_OLD_VERBS_MLX_OFED */
 
-#if defined(HAVE_IBV_DM)
+//Flow tag
+#ifdef DEFINED_IBV_FLOW_TAG
+#define VMA_IBV_FLOW_SPEC_ACTION_TAG                    IBV_EXP_FLOW_SPEC_ACTION_TAG
+#define vma_get_flow_tag(cqe)                           ntohl((uint32_t)(cqe->sop_drop_qpn))
+typedef struct ibv_exp_flow_spec_action_tag             vma_ibv_flow_spec_action_tag;
+#else
+#define vma_get_flow_tag(cqe)                           0
+typedef struct ibv_exp_flow_spec_action_tag_dummy {}    vma_ibv_flow_spec_action_tag;
+#endif //DEFINED_IBV_FLOW_TAG
+
+#endif /* DEFINED_VERBS_VERSION */
+
+// ibv_dm
+#ifdef DEFINED_IBV_DM
 #define vma_ibv_dm_size(attr)			((attr)->max_dm_size)
 #else
 #define vma_ibv_dm_size(attr)			(0)
@@ -360,16 +441,6 @@ inline bool is_set(vma_wr_tx_packet_attr state_, vma_wr_tx_packet_attr tx_mode_)
 }
 
 int vma_rdma_lib_reset();
-
-static inline void init_vma_ibv_cq_init_attr(vma_ibv_cq_init_attr* attr)
-{
-#ifdef DEFINED_IBV_EXP_CQ_TIMESTAMP
-		attr->flags |= IBV_EXP_CQ_TIMESTAMP;
-		attr->comp_mask |= IBV_EXP_CQ_INIT_ATTR_FLAGS;
-#else
-		NOT_IN_USE(attr);
-#endif
-}
 
 #ifdef DEFINED_IBV_FLOW_SPEC_IB
 static inline void ibv_flow_spec_ib_set_by_dst_gid(vma_ibv_flow_spec_ib* ib, uint8_t* dst_gid)
@@ -429,11 +500,26 @@ static inline void ibv_flow_spec_flow_tag_set(vma_ibv_flow_spec_action_tag* flow
 	NOT_IN_USE(tag_id);
 	if (flow_tag == NULL)
 		return;
-#ifdef DEFINED_IBV_EXP_FLOW_TAG
-	flow_tag->type = IBV_EXP_FLOW_SPEC_ACTION_TAG;
+#ifdef DEFINED_IBV_FLOW_TAG
+	flow_tag->type = VMA_IBV_FLOW_SPEC_ACTION_TAG;
 	flow_tag->size = sizeof(vma_ibv_flow_spec_action_tag);
 	flow_tag->tag_id = tag_id;
-#endif //DEFINED_IBV_EXP_FLOW_TAG
+#endif //DEFINED_IBV_FLOW_TAG
+}
+
+
+static inline void ibv_source_qpn_set(vma_ibv_qp_init_attr& qp_init_attr, uint32_t source_qpn)
+{
+	NOT_IN_USE(qp_init_attr);
+	NOT_IN_USE(source_qpn);
+
+#ifdef DEFINED_IBV_QP_INIT_SOURCE_QPN
+	if (source_qpn) {
+		qp_init_attr.comp_mask |= VMA_IBV_QP_INIT_QPN_MASK;
+		vma_ibv_qp_create_flags(qp_init_attr) |= VMA_IBV_QP_INIT_QPN_CREATE_FLAGS;
+		vma_ibv_qp_source_qpn(qp_init_attr) = source_qpn;
+	}
+#endif /* DEFINED_IBV_QP_INIT_SOURCE_QPN */
 }
 
 #endif

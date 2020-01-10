@@ -30,35 +30,52 @@
  * SOFTWARE.
  */
 
+#include "data_updater.h"
 
-//code coverage
-#if 0
-
-#define STR_SIZE 255
-
-#include "vma/util/if.h"
-
-#include "route_net_dev_event.h"
-#include "vma/util/utils.h"
-
-route_net_dev_event::route_net_dev_event(void* notifier, int if_index_down, event_type_t event_type) : event(notifier)
-{
-	m_if_index_down = if_index_down;
-	m_event_type = event_type;
-}
-
-route_net_dev_event::~route_net_dev_event()
+data_updater::~data_updater()
 {
 
 }
 
-const std::string route_net_dev_event::to_str() const
+header_ttl_updater::header_ttl_updater(uint8_t ttl, bool is_multicast)
+	: data_updater()
+	, m_ttl(ttl)
+	, m_is_multicast(is_multicast)
 {
-	char outstr[STR_SIZE];
-	char if_name[IFNAMSIZ];
-	if_indextoname(m_if_index_down, if_name);
-	sprintf(outstr, "interface %s [index %d] is down", if_name, m_if_index_down);
-	return std::string(outstr);
+
 }
 
-#endif //code coverage
+bool header_ttl_updater::update_field(dst_entry &dst)
+{
+	if ((IN_MULTICAST_N(dst.get_dst_addr()) && m_is_multicast) ||
+	    (!IN_MULTICAST_N(dst.get_dst_addr()) && !m_is_multicast)) {
+		dst.set_ip_ttl(m_ttl);
+	}
+	return true;
+}
+
+header_pcp_updater::header_pcp_updater(uint8_t pcp)
+	: data_updater()
+	, m_pcp(pcp)
+{
+
+}
+
+bool header_pcp_updater::update_field(dst_entry &dst)
+{
+	return dst.set_pcp(m_pcp);
+}
+
+header_tos_updater::header_tos_updater(uint8_t tos)
+	: data_updater()
+	, m_tos(tos)
+{
+
+}
+
+bool header_tos_updater::update_field(dst_entry &dst)
+{
+	dst.set_ip_tos(m_tos);
+	return true;
+}
+

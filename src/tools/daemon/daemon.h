@@ -50,6 +50,8 @@
 #include <sys/stat.h>
 #include <arpa/inet.h>
 #include <net/if.h>
+#include <sys/time.h>
+#include <ifaddrs.h>
 
 #ifdef HAVE_LINUX_LIMITS_H
 #include <linux/limits.h>
@@ -57,6 +59,7 @@
 
 #include "vma/util/agent_def.h"
 #include "vma/util/list.h"
+#include "utils/clock.h"
 
 
 #define MODULE_NAME             "vmad"
@@ -69,7 +72,7 @@
 
 #define PID_MAX         499    /**< Default maximum number of processes
                                     per node (should be prime number) */
-#define FID_MAX         2203   /**< Default maximum number of sockets
+#define FID_MAX         65599  /**< Default maximum number of sockets
                                     per process (should be prime number) */
 
 #ifndef HAVE_LINUX_LIMITS_H
@@ -296,6 +299,66 @@ static inline char *sys_exec(const char * format, ...)
 	return outbuf;
 err:
 	return NULL;
+}
+
+static inline uint32_t sys_lo_ifindex(void)
+{
+	static __thread uint32_t lo_ifindex = 0;
+	struct ifaddrs *ifaddr, *ifa;
+
+	if (lo_ifindex > 0) {
+		return lo_ifindex;
+	}
+
+	if (!getifaddrs(&ifaddr)) {
+		for (ifa = ifaddr; NULL != ifa; ifa = ifa->ifa_next) {
+			if (ifa->ifa_addr->sa_family == AF_INET &&
+					(ifa->ifa_flags & IFF_LOOPBACK)) {
+				lo_ifindex = if_nametoindex(ifa->ifa_name);
+				break;
+			}
+		}
+		freeifaddrs(ifaddr);
+	}
+
+	return lo_ifindex;
+}
+
+static inline char *sys_lo_ifname(void)
+{
+	static __thread char lo_ifname[IF_NAMESIZE] = {0};
+
+	if (lo_ifname[0] > 0) {
+		return lo_ifname;
+	}
+
+	if (NULL == if_indextoname(sys_lo_ifindex(), lo_ifname)) {
+		lo_ifname[0] = 0;
+	}
+
+	return lo_ifname;
+}
+
+static inline int sys_iplocal(uint32_t addr)
+{
+	int rc = 0;
+	struct ifaddrs *ifaddr, *ifa;
+	struct sockaddr_in *sa;
+
+	if (!getifaddrs(&ifaddr)) {
+		for (ifa = ifaddr; NULL != ifa; ifa = ifa->ifa_next) {
+			if (ifa->ifa_addr->sa_family == AF_INET) {
+				sa = (struct sockaddr_in *) ifa->ifa_addr;
+				if (addr == sa->sin_addr.s_addr) {
+					rc = 1;
+					break;
+				}
+			}
+		}
+		freeifaddrs(ifaddr);
+	}
+
+	return rc;
 }
 
 #endif /* TOOLS_DAEMON_DAEMON_H_ */

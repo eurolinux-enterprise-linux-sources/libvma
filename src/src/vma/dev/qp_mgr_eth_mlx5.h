@@ -38,9 +38,17 @@
 #include "vma/util/sg_array.h"
 #include "vma/dev/dm_mgr.h"
 
-#if defined(HAVE_INFINIBAND_MLX5_HW_H)
+#if defined(DEFINED_DIRECT_VERBS)
 
-#include <infiniband/mlx5_hw.h>
+
+struct mlx5_wqe64 {
+	union {
+		struct mlx5_wqe_ctrl_seg ctrl;
+		uint32_t data[4];
+	} ctrl;
+	struct mlx5_wqe_eth_seg eseg;
+	struct mlx5_wqe_data_seg dseg;
+};
 
 class qp_mgr_eth_mlx5 : public qp_mgr_eth
 {
@@ -52,10 +60,13 @@ public:
 	virtual ~qp_mgr_eth_mlx5();
 	virtual void	up();
 	virtual void	down();
+	virtual void    post_recv_buffer(mem_buf_desc_t* p_mem_buf_desc); // Post for receive single mem_buf_desc
+#ifndef DEFINED_SOCKETXTREME
+	vma_ib_mlx5_qp_t    m_mlx5_qp;
+#endif // DEFINED_SOCKETXTREME
 protected:
 	void		trigger_completion_for_all_sent_packets();
 	void		init_sq();
-	struct mlx5_qp*	m_hw_qp;
 	uint64_t*	m_sq_wqe_idx_to_wrid;
 
 private:
@@ -65,11 +76,9 @@ private:
 	virtual void	dm_release_data(mem_buf_desc_t* buff) { m_dm_mgr.release_data(buff); }
 
 	inline void	set_signal_in_next_send_wqe();
-
 	int		send_to_wire(vma_ibv_send_wr* p_send_wqe, vma_wr_tx_packet_attr attr, bool request_comp);
 	inline int	fill_wqe(vma_ibv_send_wr* p_send_wqe);
-	inline void	send_by_bf(uint64_t* addr, int num_wqebb);
-	inline void	send_by_bf_wrap_up(uint64_t* bottom_addr, int num_wqebb_bottom, int num_wqebb_top);
+	inline void	ring_doorbell(uint64_t* wqe, int num_wqebb, int num_wqebb_top = 0);
 	inline int	fill_inl_segment(sg_array &sga, uint8_t *cur_seg, uint8_t* data_addr, int max_inline_len, int inline_len);
 	inline int	fill_ptr_segment(sg_array &sga, struct mlx5_wqe_data_seg* dp_seg, uint8_t* data_addr, int data_len, mem_buf_desc_t* buffer);
 
@@ -77,16 +86,14 @@ private:
 	struct mlx5_wqe64*	m_sq_wqe_hot;
 	uint8_t*		m_sq_wqes_end;
 
-	volatile uint32_t*	m_sq_db;
-	volatile void*		m_sq_bf_reg;
-
-	unsigned int        m_qp_num;
 	int                 m_sq_wqe_hot_index;
-	uint16_t            m_sq_bf_offset;
-	uint16_t            m_sq_bf_buf_size;
 	uint16_t            m_sq_wqe_counter;
 	dm_mgr              m_dm_mgr;
 	bool                m_dm_enabled;
+	enum {
+		MLX5_DB_METHOD_BF,
+		MLX5_DB_METHOD_DB
+	} m_db_method;
 };
-#endif //defined(HAVE_INFINIBAND_MLX5_HW_H)
+#endif //defined(DEFINED_DIRECT_VERBS)
 #endif //QP_MGR_ETH_MLX5_H

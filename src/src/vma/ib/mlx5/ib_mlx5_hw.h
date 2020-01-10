@@ -30,57 +30,65 @@
  * SOFTWARE.
  */
 
+#ifndef SRC_VMA_IB_MLX5_HW_H_
+#define SRC_VMA_IB_MLX5_HW_H_
 
-
-#include "vma/util/verbs_extra.h"
-#include "ring.h"
-#include "ah_cleaner.h"
-
-#define MODULE_NAME 		"ahc:"
-
-#define ach_logerr		__log_info_err
-#define ach_logdbg		__log_info_dbg
-
-#if _BullseyeCoverage
-    #pragma BullseyeCoverage off
+#ifndef SRC_VMA_IB_MLX5_H_
+#error "Use <vma/ib/mlx5/ib_mlx5.h> instead."
 #endif
 
-ah_cleaner::ah_cleaner(struct ibv_ah* ah, ring* p_ring) : m_ah(ah), m_p_ring(p_ring)
-{
-	ach_logdbg("ah_cleaner created [ah=%p, ring=%p]", ah, p_ring);
-	m_next_owner = NULL;
-}
+#if defined(DEFINED_DIRECT_VERBS) && (DEFINED_DIRECT_VERBS == 2)
 
-// Arriving This function means that we got completion about our closing ah tx packet,
-// so we can destroy the old address_handler
-//
-void ah_cleaner::mem_buf_desc_return_to_owner_tx(mem_buf_desc_t* p_rx_wc_buf_desc)
-{
-	destroy_ah_n_return_to_owner(p_rx_wc_buf_desc);
-}
+#include <stdint.h>
 
-void ah_cleaner::mem_buf_desc_completion_with_error_tx(mem_buf_desc_t* p_rx_wc_buf_desc)
-{
-	destroy_ah_n_return_to_owner(p_rx_wc_buf_desc);
-}
+/* This structures duplicate mlx5dv.h (rdma-core upstream)
+ * to use upstream specific approach as a basis
+ */
+struct mlx5dv_qp {
+	volatile uint32_t *dbrec;
+	struct {
+		void *buf;
+		uint32_t wqe_cnt;
+		uint32_t stride;
+	} sq;
+	struct {
+		void *buf;
+		uint32_t wqe_cnt;
+		uint32_t stride;
+	} rq;
+	struct {
+		void *reg;
+		uint32_t size;
+	} bf;
+	uint64_t comp_mask;
+};
 
-void ah_cleaner::destroy_ah_n_return_to_owner(mem_buf_desc_t* p_mem_buf_desc)
-{
-	if (m_next_owner) {
-		p_mem_buf_desc->p_desc_owner = m_p_ring;
-		m_next_owner->mem_buf_desc_return_to_owner_tx(p_mem_buf_desc);
-	}
-	else {
-		ach_logerr("no desc_owner!");
-	}
+struct mlx5dv_cq {
+	void *buf;
+	volatile uint32_t *dbrec;
+	uint32_t cqe_cnt;
+	uint32_t cqe_size;
+	void *cq_uar;
+	uint32_t cqn;
+	uint64_t comp_mask;
+};
 
-	ach_logdbg("destroy ah %p", m_ah);
-	IF_VERBS_FAILURE(ibv_destroy_ah(m_ah)) {
-		ach_logerr("failed destroying address handle (errno=%d %m)", errno);
-	} ENDIF_VERBS_FAILURE;
-	delete this;
-}
+struct mlx5dv_obj {
+	struct {
+		struct ibv_qp *in;
+		struct mlx5dv_qp *out;
+	} qp;
+	struct {
+		struct ibv_cq *in;
+		struct mlx5dv_cq *out;
+	} cq;
+};
 
-#if _BullseyeCoverage
-    #pragma BullseyeCoverage on
-#endif
+enum mlx5dv_obj_type {
+	MLX5DV_OBJ_QP = 1 << 0,
+	MLX5DV_OBJ_CQ = 1 << 1,
+};
+
+#endif /* (DEFINED_DIRECT_VERBS == 2) */
+
+#endif /* SRC_VMA_IB_MLX5_HW_H_ */
