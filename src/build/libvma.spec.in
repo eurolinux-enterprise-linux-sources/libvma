@@ -1,0 +1,124 @@
+%global version @VERSION@
+%global release @VMA_LIBRARY_RELEASE@
+%global pkgname @PACKAGE@
+%global major_release @VMA_LIBRARY_MAJOR@
+%global revision @VMA_LIBRARY_REVISION@
+%define date __DATE
+%define time __TIME
+
+%global pmake %{__make} %{?_smp_mflags} %{?mflags} V=1
+
+%global include_dir %{_includedir}/mellanox
+%global vma_ver_rel %{name}-%{version}-%{release}
+%global vma_datadir %{_datadir}/%{vma_ver_rel}
+
+%global ofed_ver %(eval 'ofed_info -s 2> /dev/null || echo "unknown"')
+%global ofed_dir %{?_ofed_dir}%{?!_ofed_dir:%{_prefix}}
+
+%global _use_internal_dependency_generator 0
+
+Summary: A library for boosting TCP and UDP traffic (over RDMA hardware)
+Name: libvma
+Version: %{version}
+Release: 1%{?dist}
+License: GPLv2
+Group: System Environment/Libraries
+Url: https://github.com/Mellanox/libvma
+BuildRoot: %(mktemp -ud %{_tmppath}/%{name}-%{version}-%{release}-XXXXXX)
+Source: %{pkgname}-%{version}.tar.gz
+Requires(post): /sbin/ldconfig
+Requires(postun): /sbin/ldconfig
+Prefix: %{_prefix}
+
+%description
+
+VMA library is a performance booster of TCP and UDP traffic
+Part of Mellanox's enhanced services
+Allows application written over standard socket API
+To run over Infiniband/Ethernet from userspace with full network stack bypass
+and get better throughput, latency and packets/sec rate
+
+%package devel
+Summary: Header files and link required to develop with Libvma
+Group: System Environment/Libraries
+Requires: %{name}%{?_isa} = %{version}-%{release}
+
+%description devel
+Headers and symbolink link required to compile and link with the Libvma library.
+
+%package utils
+Summary: Libvma utilities
+Group: System Environment/Libraries
+Requires: %{name}%{?_isa} = %{version}-%{release}
+
+%description utils
+Example tests and tools for collecting and analyzing Libvma statistic
+
+%prep
+%setup -q
+
+%build
+
+export revision=1
+#export CFLAGS CXXFLAGS LDFLAGS
+export CXXFLAGS='%{optflags}'
+
+%configure --with-ofed=%{ofed_dir} --docdir=%{_docdir}/%{name}-%{version}
+%{pmake}
+
+%install
+[ "${RPM_BUILD_ROOT}" != "/" -a -d ${RPM_BUILD_ROOT} ] && rm -rf ${RPM_BUILD_ROOT}
+
+mkdir -p $RPM_BUILD_ROOT%{include_dir}
+mkdir -p $RPM_BUILD_ROOT%{vma_datadir}/scripts
+mkdir -p $RPM_BUILD_ROOT%{_sysconfdir}
+
+%{pmake} DESTDIR=${RPM_BUILD_ROOT} install
+
+rm -f $RPM_BUILD_ROOT%{_libdir}/*.la
+
+install -m 755 tests/vma_perf_envelope/vma_perf_envelope.sh $RPM_BUILD_ROOT/%{vma_datadir}/scripts/vma_perf_envelope.sh
+install -m 644 src/vma/vma_extra.h $RPM_BUILD_ROOT/%{include_dir}/vma_extra.h
+install -m 644 src/vma/util/libvma.conf $RPM_BUILD_ROOT/%{_sysconfdir}/
+install -s -m 755 src/stats/vma_stats $RPM_BUILD_ROOT/%{_bindir}/vma_stats
+
+
+%post
+if [ `grep memlock /etc/security/limits.conf |grep unlimited |wc -l` -le 0 ]; then
+        echo "*             -   memlock        unlimited" >> /etc/security/limits.conf
+        echo "*          soft   memlock        unlimited" >> /etc/security/limits.conf
+        echo "*          hard   memlock        unlimited" >> /etc/security/limits.conf
+        echo "- Changing max locked memory to unlimited (in /etc/security/limits.conf)"
+        echo "  Please log out from the shell and login again in order to update this change "
+        echo "  Read more about this topic in the VMA's User Manual"
+fi
+/sbin/ldconfig
+
+%clean
+[ "${RPM_BUILD_ROOT}" != "/" -a -d ${RPM_BUILD_ROOT} ] && rm -rf ${RPM_BUILD_ROOT}
+
+%postun
+/sbin/ldconfig
+
+%files
+%defattr(-,root,root,-)
+%{_libdir}/%{name}*.so.*
+%{_libdir}/%{name}.so
+%{_docdir}/%{name}-%{version}/README.txt
+%{_docdir}/%{name}-%{version}/journal.txt
+%{_docdir}/%{name}-%{version}/VMA_VERSION
+%config(noreplace) %{_sysconfdir}/libvma.conf
+%{_sysconfdir}/security/limits.d/30-libvma-limits.conf
+
+%files devel
+%defattr(-,root,root,-)
+%{include_dir}/vma_extra.h
+
+%files utils
+%defattr(-,root,root)
+%{_bindir}/vma_stats
+%{vma_datadir}/scripts/vma_perf_envelope.sh
+
+%changelog
+* Mon Jan  4 2016 Avner BenHanoch <avnerb@mellanox.com> 7.0.12-1
+– Initial Packaging
